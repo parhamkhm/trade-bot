@@ -3,8 +3,8 @@
 .env.*
 !.env.example
 
-# Data (never committed)
-data/
+# Data (never committed). Anchored to the repo root so src/tbot/data and tests/data stay tracked.
+/data/
 *.parquet
 *.sqlite
 *.sqlite3
@@ -14,8 +14,8 @@ data/
 
 # Reports / artifacts produced by runs
 research/reports/*.html
-out/
-logs/
+/out/
+/logs/
 *.log
 
 # Python
