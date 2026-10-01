@@ -226,11 +226,14 @@ These refine `CLAUDE.md` §9 into measurable checks. They may be tightened, neve
 median bid/ask spread over ≥ 30 samples spread across ≥ 6 h is < 0.20 %; a signed read endpoint
 (`account`) answers 200 with the read-only key (key has no withdrawal permission and is IP-whitelisted).
 
-**G1 — Data.** Binance 1h/4h/1d for BTCUSDT and ETHUSDT from 2018-01-01 to `holdout_start`:
+**G1a — Research data (Binance).** 1h/4h/1d for BTCUSDT and ETHUSDT from 2018-01-01 to `holdout_start`:
 every file checksum-verified, zero duplicate timestamps, zero out-of-order timestamps, and every missing
-bar classified (no `unknown` left); 4h/1d values reconcile with 1h resampling within 1e-9.
-Tabdeal recorder: ≥ 7 consecutive days with ≥ 99 % of hours complete, zero saturated polls, and the
-Binance-vs-Tabdeal BTCUSDT basis measured (median and p95, in bps).
+bar classified (no `unknown` left); 4h/1d values reconcile with 1h resampling within 1e-9; the timestamp
+unit of every file is detected and normalised (see D-017).
+
+**G1b — Live data (Tabdeal).** The recorder has run ≥ 7 consecutive days with ≥ 99 % of hours complete and
+zero saturated polls, and the Binance-vs-Tabdeal BTCUSDT basis is measured (median and p95, in bps) over
+that window. G1a and G1b are decided separately: phase 2 may start once G1a passes (decision D-016).
 
 **G2 — Engine.** Truncation test passes exactly; a hand-computed 5-bar example matches the engine to the
 cent; buy-and-hold and SMA-filter equity curves match an independent vectorbt run to ≤ 0.1 % final equity;
@@ -264,9 +267,9 @@ drawdown exceeds the 95th percentile of the bootstrap distribution. Capital scal
 | D-003 | `Decimal` in execution/portfolio, `float` only in research/indicators | exact money math; `_dec()` rejects floats at runtime |
 | D-004 | Annualisation 365 / 2190 / 8760 via `Timeframe.periods_per_year` | crypto trades every day (CLAUDE.md §3.4) |
 | D-005 | Config = YAML (behaviour) + env `TBOT_*` (secrets); live orders need switch **and** phase ≥ 6 **and** mode live | one auditable gate for real money |
-| D-006 | Added dependencies `pydantic-settings` and `PyYAML` beyond CLAUDE.md §7 | pydantic v2 moved settings into a separate package; YAML is the config format. Both are small and widely used. Flagged for Parham's approval |
+| D-006 | Added dependencies `pydantic-settings` and `PyYAML` beyond CLAUDE.md §7 | pydantic v2 moved settings into a separate package; YAML is the config format. **Approved by Parham 2026-10-01** |
 | D-007 | `mypy` strict on `core/risk/execution`; tests may omit return annotations but their bodies are still checked | keeps test code readable without weakening production typing |
-| D-008 | Sealed holdout is the **fixed date** `2025-10-01T00:00:00Z`, not a rolling 12-month window | a rolling window would silently reveal a new month every month and destroy the one-shot property |
+| D-008 | Sealed holdout is the **fixed date** `2025-10-01T00:00:00Z`, not a rolling 12-month window | a rolling window would silently reveal a new month every month and destroy the one-shot property. **Approved by Parham 2026-10-01** |
 | D-009 | Holdout is double-locked: `allow_holdout=True` **and** `TBOT_UNSEAL_HOLDOUT=G4`, every unsealing logged | accidental access must be impossible, not merely discouraged |
 | D-010 | `round_price` and `floor_qty` both round **down** | never round up into funds we do not have or a price we did not intend |
 | D-011 | Parquet stores OHLCV as `decimal128(38,12)`; research casts to float on load | exact storage, fast research |
@@ -274,6 +277,10 @@ drawdown exceeds the 95th percentile of the bootstrap distribution. Capital scal
 | D-013 | `Clock` protocol injected; no `datetime.now()` in `core/`, `risk/`, `execution/` | deterministic backtests and testable live code |
 | D-014 | `scripts/` is a Python package so `mypy` and `ruff` cover operational scripts too | the probe and recorder are production code |
 | D-015 | Tabdeal trade prices/quantities stored as TEXT in SQLite | SQLite has no decimal type; TEXT round-trips exactly |
+| D-016 | Gate G1 split into G1a (Binance research data) and G1b (Tabdeal recorder + basis, ≥ 7 days) | the basis measurement needs a week of live recording; phase 2 must not wait for it. **Approved by Parham 2026-10-01** |
+| D-017 | data.binance.vision spot files switched kline timestamps from ms to µs on 2025-01-01; the loader detects the unit per file by magnitude and normalises to UTC | mixing units silently shifts every bar of the recent history by orders of magnitude |
+| D-018 | Fee default stays 20 bps per side until Parham supplies the real Tabdeal fee tier | conservative placeholder; the real tier only improves results |
+| D-019 | The recorder also stores a periodic order-book snapshot (default every 60 s) | phase 3 needs a measured Tabdeal execution-cost model, not a guessed slippage number |
 
 ---
 

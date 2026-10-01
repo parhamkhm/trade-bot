@@ -104,6 +104,19 @@ ACCEPTANCE:
   - Tests: respx-mocked responses only; cover signature construction against a known vector, skew
     computation, spread/depth math, saturated detection, 429 backoff, and missing-credentials path.
   - uv run pytest / ruff check . / mypy all green.
+  - Path discovery: try BOTH the /r/api/v1 and /api/v1 prefixes for every public read and report which one
+    answers (status code and latency for each); do not hardcode an assumption.
+  - Symbol discovery: derive the correct symbol format from exchangeInfo itself (BTCUSDT vs BTC_USDT vs a
+    separate tabdealSymbol field). Verify BTCUSDT exists and is TRADING; if it does not exist, list every
+    available BTC market found in exchangeInfo and say so prominently in the summary.
+  - Report the maximum `limit` that /trades actually accepts (probe increasing values until it is rejected
+    or capped, and report both the requested and the returned count).
+  - If the host is unreachable, times out, or returns 403/451, exit with a non-zero code and a single clear
+    message naming the URL, status and likely cause (geo-block / firewall / wrong host). That result alone
+    answers the main G0 question and must not be buried in a stack trace.
+  - Private part: if the API exposes key permissions (e.g. an account or API-key-status field), print them,
+    and if trade or withdrawal permission is enabled, print a loud WARNING and set a flag in the JSON report
+    (`key_permissions_unsafe: true`). Balances only; never list or touch orders.
 OUT OF SCOPE: any order, cancel, OCO, userDataStream or withdrawal endpoint — not even unused helpers,
   constants or URLs; WebSocket; writing to config; touching core/types.py or docs/SPEC.md.
 REPORT BACK: files changed, test results, the real values discovered for SPEC section 9 open questions
@@ -139,6 +152,13 @@ ACCEPTANCE:
   - Tests use small local fixtures (a handful of rows), never the network. Cover: checksum mismatch,
     gap detection, duplicate detection, DST-free UTC handling, holdout exclusion, idempotent re-run.
   - uv run pytest / ruff check . / mypy all green.
+  - Timestamp units: data.binance.vision spot files switched kline timestamps from milliseconds to
+    microseconds starting 2025-01-01. Do not trust the date alone — detect the unit per file from the
+    magnitude of the value, normalise everything to UTC, and add tests covering a millisecond-era file, a
+    microsecond-era file, and the boundary month. A misdetected unit must fail loudly, never silently.
+  - Portability: the script must run both on Windows (Parham's laptop) and on Ubuntu (the server), since
+    Binance may be unreachable from Iran. No POSIX-only paths or shell assumptions; use pathlib. The output
+    Parquet store must be byte-identical in structure on both platforms so it can simply be copied.
 OUT OF SCOPE: strategies, indicators, the Tabdeal recorder, any network call in tests, modifying
   core/types.py, core/config.py or docs/SPEC.md.
 REPORT BACK: files changed, actual data coverage (first/last bar per symbol/timeframe, row counts),
@@ -169,6 +189,11 @@ ACCEPTANCE:
   - Tests use recorded JSON fixtures: restart resumption, duplicate trades, out-of-order ids, an empty
     hour, a saturated response, and a candle whose boundary falls exactly on an hour edge.
   - uv run pytest / ruff check . / mypy all green.
+  - Order-book snapshots: every `orderbook_interval_seconds` (default 60, configurable) poll /depth and
+    store one row in a separate SQLite table `orderbook(ts_ms, best_bid, best_ask, spread_bps,
+    depth_bid_01pct, depth_ask_01pct, depth_bid_05pct, depth_ask_05pct, depth_bid_1pct, depth_ask_1pct)`
+    with prices and sizes as TEXT. Phase 3 uses this to model the real Tabdeal execution cost instead of a
+    guessed slippage number, so the cumulative-depth maths must be tested against a fixture book.
 OUT OF SCOPE: private endpoints, orders, WebSocket, strategy code, modifying core/ or docs/SPEC.md.
 REPORT BACK: files changed, test results, measured write rate and database growth per day, and the
   recommended polling interval you actually implemented with the reason.
@@ -199,6 +224,20 @@ ACCEPTANCE:
   - systemd unit that manages the compose project and starts on boot.
   - src/tbot/monitoring/logging.py: structlog JSON logging with a processor that redacts any value coming
     from Secrets and any key matching api_key/secret/token/signature; tested.
+  - Start the document with `lsb_release -a` and support BOTH Ubuntu 22.04 and 24.04 (note every command
+    that differs between them).
+  - Lockout-safe hardening, marked clearly as "ASK PARHAM BEFORE RUNNING": first `ss -tlnp` to find the
+    ACTUAL SSH port and list every listening service, warn explicitly which of them ufw will block, allow
+    the real SSH port (never assume 22), set up key-based login and TEST it in a SECOND SSH session that
+    stays open, and only then disable password authentication. Order the steps so that no step can lock
+    Parham out of his own server.
+  - Clone the private repo with a READ-ONLY GitHub deploy key generated on the server (ssh-keygen,
+    add the public key as a deploy key), not a personal access token.
+  - Include `curl -4 ifconfig.me` to obtain the server's static IP, and then step-by-step instructions for
+    creating the Tabdeal API key: read-only, withdrawal DISABLED, trading DISABLED, IP-whitelisted to that
+    address, stored only in .env with chmod 600.
+  - Document how to copy the Parquet store from the server to the Windows laptop and back
+    (`scp -r` and `rsync -avz --partial --progress`), including the Windows-side command form.
 OUT OF SCOPE: Telegram (phase 5), the trading bot service itself, firewall changes on Parham's real server
   (document them, do not run them), CI changes.
 REPORT BACK: files changed, the exact commands you verified, anything in CLAUDE.md section 2 that the
@@ -228,3 +267,25 @@ ACCEPTANCE: findings ranked BLOCKER / MAJOR / MINOR with file:line and a concret
 
 پس از تأییدت، T1/T2/T4 را موازی اجرا می‌کنم، بعد T3، بعد بازبینی، و گزارش نهایی را در
 `docs/reports/phase0-1-report.md` می‌نویسم.
+
+
+---
+
+## ۵. تصمیم‌های تأییدشدهٔ پرهام (۲۰۲۶-۱۰-۰۱)
+
+- تاریخ ثابت هولداوت `2025-10-01T00:00:00Z` با قفل دوگانه (`allow_holdout` + `TBOT_UNSEAL_HOLDOUT=G4`، با ثبت در لاگ) — **تأیید شد**.
+- شکستن گیت G1 به G1a (دادهٔ Binance) و G1b (ضبط‌کنندهٔ Tabdeal، حداقل ۷ روز با ≥۹۹٪ ساعت‌های کامل) — **تأیید شد**.
+- وابستگی‌های `pydantic-settings` و `PyYAML` (شناسهٔ D-006) — **تأیید شد**.
+- کارمزد پیش‌فرض ۲۰ bps در هر سمت تا زمانی که پرهام پلهٔ کارمزد واقعی را بفرستد — **ثابت می‌ماند** (D-018).
+
+افزوده‌های خواسته‌شدهٔ پرهام در بریف‌های T1 تا T4 بالا درج شده‌اند (کشف prefix و فرمت نماد، واحد زمانی ماکرو/میلی‌ثانیه،
+اسنپ‌شات دفتر سفارش، و رویهٔ ضد‌قفل‌شدن سرور).
+
+## ۶. ترتیب اجرا و قواعد ادغام
+
+۱. **T1 و T4 اولویت اول** (ضبط‌کننده باید هرچه زودتر روی سرور بالا بیاید تا G1b شروع به شمردن کند)، **T2 موازی**.
+۲. **T3** بعد از آماده‌شدن گزارش T1 (بازهٔ polling و سقف `limit` از همان گزارش می‌آید).
+۳. روی هر دیف `reviewer` اجرا می‌شود؛ کار روی شاخهٔ feature انجام می‌شود و فقط وقتی به `main` ادغام می‌شود که
+   `reviewer` هیچ موردی با شدت BLOCKER یا MAJOR گزارش نکند.
+۴. گزارش نهایی: `docs/reports/phase0-1-report.md` (فارسی) شامل آنچه ساخته شد و روش راستی‌آزمایی، دستورهای دقیق سرور
+   به ترتیب، آنچه از پرهام لازم است، و توصیهٔ G0/G1a.
