@@ -1,7 +1,8 @@
 # CLAUDE.md — Trading Bot Project Constitution
 
 > Master prompt for every Claude Code session in this repo. Read it fully before any task.
-> Owner: Parham. Talk to Parham in **Persian**; write code, comments, commit messages and docs in **English**.
+> Owner: Parham. **Terminal replies in English. Reports for Parham (task breakdowns, gate reports, questions,
+> recommendations) in Persian under `docs/reports/<name>.md`. Code, comments, commits and docs in English.**
 
 ---
 
@@ -60,7 +61,8 @@ stop before live trading — that is a successful result of this process, not a 
 7. **Small, typed, tested.** Python 3.12, type hints everywhere, `mypy --strict` on `core/`, `risk/`, `execution/`.
    No function longer than ~60 lines without a reason. Pure functions for indicators and strategy logic.
 8. **Honesty and push-back.** If a request from Parham (or from the plan) is illogical, unsafe or likely to produce
-   an imaginary result, say so clearly in Persian, explain why, and propose the correct way. Do not just agree.
+   an imaginary result, say so clearly, explain why, and propose the correct way. Do not just agree.
+   Short push-back goes in the terminal in English; a full written argument goes to `docs/reports/` in Persian.
 
 ## 4. Architecture
 
@@ -246,8 +248,9 @@ packages · new code has tests · no secrets · `docs/SPEC.md` decision log upda
 3. The agent that writes a strategy never evaluates it; `validation-analyst` does.
 4. Every change under `risk/` or `execution/` is reviewed by `reviewer`, then by Parham, before merge.
 5. Work on feature branches; small PRs; conventional commit messages.
-6. When a gate is reached, the orchestrator writes a short gate report in Persian for Parham with numbers,
-   a recommendation (go / no-go / fix) and what is needed from him.
+6. When a gate is reached, the orchestrator writes a short gate report in Persian for Parham at
+   `docs/reports/<name>.md` with numbers, a recommendation (go / no-go / fix) and what is needed from him,
+   then names the file path in the terminal reply.
 
 ## 11. References (read for design ideas; do not copy GPL code)
 
