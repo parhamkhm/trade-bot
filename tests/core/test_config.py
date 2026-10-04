@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -13,6 +14,19 @@ from tbot.core.config import Config, RuntimeConfig, Secrets, load_config
 from tbot.core.types import Timeframe
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.fixture(autouse=True)
+def _isolate_secrets_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Keep a developer's real .env and TBOT_* environment out of these tests.
+
+    pydantic-settings reads both the process environment and a repo-root .env, so without this
+    a machine with real credentials would feed them into the test process.
+    """
+    for name in list(os.environ):
+        if name.startswith("TBOT_"):
+            monkeypatch.delenv(name, raising=False)
+    monkeypatch.chdir(tmp_path)
 
 
 def test_default_yaml_loads_and_matches_schema():

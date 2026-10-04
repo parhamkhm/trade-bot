@@ -25,6 +25,8 @@ data:
   history_start: 2018-01-01T00:00:00Z
   # SEALED HOLDOUT — fixed calendar date, never a rolling window (decision D-008).
   # No code may load bars with ts >= this value before gate G4.
+  # Editing this line does NOT unseal anything: the enforced boundary is the code constant
+  # CANONICAL_HOLDOUT_START, and a mismatch here is refused and logged (D-026, D-030).
   holdout_start: 2025-10-01T00:00:00Z
 
 exchange:

@@ -75,6 +75,9 @@ class DataConfig(_Base):
     symbols: tuple[str, ...] = ("BTCUSDT", "ETHUSDT")
     timeframes: tuple[Timeframe, ...] = (Timeframe.H1, Timeframe.H4, Timeframe.D1)
     history_start: datetime = datetime(2018, 1, 1, tzinfo=UTC)
+    # DOCUMENTATION ONLY (decision D-030). The enforced seal is the code constant
+    # CANONICAL_HOLDOUT_START in tbot.data.binance_loader; a config that disagrees with it is
+    # refused and logged (D-026), so editing this value cannot unseal the holdout.
     holdout_start: datetime = datetime(2025, 10, 1, tzinfo=UTC)
 
     @field_validator("history_start", "holdout_start")

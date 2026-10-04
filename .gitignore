@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+deploy/recorder.env
 
 # Data (never committed). Anchored to the repo root so src/tbot/data and tests/data stay tracked.
 /data/
@@ -9,11 +10,14 @@
 *.sqlite
 *.sqlite3
 *.db
-*.zip
-*.csv
+# Bulk market-data formats are ignored only under data/ (see /data/ above), not repo-wide:
+# blanket *.csv / *.zip rules silently hid legitimate test fixtures.
+!tests/**/fixtures/**
 
 # Reports / artifacts produced by runs
 research/reports/*.html
+# Probe reports contain account balances (MINOR-15) -- never committed.
+research/reports/tabdeal_probe_*.json
 /out/
 /logs/
 *.log
