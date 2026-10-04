@@ -35,6 +35,11 @@ You should see `Ubuntu 22.04.x LTS (jammy)` or `Ubuntu 24.04.x LTS (noble)`. Bot
 covered below; every place a command differs between the two is called out explicitly.
 Everything else is identical on both.
 
+**Ubuntu 26.04 ("resolute")** — the real Turkey VPS runs this. Verified there on 2026-10-04:
+Docker's official apt repo has a `resolute` suite (section 7.3 works unchanged), the uv
+installer works, chrony is preinstalled, and `ssh.socket` is active — so sshd is
+socket-activated exactly as described for 24.04 in section 5.
+
 ---
 
 ## 1. Reconnaissance — find out what's actually running (read-only, safe)
@@ -231,6 +236,20 @@ Port <real-ssh-port>
 PasswordAuthentication no
 PermitRootLogin prohibit-password
 ```
+
+> **Drop-in files override `sshd_config` (verified on the real server, Ubuntu 26.04).**
+> `sshd_config` starts with `Include /etc/ssh/sshd_config.d/*.conf`, and for each keyword sshd
+> keeps the **first** value it reads. Cloud images ship
+> `/etc/ssh/sshd_config.d/50-cloud-init.conf` with `PasswordAuthentication yes`, which wins
+> over anything you write further down in `sshd_config` — editing `sshd_config` alone leaves
+> password login **on**. Put the hardening in its own early drop-in instead:
+> ```
+> $ printf 'PasswordAuthentication no\nPermitRootLogin prohibit-password\nKbdInteractiveAuthentication no\n' | sudo tee /etc/ssh/sshd_config.d/00-tbot-hardening.conf
+> ```
+> and always check the **effective** values, not the file you edited:
+> ```
+> $ sudo sshd -T | grep -Ei '^(port|passwordauthentication|permitrootlogin|kbdinteractiveauthentication) '
+> ```
 
 Before restarting the SSH daemon, validate the config file so a typo can't break it:
 
