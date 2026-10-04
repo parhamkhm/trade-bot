@@ -1,0 +1,44 @@
+# Manages the `recorder` Docker Compose project so it starts on boot and
+# restarts if `docker compose up` itself fails. The container-level
+# `restart: unless-stopped` in docker-compose.yml already handles crashes of
+# the recorder process itself; this unit's job is the layer above that —
+# making sure Docker and the compose project come back up after a server
+# reboot or after the docker daemon restarts.
+#
+# Install (see deploy/SERVER_SETUP.md for the full, copy-paste version):
+#   sudo cp deploy/systemd/tbot-recorder.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now tbot-recorder.service
+#
+# ASSUMPTION: the repo is cloned to /opt/tbot/trade-bot and the compose
+# project is managed by the user "tbot" (a member of the `docker` group).
+# deploy/SERVER_SETUP.md sets up exactly this path and user. If you use a
+# different path or user, edit WorkingDirectory=, the ExecStart/ExecStop
+# paths, and User= below to match before installing.
+
+[Unit]
+Description=tbot Tabdeal recorder (docker compose project)
+Documentation=file:///opt/tbot/trade-bot/deploy/SERVER_SETUP.md
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=tbot
+Group=docker
+WorkingDirectory=/opt/tbot/trade-bot
+
+# "docker compose" (the plugin, with a space) — not the legacy "docker-compose"
+# binary. deploy/SERVER_SETUP.md installs the plugin form.
+ExecStart=/usr/bin/docker compose -f /opt/tbot/trade-bot/deploy/docker-compose.yml up -d --build
+ExecStop=/usr/bin/docker compose -f /opt/tbot/trade-bot/deploy/docker-compose.yml down
+ExecReload=/usr/bin/docker compose -f /opt/tbot/trade-bot/deploy/docker-compose.yml up -d --build --force-recreate
+
+TimeoutStartSec=120
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

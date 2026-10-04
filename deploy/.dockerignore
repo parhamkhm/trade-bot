@@ -1,0 +1,49 @@
+# Keep the build context (and therefore the image) small and secret-free.
+# Paths are relative to the repo root — the Dockerfile's build context is the
+# parent of deploy/ (see `context: ..` in deploy/docker-compose.yml).
+
+# Secrets — never let these into a build context, even by accident.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# VCS / editors
+.git/
+.github/
+.gitignore
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local Python/dev artifacts
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.hypothesis/
+.coverage
+coverage.xml
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Data and research outputs (never shipped in the image; the recorder writes
+# its own copy into the /app/data volume at runtime).
+data/
+research/
+.claude/
+
+# Docs not needed at runtime (README.md IS copied explicitly by the Dockerfile
+# because hatchling's build needs it present; do not add it here).
+docs/
+KICKOFF.md
+
+# Tests are not needed in the runtime image.
+tests/
