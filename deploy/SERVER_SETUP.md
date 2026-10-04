@@ -307,7 +307,15 @@ $ sudo ufw status verbose
 ```
 
 You should see your SSH port (and nothing else you didn't explicitly allow) listed as
-`ALLOW`. Test a **fourth**, brand-new SSH session now, exactly as in 4.3/5. If it works, the
+`ALLOW`.
+
+> **Docker-published ports bypass ufw.** Docker writes its own iptables rules for any
+> `ports:` mapping, ahead of ufw's chains, so a container port published as `8080:8080` is
+> reachable from the internet even though `ufw status` does not list it. Today
+> `deploy/docker-compose.yml` publishes **no** ports (the recorder only makes outbound
+> calls), so nothing is exposed. Any future dashboard or metrics endpoint **must** bind to
+> loopback only — `ports: ["127.0.0.1:8080:8080"]` — and be reached through an SSH tunnel
+> (`ssh -L 8080:127.0.0.1:8080 tbot@<server-ip>`), never published on `0.0.0.0`. Test a **fourth**, brand-new SSH session now, exactly as in 4.3/5. If it works, the
 server is hardened and still reachable.
 
 ---
@@ -359,7 +367,12 @@ $ sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin
 
 Add `tbot` to the `docker` group (this is the re-run from section 3, now that the group
 exists), then start a **new** SSH session so group membership takes effect — group changes
-never apply to an already-open session:
+never apply to an already-open session.
+
+> **The `docker` group is root-equivalent.** Any member can run
+> `docker run -v /:/host ...` and read or change every file on the server, `.env` and SSH keys
+> included, without `sudo`. Add only `tbot` to it, treat the `tbot` SSH key with the same care
+> as a root key, and never add a service account or a second person to this group.
 
 ```
 $ sudo usermod -aG docker tbot
