@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 
 import pandas as pd  # type: ignore[import-untyped]
@@ -11,6 +12,7 @@ import pytest
 
 from tbot.core.types import Timeframe
 from tbot.data import quality as q
+from tbot.data import store as store_mod
 
 
 def _ts(hour: int, *, day: int = 1, month: int = 6, year: int = 2024) -> datetime:
@@ -202,6 +204,138 @@ def test_reconcile_resample_detects_a_real_mismatch() -> None:
     assert any(m.column == "high" and m.ts == _ts(4) for m in mismatches)
 
 
+# --- reviewer finding m7: relative tolerance for large volumes ----------------------------------
+
+
+def _large_volume_rows() -> list[tuple[datetime, float, float, float, float, float]]:
+    return [
+        (_ts(1), 100.0, 101.0, 99.0, 100.5, 234567.891234),
+        (_ts(2), 100.5, 101.5, 99.5, 101.0, 345678.912345),
+        (_ts(3), 101.0, 102.0, 100.0, 101.5, 456789.123456),
+        (_ts(4), 101.5, 102.5, 100.5, 102.0, 567890.234567),
+    ]
+
+
+def test_reconcile_resample_tolerates_tiny_float_noise_on_large_volumes() -> None:
+    """Reviewer finding m7: comparing float-summed volume against a fixed 1e-9 *absolute*
+    tolerance produced false mismatches once volumes reach realistic magnitudes (95 of 2000
+    random 24h sums of hourly volumes in 1e4-9e5 were flagged purely from float accumulation
+    noise). A difference many orders of magnitude smaller than the value itself -- but bigger
+    than 1e-9 absolute -- must not be reported as a real mismatch."""
+    rows = _large_volume_rows()
+    hourly = _ohlcv_df(rows)
+    true_sum = sum(r[5] for r in rows)
+    noisy_stored_volume = true_sum + 4e-7  # realistic float accumulation noise
+    higher = _ohlcv_df(
+        [
+            (
+                _ts(4),
+                rows[0][1],
+                max(r[2] for r in rows),
+                min(r[3] for r in rows),
+                rows[-1][4],
+                noisy_stored_volume,
+            )
+        ]
+    )
+    mismatches = q.reconcile_resample(hourly, higher, higher_timeframe=Timeframe.H4)
+    assert mismatches == []
+
+
+def test_reconcile_resample_still_flags_a_genuine_mismatch_on_large_volumes() -> None:
+    """The relative-tolerance fix must not swallow a real mismatch: a volume off by 10 units on
+    a ~1.6M total is a genuine data problem, not float noise."""
+    rows = _large_volume_rows()
+    hourly = _ohlcv_df(rows)
+    true_sum = sum(r[5] for r in rows)
+    higher = _ohlcv_df(
+        [(_ts(4), rows[0][1], max(r[2] for r in rows), min(r[3] for r in rows), rows[-1][4], true_sum + 10.0)]
+    )
+    mismatches = q.reconcile_resample(hourly, higher, higher_timeframe=Timeframe.H4)
+    assert any(m.column == "volume" for m in mismatches)
+
+
+# --- decision D-036 (point 6): reconciliation mismatches tagged inside/outside outage windows ---
+
+
+def test_reconcile_resample_tags_mismatches_inside_a_gap_as_outage_window() -> None:
+    hourly = _hourly_fixture()
+    bin1 = hourly.iloc[1:5]
+    higher = _ohlcv_df(
+        [
+            (
+                _ts(4),
+                bin1["open"].iloc[0],
+                bin1["high"].max() + 1.0,  # deliberately wrong
+                bin1["low"].min(),
+                bin1["close"].iloc[-1],
+                bin1["volume"].sum(),
+            )
+        ]
+    )
+    gap_overlapping_bin1 = q.GapFinding(from_ts=_ts(1), to_ts=_ts(2), missing_bars=0)
+
+    mismatches = q.reconcile_resample(
+        hourly, higher, higher_timeframe=Timeframe.H4, gaps_1h=(gap_overlapping_bin1,)
+    )
+
+    assert len(mismatches) == 1
+    assert mismatches[0].in_outage_window is True
+
+
+def test_reconcile_resample_tags_mismatches_outside_any_outage_as_not_outage_window() -> None:
+    hourly = _hourly_fixture()
+    bin1 = hourly.iloc[1:5]
+    higher = _ohlcv_df(
+        [
+            (
+                _ts(4),
+                bin1["open"].iloc[0],
+                bin1["high"].max() + 1.0,
+                bin1["low"].min(),
+                bin1["close"].iloc[-1],
+                bin1["volume"].sum(),
+            )
+        ]
+    )
+    mismatches = q.reconcile_resample(hourly, higher, higher_timeframe=Timeframe.H4)
+    assert len(mismatches) == 1
+    assert mismatches[0].in_outage_window is False
+
+
+def test_reconcile_resample_tags_mismatches_overlapping_an_anomaly_as_outage_window() -> None:
+    hourly = _hourly_fixture()
+    bin1 = hourly.iloc[1:5]
+    higher = _ohlcv_df(
+        [
+            (
+                _ts(4),
+                bin1["open"].iloc[0],
+                bin1["high"].max() + 1.0,
+                bin1["low"].min(),
+                bin1["close"].iloc[-1],
+                bin1["volume"].sum(),
+            )
+        ]
+    )
+    anomaly = store_mod.AnomalyRecord(
+        raw_open_ts=_ts(2),
+        raw_close_ts=_ts(2) + timedelta(seconds=5),
+        duration_seconds=5.0,
+        n_trades=1,
+        volume=Decimal("0.1"),
+        classification="short",
+        action="stored_flagged",
+    )
+
+    mismatches = q.reconcile_resample(
+        hourly, higher, higher_timeframe=Timeframe.H4, anomalies_1h=(anomaly,)
+    )
+
+    assert len(mismatches) == 1
+    assert mismatches[0].in_outage_window is True
+
+
 # --- full report ------------------------------------------------------------------------------------
 
 
@@ -273,3 +407,100 @@ def test_build_quality_report_empty_frame() -> None:
     assert report.rows == 0
     assert report.first_ts is None
     assert report.gaps == []
+
+
+# --- decision D-036: "Source anomalies" report section ------------------------------------------
+
+
+def _sample_anomaly() -> store_mod.AnomalyRecord:
+    return store_mod.AnomalyRecord(
+        raw_open_ts=_ts(2),
+        raw_close_ts=_ts(2) + timedelta(seconds=5),
+        duration_seconds=5.0,
+        n_trades=3,
+        volume=Decimal("0.80000000"),
+        classification="short",
+        action="stored_flagged",
+    )
+
+
+def test_build_quality_report_includes_source_anomalies_section() -> None:
+    df = _ohlcv_df([(_ts(0), 100, 101, 99, 100, 10.0), (_ts(1), 100, 101, 99, 100, 5.0)])
+    anomaly = _sample_anomaly()
+
+    report = q.build_quality_report(
+        source="binance", symbol="BTCUSDT", timeframe=Timeframe.H1, df=df, anomalies=(anomaly,)
+    )
+
+    assert report.anomalies == [anomaly]
+    data = report.to_dict()
+    assert len(data["source_anomalies"]) == 1
+    row = data["source_anomalies"][0]
+    assert row["symbol"] == "BTCUSDT"
+    assert row["timeframe"] == "1h"
+    assert row["classification"] == "short"
+    assert row["action"] == "stored_flagged"
+    assert row["n_trades"] == 3
+    assert row["volume"] == "0.80000000"
+
+    markdown = report.render_markdown()
+    assert "## Source anomalies" in markdown
+    assert "short" in markdown
+    assert "stored_flagged" in markdown
+
+
+def test_build_quality_report_without_anomalies_omits_the_section() -> None:
+    df = _ohlcv_df([(_ts(0), 100, 101, 99, 100, 10.0)])
+    report = q.build_quality_report(source="binance", symbol="BTCUSDT", timeframe=Timeframe.H1, df=df)
+    assert report.anomalies == []
+    assert "## Source anomalies" not in report.render_markdown()
+
+
+# --- decision D-036 (point 6): reconciliation reports two numbers, hides neither ----------------
+
+
+def test_build_quality_report_reports_total_and_outside_outage_reconciliation_counts() -> None:
+    hourly = _hourly_fixture()
+    bin1 = hourly.iloc[1:5]
+    bin2 = hourly.iloc[5:9]
+    higher = _ohlcv_df(
+        [
+            (
+                _ts(4),
+                bin1["open"].iloc[0],
+                bin1["high"].max() + 1.0,  # deliberately wrong
+                bin1["low"].min(),
+                bin1["close"].iloc[-1],
+                bin1["volume"].sum(),
+            ),
+            (
+                _ts(8),
+                bin2["open"].iloc[0],
+                bin2["high"].max() + 1.0,  # deliberately wrong
+                bin2["low"].min(),
+                bin2["close"].iloc[-1],
+                bin2["volume"].sum(),
+            ),
+        ]
+    )
+
+    report = q.build_quality_report(
+        source="binance",
+        symbol="BTCUSDT",
+        timeframe=Timeframe.H4,
+        df=higher,
+        df_1h_for_reconciliation=hourly,
+    )
+
+    assert report.reconciliation is not None
+    assert len(report.reconciliation) == 2  # neither mismatch is hidden
+    outside = report.reconciliation_mismatches_outside_outages
+    assert outside is not None
+    assert len(outside) == 2  # no gaps/anomalies were supplied, so nothing is "explained" here
+
+    data = report.to_dict()
+    assert data["reconciliation_total_mismatches"] == 2
+    assert data["reconciliation_mismatches_outside_outages"] == 2
+    markdown = report.render_markdown()
+    assert "total mismatches: 2" in markdown
+    assert "mismatches outside outage windows: 2" in markdown

@@ -28,6 +28,16 @@ epsilon per file anyway). We instead derive the exact close instant as ``open_ti
 derived value minus that one-unit epsilon). This satisfies "ts is the bar's close time,
 normalised to the exact close instant" (docs/SPEC.md section 5.1) without guessing a unit for
 the epsilon.
+
+Decision D-036: real Binance history has rows around exchange outages that fail that sanity
+check (short bars, zero-trade bars with a nonsensical ``close_time``, bars whose window runs
+long) and rows with an off-grid ``open_time``. None of these abort the whole file any more --
+``parse_kline_csv_bytes`` classifies each one (``misaligned`` / ``short`` / ``empty_irregular``
+/ ``long``), stores the ones that are still causal (``short``, at the normal label) and drops
+the rest, returning both the clean records and the anomaly list. ``ingest_symbol_timeframe``
+persists the anomalies in the ``_dataset.json`` sidecar and auto-classifies any resulting gap as
+``exchange_outage``. Only genuine file-level corruption (an unparseable row, or an open/close
+timestamp unit disagreement within one row) still raises and aborts ingestion of that file.
 """
 
 from __future__ import annotations
@@ -62,6 +72,7 @@ __all__ = [
     "ChecksumMismatchError",
     "HoldoutLockError",
     "IngestOutcome",
+    "ParsedKlineCsv",
     "TimestampUnitError",
     "checksum_url",
     "detect_timestamp_unit",
@@ -137,6 +148,15 @@ def to_utc_datetime(value: int, unit: Literal["ms", "us"]) -> datetime:
     return _EPOCH + timedelta(microseconds=value)
 
 
+def _is_on_grid(ts: datetime, timeframe: Timeframe) -> bool:
+    """True when ``ts`` lies exactly on the timeframe grid (decision D-036, point 2):
+    UTC epoch multiples of ``timeframe.delta`` -- e.g. 1d bars must open at 00:00 UTC, 4h bars
+    at 00/04/08/12/16/20 UTC. ``timedelta`` supports exact (non-float) modulo, so this is an
+    exact check, not a tolerance-based one.
+    """
+    return (ts - _EPOCH) % timeframe.delta == timedelta(0)
+
+
 # ---------------------------------------------------------------------------------
 # URL building
 # ---------------------------------------------------------------------------------
@@ -209,15 +229,48 @@ def parse_checksum_text(text: str, filename: str) -> str:
 # ---------------------------------------------------------------------------------
 
 
-def parse_kline_csv_bytes(data: bytes, *, timeframe: Timeframe) -> list[store_mod.KlineRecord]:
+@dataclass(frozen=True, slots=True)
+class ParsedKlineCsv:
+    """Result of parsing one monthly kline CSV: the rows safe to store, plus every row-level
+    anomaly encountered (decision D-036) -- stored separately from each other so a caller never
+    has to guess which rows in ``records`` were flagged.
+    """
+
+    records: tuple[store_mod.KlineRecord, ...]
+    anomalies: tuple[store_mod.AnomalyRecord, ...]
+
+
+def parse_kline_csv_bytes(data: bytes, *, timeframe: Timeframe) -> ParsedKlineCsv:
     """Parse one Binance monthly kline CSV (already extracted from its ZIP) into records.
 
     Columns (no header in files observed through 2025-09; a header row, if ever present, is
     skipped defensively): open_time, open, high, low, close, volume, close_time, quote_volume,
     count, taker_buy_volume, taker_buy_quote_volume, ignore.
+
+    Decision D-036: a row-level anomaly (a short/empty/misaligned/overlong bar around a real
+    exchange outage) must never abort ingestion of the whole file. Only file-level problems do:
+    an unparseable row (wrong column count, non-numeric fields) or an open_time/close_time unit
+    disagreement within one row (which would mean the CSV itself is corrupt, not just one bar).
+    Every other row is classified and either stored (flagged) or dropped -- never silently
+    forward-filled or interpolated. See the module docstring for the close-time derivation this
+    builds on, and docs/SPEC.md section 5.1a for the full classification table:
+
+    * ``misaligned`` -- ``open_time`` is not exactly on the timeframe grid (UTC epoch multiples
+      of the timeframe's delta). Dropped: we have no causal way to know what "the 1h bar
+      starting at HH:28:14" is supposed to align to.
+    * ``short`` -- on-grid ``open_time``, but the raw ``close_time`` is earlier than
+      ``open_time + delta`` by more than 1 second, and the row still has trades. The data that
+      *is* there ends before the label, so it is stored at the normal label
+      (``open_time + delta``) and flagged -- this is causal, just thin.
+    * ``empty_irregular`` -- an irregular ``close_time`` (including ``close_time < open_time``)
+      with zero trades. Dropped: there is nothing to store.
+    * ``long`` -- on-grid ``open_time``, raw ``close_time`` later than ``open_time + delta`` by
+      more than 1 second. Dropped: the row's data extends past its label, which is look-ahead if
+      stored at that label.
     """
     text = data.decode("utf-8")
     records: list[store_mod.KlineRecord] = []
+    anomalies: list[store_mod.AnomalyRecord] = []
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line:
@@ -234,36 +287,75 @@ def parse_kline_csv_bytes(data: bytes, *, timeframe: Timeframe) -> list[store_mo
         open_unit = detect_timestamp_unit(open_time_raw)
         close_unit = detect_timestamp_unit(close_time_raw)
         if open_unit != close_unit:
+            # File-level corruption, not a per-row anomaly: still aborts the whole file.
             raise TimestampUnitError(
                 f"open_time unit ({open_unit}) disagrees with close_time unit ({close_unit}) "
                 f"in row {line!r}"
             )
 
         open_dt = to_utc_datetime(open_time_raw, open_unit)
-        close_ts = open_dt + timeframe.delta  # exact close instant; see module docstring
-
         close_raw_dt = to_utc_datetime(close_time_raw, close_unit)
+        nominal_close = open_dt + timeframe.delta  # exact close instant; see module docstring
         epsilon = timedelta(milliseconds=1) if close_unit == "ms" else timedelta(microseconds=1)
-        expected_close_raw = close_ts - epsilon
-        if abs((close_raw_dt - expected_close_raw).total_seconds()) > 1.0:
-            raise ValueError(
-                f"close_time {close_raw_dt.isoformat()} is not open_time + {timeframe.value} - "
-                f"1 {close_unit} ({expected_close_raw.isoformat()}) for row {line!r}"
+        expected_duration_seconds = (timeframe.delta - epsilon).total_seconds()
+        duration_seconds = (close_raw_dt - open_dt).total_seconds()
+        diff_seconds = duration_seconds - expected_duration_seconds
+        n_trades = int(parts[8])
+        volume = Decimal(parts[5])
+
+        def _anomaly(
+            classification: str,
+            action: str,
+            *,
+            _open_dt: datetime = open_dt,
+            _close_raw_dt: datetime = close_raw_dt,
+            _duration_seconds: float = duration_seconds,
+            _n_trades: int = n_trades,
+            _volume: Decimal = volume,
+        ) -> store_mod.AnomalyRecord:
+            return store_mod.AnomalyRecord(
+                raw_open_ts=_open_dt,
+                raw_close_ts=_close_raw_dt,
+                duration_seconds=_duration_seconds,
+                n_trades=_n_trades,
+                volume=_volume,
+                classification=classification,
+                action=action,
             )
 
-        records.append(
-            store_mod.KlineRecord(
-                ts=close_ts,
-                open=Decimal(parts[1]),
-                high=Decimal(parts[2]),
-                low=Decimal(parts[3]),
-                close=Decimal(parts[4]),
-                volume=Decimal(parts[5]),
-                quote_volume=Decimal(parts[7]),
-                trades=int(parts[8]),
+        def _record(
+            ts: datetime, *, _parts: list[str] = parts, _volume: Decimal = volume, _n_trades: int = n_trades
+        ) -> store_mod.KlineRecord:
+            return store_mod.KlineRecord(
+                ts=ts,
+                open=Decimal(_parts[1]),
+                high=Decimal(_parts[2]),
+                low=Decimal(_parts[3]),
+                close=Decimal(_parts[4]),
+                volume=_volume,
+                quote_volume=Decimal(_parts[7]),
+                trades=_n_trades,
             )
-        )
-    return records
+
+        if not _is_on_grid(open_dt, timeframe):
+            anomalies.append(_anomaly("misaligned", "dropped"))
+            continue
+
+        if abs(diff_seconds) <= 1.0:
+            records.append(_record(nominal_close))  # normal row, no anomaly
+            continue
+
+        if n_trades == 0:
+            anomalies.append(_anomaly("empty_irregular", "dropped"))
+        elif diff_seconds < -1.0:
+            anomalies.append(_anomaly("short", "stored_flagged"))
+            records.append(_record(nominal_close))  # causal: label is at/after the real data
+        elif diff_seconds > 1.0:
+            anomalies.append(_anomaly("long", "dropped"))  # data after the label -> look-ahead
+        else:  # pragma: no cover - diff_seconds > 1.0 in magnitude is exhaustive above
+            raise ValueError(f"unreachable close_time classification for row {line!r}")
+
+    return ParsedKlineCsv(records=tuple(records), anomalies=tuple(anomalies))
 
 
 # ---------------------------------------------------------------------------------
@@ -281,11 +373,26 @@ class IngestOutcome:
     skipped: tuple[str, ...]
     rows_in_store: int
     gaps: tuple[store_mod.GapRecord, ...]
+    anomalies: tuple[store_mod.AnomalyRecord, ...] = ()
 
 
 def _as_py_datetime(value: datetime) -> datetime:
     to_pydatetime = getattr(value, "to_pydatetime", None)
     return to_pydatetime() if callable(to_pydatetime) else value
+
+
+def _anomaly_overlaps_gap(
+    anomaly: store_mod.AnomalyRecord, gap_from: datetime, gap_to: datetime
+) -> bool:
+    """True when ``anomaly``'s raw time window intersects the open interval ``(gap_from, gap_to)``
+    a gap spans. Decision D-036 (point 4): a gap caused by a row this module dropped must be
+    auto-classified ``exchange_outage``, never left ``unknown`` -- the anomaly row *is* the
+    explanation. ``raw_close_ts`` can precede ``raw_open_ts`` (an ``empty_irregular`` row), so
+    both ends are taken via ``min``/``max`` rather than assumed ordered.
+    """
+    lo = min(anomaly.raw_open_ts, anomaly.raw_close_ts)
+    hi = max(anomaly.raw_open_ts, anomaly.raw_close_ts)
+    return lo <= gap_to and hi >= gap_from
 
 
 def _last_month_before_holdout() -> tuple[int, int]:
@@ -412,9 +519,14 @@ def ingest_symbol_timeframe(
                 raise ValueError(f"{zip_name} contains no CSV entry")
             csv_bytes = zf.read(csv_names[0])
 
-        records = parse_kline_csv_bytes(csv_bytes, timeframe=timeframe)
-        store_mod.write_month_part(part_path, records)
+        parsed = parse_kline_csv_bytes(csv_bytes, timeframe=timeframe)
+        store_mod.write_month_part(part_path, list(parsed.records))
         sidecar.add_file(zip_name, actual_hex, verified=True)
+        # Decision D-036 (points 4/7): persist this month's anomalies so a re-run (idempotent,
+        # the sidecar already has a verified file + part on disk and never re-parses the CSV)
+        # and a --report-only run both still see them, instead of having to re-download to
+        # rediscover what was already classified.
+        sidecar.replace_anomalies_in_month(year, month, parsed.anomalies)
         downloaded.append(zip_name)
         # Minor fix 3 (fix round): persist after every month, not once at the end of the loop --
         # otherwise a crash on month 50 discards the verified-file record for months 1-49 and the
@@ -443,22 +555,38 @@ def ingest_symbol_timeframe(
             previous_classification = {
                 (g.from_ts, g.to_ts): g.classification for g in sidecar.gaps
             }
-            new_gaps = [
-                store_mod.GapRecord(
-                    from_ts=_as_py_datetime(f.from_ts),
-                    to_ts=_as_py_datetime(f.to_ts),
-                    missing_bars=f.missing_bars,
-                    classification=previous_classification.get(
-                        (_as_py_datetime(f.from_ts), _as_py_datetime(f.to_ts)), "unknown"
-                    ),
+            new_gaps = []
+            for f in findings:
+                from_ts = _as_py_datetime(f.from_ts)
+                to_ts = _as_py_datetime(f.to_ts)
+                classification = previous_classification.get((from_ts, to_ts), "unknown")
+                # Decision D-036 (point 4): a gap that overlaps a row this module classified
+                # and dropped is never left "unknown" -- the dropped row already explains it.
+                # A classification a human already recorded (anything other than "unknown")
+                # is never overwritten.
+                if classification == "unknown" and any(
+                    _anomaly_overlaps_gap(a, from_ts, to_ts) for a in sidecar.anomalies
+                ):
+                    classification = "exchange_outage"
+                new_gaps.append(
+                    store_mod.GapRecord(
+                        from_ts=from_ts,
+                        to_ts=to_ts,
+                        missing_bars=f.missing_bars,
+                        classification=classification,
+                    )
                 )
-                for f in findings
-            ]
             gaps = tuple(new_gaps)
             sidecar.rows = len(ts_series)
             sidecar.first_ts = _as_py_datetime(ts_series.min())
             sidecar.last_ts = _as_py_datetime(ts_series.max())
         sidecar.gaps = list(gaps)
+
+    # Same reasoning as the rows/first_ts/last_ts/gaps trim just above: the persisted sidecar
+    # must only ever report pre-holdout anomalies, regardless of whether this particular run was
+    # unsealed, so a stray G4 run cannot leak holdout-year anomaly rows into a file nobody
+    # double-locks.
+    sidecar.anomalies = [a for a in sidecar.anomalies if a.raw_open_ts < CANONICAL_HOLDOUT_START]
 
     sidecar.holdout_start = CANONICAL_HOLDOUT_START
     sidecar.downloaded_at = now
@@ -471,6 +599,7 @@ def ingest_symbol_timeframe(
         skipped=tuple(skipped),
         rows_in_store=sidecar.rows,
         gaps=gaps,
+        anomalies=tuple(sidecar.anomalies),
     )
 
 

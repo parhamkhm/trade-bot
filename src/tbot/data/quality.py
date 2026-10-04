@@ -12,7 +12,8 @@ Expected ``DataFrame`` columns: ``ts`` (tz-aware UTC, the bar's CLOSE time), ``o
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+import math
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from itertools import pairwise
@@ -22,13 +23,16 @@ from typing import Any
 import pandas as pd  # type: ignore[import-untyped]
 
 from tbot.core.types import Timeframe
+from tbot.data import store as store_mod
 
 __all__ = [
+    "RECONCILIATION_REL_TOLERANCE",
     "RECONCILIATION_TOLERANCE",
     "RETURN_OUTLIER_THRESHOLD",
     "GapFinding",
     "OutlierFinding",
     "QualityReport",
+    "ReconciliationMismatch",
     "build_quality_report",
     "coverage_by_month",
     "find_duplicate_timestamps",
@@ -50,7 +54,14 @@ RETURN_OUTLIER_THRESHOLD: dict[Timeframe, float] = {
     Timeframe.D1: 0.40,
 }
 
+# Reviewer finding m7: comparing float-summed resampled values against a fixed *absolute*
+# tolerance alone produced false mismatches once volumes reach realistic magnitudes (95 of 2000
+# random 24h sums of hourly volumes in 1e4-9e5 flagged as "mismatched" purely from float
+# accumulation noise). ``math.isclose``'s combined rule -- tolerance = max(rel_tol * max(|a|,
+# |b|), abs_tol) -- fixes this: the relative term scales with the value for large numbers, and
+# the absolute term still catches a genuine mismatch between two small/zero values.
 RECONCILIATION_TOLERANCE = 1e-9
+RECONCILIATION_REL_TOLERANCE = 1e-12
 
 _RESAMPLE_RULE: dict[Timeframe, str] = {Timeframe.H4: "4h", Timeframe.D1: "1D"}
 
@@ -86,12 +97,20 @@ class OutlierFinding:
 
 @dataclass(frozen=True, slots=True)
 class ReconciliationMismatch:
-    """One resampled higher-timeframe value that disagrees with the stored value."""
+    """One resampled higher-timeframe value that disagrees with the stored value.
+
+    ``in_outage_window`` (decision D-036, point 6) is true when the higher-timeframe bin this
+    mismatch belongs to overlaps a gap or a source anomaly in either the 1h or the
+    higher-timeframe series -- i.e. a mismatch that is plausibly just a symptom of the same
+    outage, not an independent data problem. G1a's reconciliation criterion is reported as two
+    numbers (total mismatches, and mismatches outside outage windows) rather than hiding either.
+    """
 
     ts: datetime
     column: str
     resampled: float
     stored: float
+    in_outage_window: bool = False
 
     @property
     def diff(self) -> float:
@@ -104,6 +123,7 @@ class ReconciliationMismatch:
             "resampled": self.resampled,
             "stored": self.stored,
             "diff": self.diff,
+            "in_outage_window": self.in_outage_window,
         }
 
 
@@ -199,13 +219,50 @@ def coverage_by_month(ts: pd.Series, timeframe: Timeframe) -> dict[str, dict[str
     return result
 
 
+def _windows_overlap(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> bool:
+    """True when the half-open-ish windows ``[a_start, a_end]`` and ``[b_start, b_end]`` overlap."""
+    return a_start <= b_end and b_start <= a_end
+
+
+def _bin_is_outage_window(
+    bin_start: datetime,
+    bin_end: datetime,
+    *,
+    gaps_1h: Sequence[GapFinding],
+    gaps_higher: Sequence[GapFinding],
+    anomalies_1h: Sequence[store_mod.AnomalyRecord],
+    anomalies_higher: Sequence[store_mod.AnomalyRecord],
+) -> bool:
+    for gap in (*gaps_1h, *gaps_higher):
+        if _windows_overlap(bin_start, bin_end, gap.from_ts, gap.to_ts):
+            return True
+    for anomaly in (*anomalies_1h, *anomalies_higher):
+        lo = min(anomaly.raw_open_ts, anomaly.raw_close_ts)
+        hi = max(anomaly.raw_open_ts, anomaly.raw_close_ts)
+        if _windows_overlap(bin_start, bin_end, lo, hi):
+            return True
+    return False
+
+
 def reconcile_resample(
-    df_1h: pd.DataFrame, df_higher: pd.DataFrame, *, higher_timeframe: Timeframe
+    df_1h: pd.DataFrame,
+    df_higher: pd.DataFrame,
+    *,
+    higher_timeframe: Timeframe,
+    gaps_1h: Sequence[GapFinding] = (),
+    gaps_higher: Sequence[GapFinding] = (),
+    anomalies_1h: Sequence[store_mod.AnomalyRecord] = (),
+    anomalies_higher: Sequence[store_mod.AnomalyRecord] = (),
 ) -> list[ReconciliationMismatch]:
     """Resample 1h bars to ``higher_timeframe`` (``label='right', closed='right'``) and compare.
 
     Both frames use ``ts`` as the bar's CLOSE time, which is already the right edge of the
     resampling window, so resampling directly on ``ts`` reproduces the higher-timeframe grid.
+
+    Decision D-036 (point 6): this never hides a mismatch. ``gaps_1h``/``gaps_higher`` and
+    ``anomalies_1h``/``anomalies_higher`` are used only to tag each mismatch's
+    ``in_outage_window`` -- every mismatch is still returned, tagged or not; the caller (
+    ``build_quality_report``) reports both the total count and the count outside outage windows.
     """
     rule = _RESAMPLE_RULE[higher_timeframe]
     indexed = df_1h.sort_values("ts").set_index("ts")
@@ -219,13 +276,32 @@ def reconcile_resample(
     # gaps are find_gaps()'s job, not a value mismatch, so they are not reported here.
     common = resampled.index.intersection(stored.index)
     for ts in common:
+        bin_end = ts.to_pydatetime()
+        bin_start = bin_end - higher_timeframe.delta
+        in_outage = _bin_is_outage_window(
+            bin_start,
+            bin_end,
+            gaps_1h=gaps_1h,
+            gaps_higher=gaps_higher,
+            anomalies_1h=anomalies_1h,
+            anomalies_higher=anomalies_higher,
+        )
         for column in ("open", "high", "low", "close", "volume"):
             resampled_value = float(resampled.loc[ts, column])
             stored_value = float(stored.loc[ts, column])
-            if abs(resampled_value - stored_value) > RECONCILIATION_TOLERANCE:
+            if not math.isclose(
+                resampled_value,
+                stored_value,
+                rel_tol=RECONCILIATION_REL_TOLERANCE,
+                abs_tol=RECONCILIATION_TOLERANCE,
+            ):
                 mismatches.append(
                     ReconciliationMismatch(
-                        ts=ts.to_pydatetime(), column=column, resampled=resampled_value, stored=stored_value
+                        ts=bin_end,
+                        column=column,
+                        resampled=resampled_value,
+                        stored=stored_value,
+                        in_outage_window=in_outage,
                     )
                 )
     return mismatches
@@ -252,12 +328,24 @@ class QualityReport:
     high_eq_low_bars: list[datetime] = field(default_factory=list)
     return_outliers: list[OutlierFinding] = field(default_factory=list)
     reconciliation: list[ReconciliationMismatch] | None = None
+    anomalies: list[store_mod.AnomalyRecord] = field(default_factory=list)
 
     @property
     def unclassified_gap_count(self) -> int:
         return sum(1 for g in self.gaps if g.classification == "unknown")
 
+    @property
+    def reconciliation_mismatches_outside_outages(self) -> list[ReconciliationMismatch] | None:
+        """Decision D-036 (point 6): the subset of ``reconciliation`` that is NOT explained by
+        an overlapping gap or source anomaly in either series -- the number that actually
+        matters for "is the data clean", as opposed to "is the data clean during an outage we
+        already know about"."""
+        if self.reconciliation is None:
+            return None
+        return [m for m in self.reconciliation if not m.in_outage_window]
+
     def to_dict(self) -> dict[str, Any]:
+        outside = self.reconciliation_mismatches_outside_outages
         return {
             "source": self.source,
             "symbol": self.symbol,
@@ -275,9 +363,17 @@ class QualityReport:
             "zero_volume_bars": [_iso(t) for t in self.zero_volume_bars],
             "high_eq_low_bars": [_iso(t) for t in self.high_eq_low_bars],
             "return_outliers": [o.to_dict() for o in self.return_outliers],
+            "source_anomalies": [
+                {"symbol": self.symbol, "timeframe": self.timeframe.value, **a.to_dict()}
+                for a in self.anomalies
+            ],
             "reconciliation": (
                 None if self.reconciliation is None else [m.to_dict() for m in self.reconciliation]
             ),
+            "reconciliation_total_mismatches": (
+                None if self.reconciliation is None else len(self.reconciliation)
+            ),
+            "reconciliation_mismatches_outside_outages": (None if outside is None else len(outside)),
             "unclassified_gap_count": self.unclassified_gap_count,
         }
 
@@ -325,15 +421,46 @@ class QualityReport:
             lines += ["", "## |return| outliers", ""]
             lines += [f"- {_iso(o.ts)}: {o.pct_return:+.2%}" for o in self.return_outliers]
 
+        if self.anomalies:
+            lines += [
+                "",
+                "## Source anomalies",
+                "",
+                "| symbol | timeframe | raw open | raw close | duration (s) | n_trades | volume "
+                "| class | action |",
+                "|---|---|---|---|---|---|---|---|---|",
+            ]
+            for a in self.anomalies:
+                lines.append(
+                    f"| {self.symbol} | {self.timeframe.value} | {_iso(a.raw_open_ts)} | "
+                    f"{_iso(a.raw_close_ts)} | {a.duration_seconds:.3f} | {a.n_trades} | {a.volume} | "
+                    f"{a.classification} | {a.action} |"
+                )
+
         if self.reconciliation is not None:
-            lines += ["", "## Resampling reconciliation", ""]
+            outside = self.reconciliation_mismatches_outside_outages or []
+            lines += [
+                "",
+                "## Resampling reconciliation",
+                "",
+                f"- total mismatches: {len(self.reconciliation)}",
+                f"- mismatches outside outage windows: {len(outside)}",
+            ]
             if self.reconciliation:
+                lines += ["", "### All mismatches", ""]
                 lines += [
                     f"- {_iso(m.ts)} {m.column}: resampled={m.resampled} stored={m.stored}"
+                    f"{' (outage window)' if m.in_outage_window else ''}"
                     for m in self.reconciliation
                 ]
             else:
-                lines.append("- OK: resampled values match stored values within 1e-9")
+                lines.append("- OK: resampled values match stored values within tolerance")
+            if outside:
+                lines += ["", "### Mismatches outside outage windows", ""]
+                lines += [
+                    f"- {_iso(m.ts)} {m.column}: resampled={m.resampled} stored={m.stored}"
+                    for m in outside
+                ]
 
         return "\n".join(lines) + "\n"
 
@@ -370,6 +497,8 @@ def build_quality_report(
     df: pd.DataFrame,
     df_1h_for_reconciliation: pd.DataFrame | None = None,
     gap_classifications: Mapping[tuple[datetime, datetime], str] | None = None,
+    anomalies: Sequence[store_mod.AnomalyRecord] = (),
+    anomalies_1h_for_reconciliation: Sequence[store_mod.AnomalyRecord] = (),
 ) -> QualityReport:
     """Run every check in this module over ``df`` and assemble one report.
 
@@ -381,18 +510,33 @@ def build_quality_report(
     sidecar by the caller) -- without it every gap is reported ``"unknown"`` forever, even one
     that was classified yesterday, because this function (like every function in this module) is
     pure and has no memory of its own.
+
+    ``anomalies`` (decision D-036) are this series' own source-row anomalies, for the "Source
+    anomalies" report section. ``anomalies_1h_for_reconciliation`` are the 1h series' anomalies,
+    used (together with ``anomalies``) only to tag reconciliation mismatches as inside/outside an
+    outage window -- both are typically read back from the Binance sidecar(s) by the caller.
     """
     if df.empty:
         return QualityReport(
-            source=source, symbol=symbol, timeframe=timeframe, rows=0, first_ts=None, last_ts=None
+            source=source, symbol=symbol, timeframe=timeframe, rows=0, first_ts=None, last_ts=None,
+            anomalies=list(anomalies),
         )
 
     ordered = df.sort_values("ts").reset_index(drop=True)
+    gaps = _apply_gap_classifications(find_gaps(ordered["ts"], timeframe), gap_classifications)
+
     reconciliation: list[ReconciliationMismatch] | None = None
     if timeframe in _RESAMPLE_RULE and df_1h_for_reconciliation is not None:
-        reconciliation = reconcile_resample(df_1h_for_reconciliation, ordered, higher_timeframe=timeframe)
-
-    gaps = _apply_gap_classifications(find_gaps(ordered["ts"], timeframe), gap_classifications)
+        gaps_1h = find_gaps(df_1h_for_reconciliation["ts"], Timeframe.H1)
+        reconciliation = reconcile_resample(
+            df_1h_for_reconciliation,
+            ordered,
+            higher_timeframe=timeframe,
+            gaps_1h=gaps_1h,
+            gaps_higher=gaps,
+            anomalies_1h=anomalies_1h_for_reconciliation,
+            anomalies_higher=anomalies,
+        )
 
     return QualityReport(
         source=source,
@@ -409,6 +553,7 @@ def build_quality_report(
         high_eq_low_bars=find_high_eq_low(ordered),
         return_outliers=find_return_outliers(ordered, timeframe),
         reconciliation=reconciliation,
+        anomalies=list(anomalies),
     )
 
 

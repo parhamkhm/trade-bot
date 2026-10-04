@@ -22,6 +22,7 @@ read path for research/strategy code is ``tbot.data.binance_loader.load_bars`` /
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -37,6 +38,7 @@ from tbot.core.types import Timeframe, ensure_utc
 __all__ = [
     "KLINE_SCHEMA",
     "TOOL_VERSION",
+    "AnomalyRecord",
     "DatasetSidecar",
     "FileRecord",
     "GapRecord",
@@ -131,6 +133,54 @@ class GapRecord:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class AnomalyRecord:
+    """One classified source-row anomaly from a Binance monthly kline file (decision D-036).
+
+    ``raw_open_ts``/``raw_close_ts`` are decoded directly from the CSV's ``open_time``/
+    ``close_time`` columns -- unlike ``KlineRecord.ts``, ``raw_close_ts`` is *not* derived and
+    may legitimately precede ``raw_open_ts`` (an ``empty_irregular`` row can have a close_time
+    before its open_time). ``classification`` is one of ``misaligned`` / ``short`` /
+    ``empty_irregular`` / ``long``; ``action`` is ``stored_flagged`` (only for ``short``, which
+    is kept using the derived close as its label) or ``dropped`` (every other classification).
+    """
+
+    raw_open_ts: datetime
+    raw_close_ts: datetime
+    duration_seconds: float
+    n_trades: int
+    volume: Decimal
+    classification: str
+    action: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "raw_open_ts", ensure_utc(self.raw_open_ts, "AnomalyRecord.raw_open_ts"))
+        object.__setattr__(self, "raw_close_ts", ensure_utc(self.raw_close_ts, "AnomalyRecord.raw_close_ts"))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "raw_open": self.raw_open_ts.isoformat().replace("+00:00", "Z"),
+            "raw_close": self.raw_close_ts.isoformat().replace("+00:00", "Z"),
+            "duration_seconds": self.duration_seconds,
+            "n_trades": self.n_trades,
+            "volume": str(self.volume),
+            "classification": self.classification,
+            "action": self.action,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> AnomalyRecord:
+        return cls(
+            raw_open_ts=datetime.fromisoformat(str(data["raw_open"]).replace("Z", "+00:00")),
+            raw_close_ts=datetime.fromisoformat(str(data["raw_close"]).replace("Z", "+00:00")),
+            duration_seconds=float(data["duration_seconds"]),
+            n_trades=int(data["n_trades"]),
+            volume=Decimal(str(data["volume"])),
+            classification=str(data["classification"]),
+            action=str(data["action"]),
+        )
+
+
 @dataclass(slots=True)
 class DatasetSidecar:
     """``_dataset.json`` — one per ``symbol/timeframe`` directory (docs/SPEC.md section 5.1)."""
@@ -144,6 +194,7 @@ class DatasetSidecar:
     holdout_start: datetime | None = None
     files: list[FileRecord] = field(default_factory=list)
     gaps: list[GapRecord] = field(default_factory=list)
+    anomalies: list[AnomalyRecord] = field(default_factory=list)
     downloaded_at: datetime | None = None
     tool_version: str = TOOL_VERSION
 
@@ -156,6 +207,25 @@ class DatasetSidecar:
     def add_file(self, name: str, sha256: str, *, verified: bool) -> None:
         self.files = [f for f in self.files if f.name != name]
         self.files.append(FileRecord(name=name, sha256=sha256, verified=verified))
+
+    def replace_anomalies_in_month(
+        self, year: int, month: int, new_anomalies: Sequence[AnomalyRecord]
+    ) -> None:
+        """Replace whatever anomalies were previously recorded for calendar month
+        ``year-month`` with ``new_anomalies``, keyed by ``raw_open_ts`` falling in that month.
+
+        Decision D-036 (point 4/7): anomalies must be persisted so re-runs and report-only runs
+        see them (idempotency), but re-downloading a month must not pile up duplicate anomaly
+        rows from a previous attempt -- so the old rows for that exact month are dropped first.
+        """
+        start = datetime(year, month, 1, tzinfo=UTC)
+        end = (
+            datetime(year + 1, 1, 1, tzinfo=UTC)
+            if month == 12
+            else datetime(year, month + 1, 1, tzinfo=UTC)
+        )
+        kept = [a for a in self.anomalies if not (start <= a.raw_open_ts < end)]
+        self.anomalies = sorted([*kept, *new_anomalies], key=lambda a: a.raw_open_ts)
 
     def to_dict(self) -> dict[str, Any]:
         def _iso(dt: datetime | None) -> str | None:
@@ -171,6 +241,7 @@ class DatasetSidecar:
             "holdout_start": _iso(self.holdout_start),
             "files": [f.to_dict() for f in self.files],
             "gaps": [g.to_dict() for g in self.gaps],
+            "anomalies": [a.to_dict() for a in self.anomalies],
             "downloaded_at": _iso(self.downloaded_at),
             "tool_version": self.tool_version,
         }
@@ -192,6 +263,7 @@ class DatasetSidecar:
             holdout_start=_parse(data.get("holdout_start")),
             files=[FileRecord.from_dict(f) for f in data.get("files", [])],
             gaps=[GapRecord.from_dict(g) for g in data.get("gaps", [])],
+            anomalies=[AnomalyRecord.from_dict(a) for a in data.get("anomalies", [])],
             downloaded_at=_parse(data.get("downloaded_at")),
             tool_version=str(data.get("tool_version", TOOL_VERSION)),
         )

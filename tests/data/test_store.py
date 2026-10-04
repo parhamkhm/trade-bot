@@ -156,3 +156,87 @@ def test_read_symbol_timeframe_is_private_not_a_public_reexport() -> None:
     assert "read_symbol_timeframe" not in store_mod.__all__
     assert not hasattr(store_mod, "read_symbol_timeframe")
     assert hasattr(store_mod, "_read_symbol_timeframe")
+
+
+# --- decision D-036: AnomalyRecord persistence in the sidecar -----------------------------------
+
+
+def _anomaly(
+    open_hour: int, *, classification: str = "short", action: str = "stored_flagged"
+) -> store_mod.AnomalyRecord:
+    return store_mod.AnomalyRecord(
+        raw_open_ts=datetime(2024, 6, 1, open_hour, tzinfo=UTC),
+        raw_close_ts=datetime(2024, 6, 1, open_hour, 0, 5, tzinfo=UTC),
+        duration_seconds=5.0,
+        n_trades=3,
+        volume=Decimal("0.80000000"),
+        classification=classification,
+        action=action,
+    )
+
+
+def test_anomaly_record_round_trips_through_dict() -> None:
+    original = _anomaly(3, classification="empty_irregular", action="dropped")
+    recovered = store_mod.AnomalyRecord.from_dict(original.to_dict())
+    assert recovered == original
+    assert isinstance(recovered.volume, Decimal)
+
+
+def test_anomaly_record_allows_close_before_open() -> None:
+    """``empty_irregular`` rows can have a close_time before their open_time -- the dataclass
+    must not reject that ordering, only require both timestamps to be UTC-aware."""
+    record = store_mod.AnomalyRecord(
+        raw_open_ts=datetime(2020, 12, 21, 14, tzinfo=UTC),
+        raw_close_ts=datetime(2020, 12, 21, 13, 49, 1, tzinfo=UTC),
+        duration_seconds=-759.0,
+        n_trades=0,
+        volume=Decimal("0"),
+        classification="empty_irregular",
+        action="dropped",
+    )
+    assert record.raw_close_ts < record.raw_open_ts
+
+
+def test_sidecar_round_trips_anomalies(tmp_path: Path) -> None:
+    path = store_mod.sidecar_path(
+        tmp_path / "parquet", source="binance", symbol="BTCUSDT", timeframe=Timeframe.H1
+    )
+    sidecar = store_mod.DatasetSidecar(source="binance", symbol="BTCUSDT", timeframe=Timeframe.H1)
+    sidecar.anomalies.append(_anomaly(3))
+    store_mod.save_sidecar(path, sidecar)
+
+    loaded = store_mod.load_sidecar(path, source="binance", symbol="BTCUSDT", timeframe=Timeframe.H1)
+    assert len(loaded.anomalies) == 1
+    assert loaded.anomalies[0].classification == "short"
+    assert loaded.anomalies[0].volume == Decimal("0.80000000")
+
+
+def test_replace_anomalies_in_month_drops_only_that_months_rows() -> None:
+    sidecar = store_mod.DatasetSidecar(source="binance", symbol="BTCUSDT", timeframe=Timeframe.H1)
+    june_anomaly = _anomaly(3)
+    july_anomaly = store_mod.AnomalyRecord(
+        raw_open_ts=datetime(2024, 7, 1, 5, tzinfo=UTC),
+        raw_close_ts=datetime(2024, 7, 1, 5, 0, 5, tzinfo=UTC),
+        duration_seconds=5.0,
+        n_trades=1,
+        volume=Decimal("0.1"),
+        classification="short",
+        action="stored_flagged",
+    )
+    sidecar.anomalies = [june_anomaly, july_anomaly]
+
+    # re-processing June must only replace June's rows, never July's.
+    new_june_anomaly = _anomaly(4, classification="long", action="dropped")
+    sidecar.replace_anomalies_in_month(2024, 6, [new_june_anomaly])
+
+    assert sidecar.anomalies == [new_june_anomaly, july_anomaly]
+
+
+def test_replace_anomalies_in_month_is_idempotent_on_rerun() -> None:
+    """Re-ingesting the same month twice with the same parsed anomalies must not duplicate rows
+    (decision D-036, point 7: idempotent re-runs)."""
+    sidecar = store_mod.DatasetSidecar(source="binance", symbol="BTCUSDT", timeframe=Timeframe.H1)
+    anomaly = _anomaly(3)
+    sidecar.replace_anomalies_in_month(2024, 6, [anomaly])
+    sidecar.replace_anomalies_in_month(2024, 6, [anomaly])
+    assert sidecar.anomalies == [anomaly]
