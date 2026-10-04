@@ -20,9 +20,17 @@ The heartbeat payload is a fixed, already-implemented contract
      "n_trades_total": int, "consecutive_errors": int}
 
 This script now additionally fails when `consecutive_errors` has crossed a threshold (the
-recorder is up but every poll is failing) or when `last_poll_ts` itself is older than
-expected (the process is wedged/dead even though the file still exists from before). Both
-thresholds are env-overridable so an operator can tune them without rebuilding the image.
+recorder is up but every poll is failing), when `last_poll_ts` itself is older than
+expected (the process is wedged/dead even though the file still exists from before), or
+(fourth fix round, m3) when `last_new_trade_ts_ms` is older than expected -- the process is
+polling fine (so the two checks above pass) but the exchange's own trade feed has gone
+stale, which neither of them can see. All three thresholds are env-overridable so an
+operator can tune them without rebuilding the image.
+
+m3 default (`TBOT_HEARTBEAT_MAX_TRADE_STALENESS_SECONDS=7200`): measured from the Turkey
+server 2026-10-04, BTCUSDT on Tabdeal is thin -- a 1000-trade/~29h sample had a p99
+inter-trade gap of 641s and a max of 2120s (35 min) -- so a tighter default (e.g. 1800s)
+would false-alarm during entirely normal quiet periods.
 
 Every failure mode here -- missing file, unreadable file, malformed JSON, missing/
 malformed fields, a clock that looks wrong -- resolves to a normal "unhealthy" result, never
@@ -38,19 +46,30 @@ from __future__ import annotations
 import json
 import os
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-__all__ = ["DEFAULT_MAX_CONSECUTIVE_ERRORS", "evaluate_heartbeat", "main"]
+__all__ = [
+    "DEFAULT_MAX_CONSECUTIVE_ERRORS",
+    "DEFAULT_MAX_TRADE_STALENESS_SECONDS",
+    "evaluate_heartbeat",
+    "main",
+]
 
 # Matches the ENV default in deploy/Dockerfile; kept here too so this module has a sane
 # default even if invoked without that ENV var set (e.g. directly, in a test).
 DEFAULT_MAX_CONSECUTIVE_ERRORS = 10
 
+# m3 (fourth fix round): see the module docstring for the measured BTCUSDT inter-trade-gap
+# stats this default is sized against.
+DEFAULT_MAX_TRADE_STALENESS_SECONDS = 7200.0
+
 # Small forward-clock-skew allowance: a `last_poll_ts` a few seconds in the future (container
 # clock vs. host clock jitter) should not itself be treated as a failure; anything beyond this
 # is suspicious enough to flag rather than silently accept.
 _MAX_CLOCK_SKEW_SECONDS = 5.0
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 def evaluate_heartbeat(
@@ -59,6 +78,7 @@ def evaluate_heartbeat(
     now: datetime,
     max_age_seconds: float,
     max_consecutive_errors: int,
+    max_trade_staleness_seconds: float = DEFAULT_MAX_TRADE_STALENESS_SECONDS,
 ) -> tuple[bool, str]:
     """Pure decision function: (healthy, reason). Never raises.
 
@@ -93,6 +113,25 @@ def evaluate_heartbeat(
             f"consecutive_errors={consecutive_errors} >= max {max_consecutive_errors} "
             "(the process is alive but every poll cycle is failing)",
         )
+
+    # m3 (fourth fix round): absent entirely (an older heartbeat payload, or a database with no
+    # trades recorded yet at all) is treated as unknown, not unhealthy -- this field did not exist
+    # before this fix round. `None` (present but no trade has ever been recorded) is likewise not
+    # itself a failure; `last_poll_ts`'s own staleness check already covers "nothing is happening
+    # at all" in that case.
+    if "last_new_trade_ts_ms" in payload:
+        last_new_trade_ts_ms = payload["last_new_trade_ts_ms"]
+        if last_new_trade_ts_ms is not None:
+            if not isinstance(last_new_trade_ts_ms, int) or isinstance(last_new_trade_ts_ms, bool):
+                return False, "heartbeat payload has a malformed 'last_new_trade_ts_ms'"
+            last_new_trade_ts = _EPOCH + timedelta(milliseconds=last_new_trade_ts_ms)
+            trade_age_seconds = (now - last_new_trade_ts).total_seconds()
+            if trade_age_seconds > max_trade_staleness_seconds:
+                return (
+                    False,
+                    f"last_new_trade_ts_ms is {trade_age_seconds:.0f}s old "
+                    f"(max {max_trade_staleness_seconds:.0f}s) -- the exchange trade feed looks stale",
+                )
 
     return True, "ok"
 
@@ -142,6 +181,14 @@ def main(argv: list[str] | None = None) -> int:  # noqa: ARG001 - argv kept for 
         )
     except ValueError:
         max_consecutive_errors = DEFAULT_MAX_CONSECUTIVE_ERRORS
+    try:
+        max_trade_staleness_seconds = float(
+            os.environ.get(
+                "TBOT_HEARTBEAT_MAX_TRADE_STALENESS_SECONDS", str(DEFAULT_MAX_TRADE_STALENESS_SECONDS)
+            )
+        )
+    except ValueError:
+        max_trade_staleness_seconds = DEFAULT_MAX_TRADE_STALENESS_SECONDS
 
     if not path.is_file():
         print(f"heartbeat file not found: {path}", file=sys.stderr)
@@ -158,6 +205,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: ARG001 - argv kept for 
         now=datetime.now(UTC),
         max_age_seconds=max_age_seconds,
         max_consecutive_errors=max_consecutive_errors,
+        max_trade_staleness_seconds=max_trade_staleness_seconds,
     )
     if not healthy:
         print(reason, file=sys.stderr)

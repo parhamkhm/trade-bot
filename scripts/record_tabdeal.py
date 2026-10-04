@@ -18,7 +18,7 @@ from the Turkey server. Overriding any of them needs no code edit: pass the CLI 
       poll_interval_seconds: 2.0
       orderbook_interval_seconds: 60
       grace_period_seconds: 60
-      trades_limit: 500
+      trades_limit: 1000
       depth_limit: 100
 
 That section is read directly from the YAML file by this script (``_load_recorder_overrides``
