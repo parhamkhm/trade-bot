@@ -18,12 +18,17 @@ services:
     container_name: tbot-recorder
     restart: unless-stopped
 
-    # m4 (fourth fix round): once consecutive_errors climbs past 5, the recorder itself backs
-    # off exponentially (capped at 300s; see TabdealRecorderService._next_wait_seconds) rather
-    # than retrying a dead/rate-limiting endpoint every poll_interval_seconds forever. That wait
-    # is always interruptible (threading.Event.wait, released the instant SIGTERM arrives), but
-    # give `docker compose stop`/`down` a realistic grace window anyway, covering an in-flight
-    # HTTP request plus its own retries, rather than the 10s default.
+    # m-H (fifth fix round, corrects an overstated claim from the fourth): this grace period
+    # covers the *normal* shutdown path -- the recorder's own poll/candle/heartbeat loop waits on
+    # an interruptible threading.Event (TabdealRecorderService.run_forever / _next_wait_seconds),
+    # released the instant SIGTERM arrives -- so 30s is generous for that, rather than the 10s
+    # default. It deliberately does NOT need to cover one in-flight tbot.execution.tabdeal_client
+    # call's own retries/backoff in the worst case, which can block considerably longer than 30s
+    # across several uninterruptible retry sleeps; if SIGTERM lands mid-call, Docker simply
+    # SIGKILLs once this window elapses. That is still safe: every SQLite write goes through one
+    # atomic transaction (RecorderStore.transaction) and every Parquet write is a
+    # tmp-file-plus-atomic-rename (tbot.data.candles.write_candle), so a kill at any point leaves
+    # either the previous, fully-committed state or nothing -- never a half-written row or file.
     stop_grace_period: 30s
 
     # Secrets live only in .env on the server (CLAUDE.md section 3.6); never in this
