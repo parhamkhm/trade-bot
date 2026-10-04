@@ -4,7 +4,7 @@ Status: **living document, owned by the orchestrator.** Sub-agents never edit th
 `src/tbot/core/types.py`; they propose changes in their task report.
 `CLAUDE.md` is the constitution (what and why); this file is the contract (exactly how).
 
-Last updated: 2026-10-01 · Phase: 0–1 in progress.
+Last updated: 2026-10-04 · Phase: 0–1 in progress.
 
 ---
 
@@ -167,6 +167,10 @@ Each `symbol/timeframe` directory carries a sidecar `_dataset.json`:
 `holdout_start = 2025-10-01T00:00:00Z` — a **fixed calendar date**, not a rolling "last 12 months"
 (decision D-008). Rules:
 
+0. `holdout_start` is a **canonical constant in code** (`2025-10-01T00:00:00Z`), not merely a config field.
+   The loader compares `DataConfig.holdout_start` against that constant and refuses to read (logging a
+   `refused: holdout_start overridden` row) when they differ and both locks are not engaged. A YAML edit must
+   never be able to unseal the holdout silently (decision D-026).
 1. The default loader returns only bars with `ts < holdout_start`.
 2. Loading holdout data requires **both** an explicit `allow_holdout=True` argument **and** the
    environment variable `TBOT_UNSEAL_HOLDOUT=G4`; otherwise the loader raises.
@@ -175,7 +179,8 @@ Each `symbol/timeframe` directory carries a sidecar `_dataset.json`:
 
 ### 5.3 Data-quality report
 
-`scripts/download_binance.py --report` writes `research/reports/data_quality_<date>.{json,md}` containing,
+`scripts/download_binance.py --report` writes `research/reports/data_quality_<date>_<symbol>_<timeframe>.{json,md}`
+(one report per series — decision D-027) containing,
 per symbol/timeframe: row count, coverage per month, missing bars with timestamps (and a classification,
 `unknown` until investigated), duplicate timestamps, out-of-order timestamps, zero-volume bars,
 bars where `high == low`, and |return| > 20 % outliers (1h) / > 40 % (1d).
@@ -188,13 +193,29 @@ Tabdeal has no kline endpoint, so 1h candles are built from polled public `/trad
 - SQLite at `data/tabdeal/trades.sqlite`:
   `trades(trade_id INTEGER PRIMARY KEY, ts_ms INTEGER, price TEXT, qty TEXT, is_buyer_maker INTEGER, recorded_ts_ms INTEGER)`
   (price/qty stored as TEXT to keep exact decimals),
-  `poll_log(poll_ts_ms, first_id, last_id, n_trades, saturated INTEGER, http_status, latency_ms)`,
-  `gaps(detected_ts_ms, from_id, to_id, reason)`.
+  `poll_log(poll_ts_ms, first_id, last_id, n_trades, n_items_received, saturated INTEGER, http_status,
+  latency_ms, window_span_seconds, coverage_ratio)` — `n_items_received` separates "the exchange returned
+  nothing" from "we received items and parsed none of them",
+  `gaps(detected_ts_ms, from_id, to_id, reason, hour_close_ms)` — `hour_close_ms` identifies WHICH hour an
+  empty-hour gap refers to, which G1b needs,
+  and `sweep_cursor` (how far the candle sweep has walked, so a trailing empty hour is not re-gapped on every
+  poll — see D-029).
+  The database carries `PRAGMA user_version` and migrates an older file in place by adding missing columns
+  (D-035); it never silently runs against a schema it does not understand.
 - Dedupe by `trade_id` (primary key, `INSERT OR IGNORE`).
-- `saturated = 1` when the response length equals the requested `limit` — a sign the polling interval is
-  too long; this is both logged and alerted.
+- **Saturation and data-loss risk (corrected, decision D-024 — provisional: observed from Parham's laptop, to be
+  confirmed by the server probe).** Tabdeal's `/trades` appears to be a *recent trades*
+  endpoint: it returns the most recent `limit` trades, so `count == limit` holds on essentially every poll
+  and carries no information. `saturated` is still recorded for raw fidelity, but it is **not** an alert and
+  **not** a gate criterion. The operational metrics are:
+  * `coverage_ratio = window_span_seconds / poll_interval_seconds` — how much margin the returned window
+    gives us. A poll is *at risk* when `coverage_ratio < 3`; that is what gets logged as a warning.
+  * actual data loss — the lowest returned trade id exceeds `last_stored_id + 1`. This is a real id gap and
+    already writes a `gaps` row.
+  `poll_log` therefore also stores `window_span_seconds` and `coverage_ratio`.
 - Candles are written to `data/parquet/klines/source=tabdeal/symbol=BTCUSDT/timeframe=1h/...` with the same
-  schema plus `complete BOOL` (false when a gap or saturation overlapped the bar) and `n_trades`.
+  schema plus `complete BOOL` and `n_trades`. `complete=False` is driven by a real trade-id gap or an
+  empty-hour gap overlapping the bar — never by the uninformative `saturated` flag (D-024).
   Resampling uses `label='right', closed='right'`; an hour with no trades produces **no bar** and a gap row —
   never a forward-filled bar.
 - A candle for hour H is written only after `H_end + grace` (grace default 60 s) has passed.
@@ -231,9 +252,9 @@ every file checksum-verified, zero duplicate timestamps, zero out-of-order times
 bar classified (no `unknown` left); 4h/1d values reconcile with 1h resampling within 1e-9; the timestamp
 unit of every file is detected and normalised (see D-017).
 
-**G1b — Live data (Tabdeal).** The recorder has run ≥ 7 consecutive days with ≥ 99 % of hours complete and
-zero saturated polls, and the Binance-vs-Tabdeal BTCUSDT basis is measured (median and p95, in bps) over
-that window. G1a and G1b are decided separately: phase 2 may start once G1a passes (decision D-016).
+**G1b — Live data (Tabdeal).** The recorder has run ≥ 7 consecutive days with ≥ 99 % of hours complete,
+zero trade-id gaps, and `coverage_ratio ≥ 3` on every poll (D-024), and the Binance-vs-Tabdeal BTCUSDT basis
+is measured (median and p95, in bps) over that window. G1a and G1b are decided separately: phase 2 may start once G1a passes (decision D-016).
 
 **G2 — Engine.** Truncation test passes exactly; a hand-computed 5-bar example matches the engine to the
 cent; buy-and-hold and SMA-filter equity curves match an independent vectorbt run to ≤ 0.1 % final equity;
@@ -281,6 +302,22 @@ drawdown exceeds the 95th percentile of the bootstrap distribution. Capital scal
 | D-017 | data.binance.vision spot files switched kline timestamps from ms to µs on 2025-01-01; the loader detects the unit per file by magnitude and normalises to UTC | mixing units silently shifts every bar of the recent history by orders of magnitude |
 | D-018 | Fee default stays 20 bps per side until Parham supplies the real Tabdeal fee tier | conservative placeholder; the real tier only improves results |
 | D-019 | The recorder also stores a periodic order-book snapshot (default every 60 s) | phase 3 needs a measured Tabdeal execution-cost model, not a guessed slippage number |
+| D-020 | The |return| outlier threshold in the quality report is 20 % for 1h and 4h, 40 % for 1d | the 4h threshold was unspecified; 20 % is the more sensitive choice. These thresholds flag bars for inspection in the report — they are not a gate criterion and never drop data |
+| D-021 | Only **complete monthly** Binance files are ingested; the current partial month (daily files) is not | research data stops at `holdout_start` = 2025-10-01, so the current month is irrelevant to research. Revisit only if live-vs-backtest comparison needs recent Binance bars |
+| D-022 | Binance bar close time is derived as `open_time + timeframe.delta`, not read from the file's `close_time` column | the file's `close_time` carries a unit-dependent epsilon (-1 ms before 2025, -1 µs after); deriving it removes that trap |
+| D-023 | `.gitignore` no longer blanket-ignores `*.csv` / `*.zip` repo-wide | the blanket rules silently hid legitimate test fixtures; bulk data is excluded by the anchored `/data/` rule instead |
+| D-024 | "Saturated" (`count == limit`) is recorded but demoted: the real metrics are `coverage_ratio = window_span / poll_interval` (< 3 = at risk) and actual trade-id gaps | `/trades` behaved as a *recent trades* endpoint (most recent `limit` trades, so `count == limit` on every call), which would have made G1b unsatisfiable and every candle incomplete. **Provenance:** observed from Parham's Windows laptop (his local network), **not** from the Turkey server, with ad-hoc read-only calls to the public `/trades` endpoint during T1/T3 development (2026-10-01/02); no raw output was kept in the repo. **Status: provisional — to be confirmed by the server probe (G0).** The probe has not been run on the server yet. The demotion is safe either way: if the server probe shows a different behaviour, `saturated` is still recorded and can be re-promoted |
+| D-025 | Shared order-book maths lives in `src/tbot/data/depth.py`, imported by both the probe script and the recorder | a library module importing from `scripts/` is the wrong dependency direction; one implementation keeps the phase-3 cost model consistent |
+| D-026 | The holdout boundary is a **code constant**, and any config that disagrees with it is refused and logged | review found that a one-line YAML edit (or `--config my.yaml`) unsealed 12 months of sealed data with no lock, no log and no error — the seal must not be a configuration value |
+| D-027 | The data-quality report is written per symbol/timeframe, not one file per date | one report per series is more useful than a merged one; SPEC updated to match the implementation rather than the reverse |
+| D-028 | Any public read path that bypasses the holdout filter (`store.read_symbol_timeframe`, `candles.read_candles`) is made private or requires an explicit `holdout_start` argument | a friendly, unguarded second read path is what a future phase-2 author would reach for by accident |
+| D-029 | The recorder keeps a `sweep_cursor` table in addition to the four documented tables | without it, a trailing empty hour is re-walked on every poll, writing ~2,160 duplicate gap rows per hour and degrading the overlap scan quadratically |
+| D-030 | `DataConfig.holdout_start` is **documentation only**; the enforced boundary is `CANONICAL_HOLDOUT_START` in `binance_loader.py`, and a config that disagrees is refused | keeps one source of truth after D-026 while leaving the value visible where a reader looks for it |
+| D-031 | Tabdeal response bodies are parsed with `parse_float=Decimal` | httpx's `.json()` turns JSON numbers into floats, rounding money before any `Decimal` conversion can preserve it |
+| D-032 | Binance ingestion **stops at** `CANONICAL_HOLDOUT_START`; the sealed year is downloaded once, at G4 | previously the whole holdout year was written to `data/`, leaving a stray `pd.read_parquet` as the last way to see sealed bars. Not downloading it is a stronger seal than guarding the reader |
+| D-033 | Secret redaction is **value-based**: the actual secret strings are registered and scrubbed from any rendered output, with the name/prefix patterns kept only as a second line of defence | a real Tabdeal key is a bare alphanumeric string, so pattern matching on `sk-`-style prefixes or `key=` shapes never catches it in a traceback |
+| D-034 | stdlib `logging` is routed through the structlog pipeline (`ProcessorFormatter`), plus a scrubbing `sys.excepthook` | silencing httpx was a point fix for one known leaker; phase 5 adds python-telegram-bot, which logs bot-token URLs |
+| D-035 | The recorder database carries `PRAGMA user_version` and an explicit migration path | `CREATE TABLE IF NOT EXISTS` silently skips new columns, which turned an existing database into a 5-second crash loop that the healthcheck could not see |
 
 ---
 
@@ -294,4 +331,6 @@ drawdown exceeds the 95th percentile of the bootstrap distribution. Capital scal
 5. **Server static IP** for the API-key whitelist.
 6. **`/trades` behaviour**: default and maximum `limit`, whether the window is id- or time-based — determines
    the recorder's polling interval.
+   *Partial, provisional:* from Parham's laptop it behaves as a recent-trades window (D-024). Still open until the
+   server probe confirms it and reports the maximum accepted `limit` and the window span.
 7. Whether CI should run on GitHub-hosted runners for a private repo (minutes cost) or a self-hosted runner.
