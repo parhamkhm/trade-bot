@@ -22,6 +22,10 @@ Exit codes:
   trade or withdrawal permission enabled (see ``report["key_permissions_unsafe"]``).
   CLAUDE.md section 3.6 requires a read-only key before phase 6 -- this must not be silently
   exit-0'd by CI or an operator's shell script.
+* ``130`` / ``143`` -- (m9a) the probe was interrupted mid-run by Ctrl+C/SIGINT or by SIGTERM
+  (e.g. systemd stopping the service) respectively, during what can be an hours-long
+  depth-sampling loop. A partial report (``report["interrupted"] = true``) is still written to
+  ``--out`` -- whatever was collected before the interruption is never silently lost.
 
 Nothing here is a real order, and nothing here can become one: see
 ``src/tbot/execution/tabdeal_client.py`` for the read-only surface this script calls.
@@ -31,11 +35,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import signal
 import statistics
 import sys
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -59,20 +64,22 @@ from tbot.monitoring.logging import configure_logging, register_secrets_for_logg
 __all__ = [
     "SystemClock",
     "build_symbol_filters",
+    "classify_key_permissions",
     "compute_clock_skew_ms",
     "cumulative_depth",
     "describe_unreachable_failure",
+    "detect_time_unit",
     "discover_max_trades_limit",
     "extract_nonzero_balances",
     "find_base_asset_markets",
     "find_symbol_entry",
+    "ids_contiguous_in_window",
     "is_saturated",
     "main",
     "probe_both_prefixes",
     "spread_bps_and_pct",
     "summarize_spreads",
     "trades_window_stats",
-    "unsafe_key_permissions",
 ]
 
 _DEFAULT_TRADES_LIMIT_CANDIDATES: tuple[int, ...] = (100, 500, 1000, 2000, 5000, 10_000)
@@ -124,6 +131,53 @@ def summarize_spreads(spreads_bps: Sequence[float]) -> dict[str, float]:
     }
 
 
+TimeUnit = Literal["s", "ms", "us", "unknown"]
+
+# m2 (reviewer finding): the recorder (tbot.data.tabdeal_recorder) assumes Tabdeal's /trades
+# `time` field is already integer milliseconds -- a Binance-style assumption that has never been
+# checked against this exchange specifically. Classify by order of magnitude: a current-era epoch
+# value is ~10 digits in seconds, ~13 in milliseconds, ~16 in microseconds. The boundaries below
+# sit mid-way between those bands (not at round powers of ten at the band edges) so they are not
+# fragile to which exact year the probe happens to run in.
+_SECONDS_MAGNITUDE_CEILING = 10**11
+_MS_MAGNITUDE_CEILING = 10**14
+_US_MAGNITUDE_CEILING = 10**17
+
+
+def detect_time_unit(times: Sequence[int]) -> TimeUnit:
+    """Classify the unit of a ``/trades`` window's ``time`` values by magnitude (m2).
+
+    Uses the *median* magnitude across the window, not just the first element, so one corrupted
+    or zero timestamp cannot flip the classification for an otherwise-consistent window.
+    Returns ``"unknown"`` for an empty window or a magnitude outside all three known bands.
+    """
+    if not times:
+        return "unknown"
+    magnitude = statistics.median(abs(t) for t in times)
+    if magnitude < _SECONDS_MAGNITUDE_CEILING:
+        return "s"
+    if magnitude < _MS_MAGNITUDE_CEILING:
+        return "ms"
+    if magnitude < _US_MAGNITUDE_CEILING:
+        return "us"
+    return "unknown"
+
+
+def ids_contiguous_in_window(ids: Sequence[int]) -> tuple[bool | None, int]:
+    """``(contiguous, missing_count)`` for a window's trade ids (m2).
+
+    ``contiguous`` is ``max(ids) - min(ids) + 1 == count`` (accounting for any duplicate id,
+    which would otherwise be misread as a gap). ``(None, 0)`` when there are fewer than two
+    distinct ids to judge contiguity from at all.
+    """
+    distinct = set(ids)
+    if len(distinct) < 2:
+        return None, 0
+    span = max(distinct) - min(distinct) + 1
+    missing = span - len(distinct)
+    return missing == 0, missing
+
+
 @dataclass(frozen=True, slots=True)
 class TradesWindowStats:
     count: int
@@ -132,13 +186,33 @@ class TradesWindowStats:
     span_seconds: float | None
     saturated: bool
     recommended_poll_interval_seconds: float | None
+    time_unit: TimeUnit
+    time_unit_disagrees_with_ms: bool
+    ids_contiguous: bool | None
+    missing_ids: int
 
 
 def trades_window_stats(trades: Any, requested_limit: int) -> TradesWindowStats:
     """Count/id-range/time-span/saturation for one ``/trades`` response, plus a recommended
-    polling interval with a 3x safety margin against saturating the same ``limit`` again."""
+    polling interval with a 3x safety margin against saturating the same ``limit`` again.
+
+    m2 (reviewer finding): also reports the detected ``time`` unit (the recorder assumes ms --
+    this checks that assumption rather than trusting it) and whether trade ids are contiguous
+    across the window (the recorder assumes no gap between consecutive polls).
+    """
     if not isinstance(trades, list):
-        return TradesWindowStats(0, None, None, None, False, None)
+        return TradesWindowStats(
+            count=0,
+            min_id=None,
+            max_id=None,
+            span_seconds=None,
+            saturated=False,
+            recommended_poll_interval_seconds=None,
+            time_unit="unknown",
+            time_unit_disagrees_with_ms=False,
+            ids_contiguous=None,
+            missing_ids=0,
+        )
     ids: list[int] = []
     times: list[int] = []
     for item in trades:
@@ -158,6 +232,11 @@ def trades_window_stats(trades: Any, requested_limit: int) -> TradesWindowStats:
     if span_seconds and span_seconds > 0 and count > 1:
         trade_rate = count / span_seconds
         recommended = requested_limit / (safety_margin * trade_rate)
+    time_unit = detect_time_unit(times)
+    # Only claim a disagreement when there is at least one time value to disagree with --
+    # an empty/missing `time` field is "no evidence", not "not milliseconds".
+    time_unit_disagrees_with_ms = bool(times) and time_unit != "ms"
+    ids_contiguous, missing_ids = ids_contiguous_in_window(ids)
     return TradesWindowStats(
         count=count,
         min_id=min(ids) if ids else None,
@@ -165,6 +244,10 @@ def trades_window_stats(trades: Any, requested_limit: int) -> TradesWindowStats:
         span_seconds=span_seconds,
         saturated=saturated,
         recommended_poll_interval_seconds=recommended,
+        time_unit=time_unit,
+        time_unit_disagrees_with_ms=time_unit_disagrees_with_ms,
+        ids_contiguous=ids_contiguous,
+        missing_ids=missing_ids,
     )
 
 
@@ -309,22 +392,45 @@ def build_symbol_filters(entry: dict[str, Any], symbol_label: str) -> SymbolFilt
         return None
 
 
-def unsafe_key_permissions(account_body: Any) -> tuple[bool, dict[str, Any]]:
-    """Return ``(unsafe, permissions_found)``. ``unsafe`` is True if trade or withdraw
-    permission is enabled on the key -- CLAUDE.md section 3.6 requires read-only keys pre-live."""
+KeyPermissionState = Literal["safe", "unsafe", "unknown"]
+
+# m9b (reviewer finding): these are the only fields that actually say anything about trade/
+# withdraw permission. `canDeposit` is tracked in `found` for visibility but never drives the
+# safe/unsafe/unknown classification -- a key with only `canDeposit` present tells us nothing
+# about trade/withdraw permission either way.
+_PERMISSION_INDICATOR_KEYS: tuple[str, ...] = ("canTrade", "canWithdraw", "permissions")
+
+
+def classify_key_permissions(account_body: Any) -> tuple[KeyPermissionState, dict[str, Any]]:
+    """Classify the Tabdeal API key's trade/withdraw permission from an ``account`` response.
+
+    Three states, not two (m9b -- reviewer finding): the previous version treated "none of
+    canTrade/canWithdraw/permissions are present in the response" as ``unsafe=False``, silently
+    reporting "safe" by default and exiting 0 -- CLAUDE.md section 3.6 requires a read-only key
+    before phase 6, and that silent fail-open meant a CI check or an operator's shell script could
+    treat an *unverified* key as a confirmed-safe one. ``"unknown"`` makes the gap explicit
+    instead: a human must then confirm in the Tabdeal UI that this key has no trade and no
+    withdrawal permission before phase 6.
+
+    Note for whoever reads the report: Binance-style ``canTrade``/``canWithdraw`` fields, even
+    when present, may describe the *account* rather than the specific API *key* making this
+    request -- CLAUDE.md section 3.6's requirement is about the key.
+    """
     if not isinstance(account_body, dict):
-        return False, {}
+        return "unknown", {}
     found: dict[str, Any] = {}
     for key in ("canTrade", "canWithdraw", "canDeposit", "permissions"):
         if key in account_body:
             found[key] = account_body[key]
+    if not any(key in account_body for key in _PERMISSION_INDICATOR_KEYS):
+        return "unknown", found
     unsafe = bool(account_body.get("canTrade")) or bool(account_body.get("canWithdraw"))
     permissions = account_body.get("permissions")
     if isinstance(permissions, list):
         upper = {str(p).upper() for p in permissions}
         if upper & {"TRADE", "WITHDRAW", "WITHDRAWALS"}:
             unsafe = True
-    return unsafe, found
+    return ("unsafe" if unsafe else "safe"), found
 
 
 def extract_nonzero_balances(account_body: Any) -> list[dict[str, str]]:
@@ -487,38 +593,25 @@ def _split_symbol(symbol: str) -> tuple[str, str]:
     return symbol.upper(), ""
 
 
-def run_probe(client: TabdealClient, clock: Clock, args: argparse.Namespace) -> tuple[dict[str, Any], int]:
-    """Run every check and return ``(report, exit_code)``. Never raises on exchange errors --
-    every failure is captured in the report; only a genuinely unreachable ``ping`` short-circuits."""
-    report: dict[str, Any] = {
-        "generated_at": clock.now().isoformat(),
-        "base_url": client.base_url,
-        "key_permissions_unsafe": False,
-    }
+def _probe_ping(client: TabdealClient) -> tuple[dict[str, Any], ProbeResult]:
+    return probe_both_prefixes(client, lambda p: client.ping(prefix=p), "ping")
 
-    ping_summary, ping_chosen = probe_both_prefixes(client, lambda p: client.ping(prefix=p), "ping")
-    report["ping"] = ping_summary
-    if ping_summary["answering_prefix"] is None:
-        report["fatal_error"] = describe_unreachable_failure(ping_chosen)
-        return report, 1
 
-    prefix = client.read_prefix if ping_summary["answering_prefix"] == "read" else client.write_prefix
-
-    # -- time / clock skew ---------------------------------------------------------
+def _probe_time(client: TabdealClient, clock: Clock, prefix: str) -> dict[str, Any]:
     time_summary, _time_chosen = probe_both_prefixes(client, lambda p: client.server_time(prefix=p), "time")
-    report["time"] = time_summary
     before = clock.now()
     server_time_result = client.server_time(prefix=prefix)
     after = clock.now()
     server_time_ms = _extract_server_time_ms(server_time_result.body)
     if server_time_ms is not None:
-        report["time"]["clock_skew_ms"] = compute_clock_skew_ms(server_time_ms, before, after)
+        time_summary["clock_skew_ms"] = compute_clock_skew_ms(server_time_ms, before, after)
+    return time_summary
 
-    # -- exchangeInfo / symbol + filter discovery -----------------------------------
+
+def _probe_symbols(client: TabdealClient, args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
     info_summary, info_chosen = probe_both_prefixes(
         client, lambda p: client.exchange_info(prefix=p), "exchangeInfo"
     )
-    report["exchange_info"] = info_summary
     symbols_report: dict[str, Any] = {}
     if info_chosen.ok:
         for symbol in args.symbols:
@@ -539,128 +632,292 @@ def run_probe(client: TabdealClient, clock: Clock, args: argparse.Namespace) -> 
                 "filters": _filters_to_report(filters) if filters is not None else None,
                 "filters_unknown": filters is None,
             }
-    report["symbols"] = symbols_report
+    return info_summary, symbols_report
 
-    # -- depth: repeated sampling for median spread + cumulative depth -------------
-    depth_report: dict[str, Any] = {}
-    primary_symbol = args.symbols[0] if args.symbols else "BTCUSDT"
+
+@dataclass(frozen=True, slots=True)
+class _DepthSampleOk:
+    spread_bps: float
+    spread_pct: float
+    depth: dict[str, dict[str, dict[str, str]]]
+
+
+@dataclass(frozen=True, slots=True)
+class _DepthSampleCrossed:
+    """m9a (reviewer finding): a momentarily crossed book (best ask < best bid) is a real,
+    if rare, exchange data condition -- never a reason to abort a sampling run that may be
+    collecting evidence for hours."""
+
+    best_bid: str
+    best_ask: str
+
+
+@dataclass(frozen=True, slots=True)
+class _DepthSampleSkipped:
+    reason: Literal["no_result", "parse_failed"]
+
+
+_DepthSampleOutcome = _DepthSampleOk | _DepthSampleCrossed | _DepthSampleSkipped
+
+
+def _evaluate_depth_sample(result: ProbeResult) -> _DepthSampleOutcome:
+    """Classify one ``/depth`` response. Never raises: ``spread_bps_and_pct`` raises
+    ``ValueError`` on a crossed book (by design, for callers that treat it as a hard error), but
+    a multi-hour, many-sample probe run must survive that on any single sample -- m9a."""
+    if not (result.ok and isinstance(result.body, dict)):
+        return _DepthSampleSkipped(reason="no_result")
+    bids = parse_depth_levels(result.body.get("bids"))
+    asks = parse_depth_levels(result.body.get("asks"))
+    best = best_bid_ask(bids, asks)
+    if best is None:
+        return _DepthSampleSkipped(reason="parse_failed")
+    best_bid, best_ask = best
+    try:
+        bps, pct = spread_bps_and_pct(best_bid, best_ask)
+    except ValueError:
+        return _DepthSampleCrossed(best_bid=str(best_bid), best_ask=str(best_ask))
+    mid = (best_bid + best_ask) / 2
+    # M4: bid depth (what we could *sell* into) and ask depth (what we could *buy* from) are kept
+    # separate -- phase 3 sizing needs them independently, and summing them into one number threw
+    # that distinction away irrecoverably.
+    depths: dict[str, dict[str, dict[str, str]]] = {}
+    for threshold in _DEPTH_THRESHOLDS_PCT:
+        bid_base, bid_quote = cumulative_depth(bids, mid, threshold, side="bid")
+        ask_base, ask_quote = cumulative_depth(asks, mid, threshold, side="ask")
+        depths[str(threshold)] = {
+            "bid": {"base_qty": str(bid_base), "quote_notional": str(bid_quote)},
+            "ask": {"base_qty": str(ask_base), "quote_notional": str(ask_quote)},
+        }
+    return _DepthSampleOk(spread_bps=bps, spread_pct=pct, depth=depths)
+
+
+@dataclass
+class _DepthWindowAccumulator:
+    """Mutable accumulators for :func:`sample_depth_window` -- a plain object instead of a
+    handful of loose ``list`` locals so the per-sample update and the report-rendering steps can
+    each be their own small function."""
+
+    spreads_bps: list[float] = field(default_factory=list)
+    cumulative_samples: list[dict[str, Any]] = field(default_factory=list)
+    crossed_samples: list[dict[str, str]] = field(default_factory=list)
+    successful_sample_timestamps: list[datetime] = field(default_factory=list)
+
+    def record(self, attempt_ts: datetime, outcome: _DepthSampleOutcome) -> None:
+        if isinstance(outcome, _DepthSampleOk):
+            self.spreads_bps.append(outcome.spread_bps)
+            self.successful_sample_timestamps.append(attempt_ts)
+            self.cumulative_samples.append(
+                {"spread_bps": outcome.spread_bps, "spread_pct": outcome.spread_pct, "depth": outcome.depth}
+            )
+        elif isinstance(outcome, _DepthSampleCrossed):
+            self.crossed_samples.append(
+                {"ts": attempt_ts.isoformat(), "best_bid": outcome.best_bid, "best_ask": outcome.best_ask}
+            )
+
+    def render_into(self, depth_report: dict[str, Any]) -> None:
+        """Mutate ``depth_report`` in place from the current accumulator state (m9a) -- called
+        after *every* sample, not only once at the end, so a caller can persist a partial report
+        to disk at any point during a run that may span hours."""
+        timestamps = self.successful_sample_timestamps
+        first_ts = timestamps[0] if timestamps else None
+        last_ts = timestamps[-1] if timestamps else None
+        span = (last_ts - first_ts).total_seconds() if first_ts and last_ts else 0.0
+        depth_report["spread_summary"] = summarize_spreads(self.spreads_bps)
+        depth_report["samples"] = list(self.cumulative_samples)
+        # m9a: counted and recorded, not just silently dropped -- Parham can see exactly which
+        # samples were crossed and when.
+        depth_report["crossed_book_samples"] = list(self.crossed_samples)
+        depth_report["crossed_book_count"] = len(self.crossed_samples)
+        depth_report["first_sample_ts"] = first_ts.isoformat() if first_ts else None
+        depth_report["last_sample_ts"] = last_ts.isoformat() if last_ts else None
+        # M3: SPEC section 7 G0 needs >= 30 samples spanning >= 6 hours of wall-clock time --
+        # without recording the actual first/last sample timestamps, a 60-second run and a
+        # 6-hour run produce an identical-looking report. g0_spread_plan_ok makes that check
+        # explicit. MINOR-2: both span and count are successes-only, so they can never contradict
+        # spread_summary["samples"] (also successes-only) in the human summary.
+        depth_report["sampling_span_seconds"] = span
+        depth_report["g0_spread_plan_ok"] = len(timestamps) >= 30 and span >= 21_600
+
+
+def sample_depth_window(
+    client: TabdealClient,
+    clock: Clock,
+    symbol: str,
+    prefix: str,
+    *,
+    samples: int,
+    interval_seconds: float,
+    first_result: ProbeResult | None,
+    depth_report: dict[str, Any],
+    on_progress: Callable[[], None] | None = None,
+) -> None:
+    """Repeatedly sample ``/depth`` for ``symbol``, mutating ``depth_report`` in place after
+    *every* attempt (m9a) -- not only once the whole loop finishes -- so a caller can persist a
+    partial report to disk at any point during a run that may span hours, via ``on_progress``.
+
+    A crossed book on any one sample (m9a) is counted and recorded, never raised: nothing here
+    lets one bad sample out of (say) 30 lose the other 29.
+    """
+    acc = _DepthWindowAccumulator()
+    for i in range(max(0, samples)):
+        attempt_ts = clock.now()
+        result = (
+            first_result
+            if i == 0 and first_result is not None and first_result.ok
+            else client.depth(symbol, limit=100, prefix=prefix)
+        )
+        acc.record(attempt_ts, _evaluate_depth_sample(result))
+        acc.render_into(depth_report)
+        if on_progress is not None:
+            on_progress()
+        if i < samples - 1:
+            time.sleep(max(0.0, interval_seconds))
+    acc.render_into(depth_report)
+
+
+def _probe_depth(
+    client: TabdealClient,
+    clock: Clock,
+    args: argparse.Namespace,
+    prefix: str,
+    symbol: str,
+    *,
+    depth_report: dict[str, Any],
+    on_progress: Callable[[], None] | None = None,
+) -> None:
     depth_prefix_summary, depth_chosen = probe_both_prefixes(
-        client, lambda p: client.depth(primary_symbol, limit=100, prefix=p), "depth"
+        client, lambda p: client.depth(symbol, limit=100, prefix=p), "depth"
     )
     depth_report["prefix_discovery"] = depth_prefix_summary
-    spreads_bps: list[float] = []
-    cumulative_samples: list[dict[str, Any]] = []
-    # MINOR-2 (second fix round): this must record the timestamp of each *successful* depth
-    # sample only. The previous version appended a timestamp unconditionally, before even
-    # attempting the call -- so a run with (say) 25 failed calls out of 30 attempts over 6 hours
-    # still reported a full 6-hour span and g0_spread_plan_ok=True, while spread_summary["samples"]
-    # (correctly derived from spreads_bps, i.e. successes only) said 5. Those two numbers
-    # contradicting each other on adjacent lines of the human summary is exactly the kind of G0
-    # evidence that must never be handed to Parham.
-    successful_sample_timestamps: list[datetime] = []
-    for i in range(max(0, args.samples)):
-        attempt_ts = clock.now()
-        if i == 0 and depth_chosen.ok:
-            result = depth_chosen
-        else:
-            result = client.depth(primary_symbol, limit=100, prefix=prefix)
-        if result.ok and isinstance(result.body, dict):
-            bids = parse_depth_levels(result.body.get("bids"))
-            asks = parse_depth_levels(result.body.get("asks"))
-            best = best_bid_ask(bids, asks)
-            if best is not None:
-                best_bid, best_ask = best
-                bps, pct = spread_bps_and_pct(best_bid, best_ask)
-                spreads_bps.append(bps)
-                successful_sample_timestamps.append(attempt_ts)
-                mid = (best_bid + best_ask) / 2
-                # M4: bid depth (what we could *sell* into) and ask depth (what we could *buy*
-                # from) are kept separate -- phase 3 sizing needs them independently, and summing
-                # them into one number threw that distinction away irrecoverably.
-                depths: dict[str, dict[str, dict[str, str]]] = {}
-                for threshold in _DEPTH_THRESHOLDS_PCT:
-                    bid_base, bid_quote = cumulative_depth(bids, mid, threshold, side="bid")
-                    ask_base, ask_quote = cumulative_depth(asks, mid, threshold, side="ask")
-                    depths[str(threshold)] = {
-                        "bid": {"base_qty": str(bid_base), "quote_notional": str(bid_quote)},
-                        "ask": {"base_qty": str(ask_base), "quote_notional": str(ask_quote)},
-                    }
-                cumulative_samples.append({"spread_bps": bps, "spread_pct": pct, "depth": depths})
-        if i < args.samples - 1:
-            time.sleep(max(0.0, args.interval))
-    depth_report["spread_summary"] = summarize_spreads(spreads_bps)
-    depth_report["samples"] = cumulative_samples
-    # M3: SPEC section 7 G0 needs >= 30 samples spanning >= 6 hours of wall-clock time -- without
-    # recording the actual first/last sample timestamps, a 60-second run and a 6-hour run produce
-    # an identical-looking report. g0_spread_plan_ok makes that check explicit and unmissable.
-    # MINOR-2: both the span and the count below are now based on successful samples only, so they
-    # can never contradict spread_summary["samples"] (also successes-only) in the human summary.
-    first_sample_ts = successful_sample_timestamps[0] if successful_sample_timestamps else None
-    last_sample_ts = successful_sample_timestamps[-1] if successful_sample_timestamps else None
-    sampling_span_seconds = (
-        (last_sample_ts - first_sample_ts).total_seconds() if first_sample_ts and last_sample_ts else 0.0
+    sample_depth_window(
+        client,
+        clock,
+        symbol,
+        prefix,
+        samples=args.samples,
+        interval_seconds=args.interval,
+        first_result=depth_chosen,
+        depth_report=depth_report,
+        on_progress=on_progress,
     )
-    depth_report["first_sample_ts"] = first_sample_ts.isoformat() if first_sample_ts else None
-    depth_report["last_sample_ts"] = last_sample_ts.isoformat() if last_sample_ts else None
-    depth_report["sampling_span_seconds"] = sampling_span_seconds
-    depth_report["g0_spread_plan_ok"] = (
-        len(successful_sample_timestamps) >= 30 and sampling_span_seconds >= 21_600
-    )
-    report["depth"] = {primary_symbol: depth_report}
 
-    # -- trades: window stats + saturation + max-limit discovery -------------------
+
+def _probe_trades(
+    client: TabdealClient, args: argparse.Namespace, prefix: str, symbol: str
+) -> dict[str, Any]:
     trades_prefix_summary, trades_chosen = probe_both_prefixes(
-        client, lambda p: client.trades(primary_symbol, limit=500, prefix=p), "trades"
+        client, lambda p: client.trades(symbol, limit=500, prefix=p), "trades"
     )
     stats = trades_window_stats(trades_chosen.body, 500)
     limit_attempts, max_accepted = discover_max_trades_limit(
-        client, primary_symbol, prefix, args.trades_limit_candidates
+        client, symbol, prefix, args.trades_limit_candidates
     )
-    report["trades"] = {
+    return {
         "prefix_discovery": trades_prefix_summary,
         "window_stats": asdict(stats),
         "max_limit_attempts": [asdict(a) for a in limit_attempts],
         "max_accepted_limit": max_accepted,
+        # m2: explicit G0 checks, not just numbers buried in window_stats.
+        "g0_time_unit_is_ms": stats.time_unit == "ms",
+        "g0_ids_contiguous": bool(stats.ids_contiguous),
     }
 
-    # -- private: account balances only, only if credentials are present -----------
-    if client.has_credentials:
-        account_result = client.account(prefix=prefix)
-        unsafe, permissions = unsafe_key_permissions(account_result.body)
-        report["key_permissions_unsafe"] = unsafe
-        report["account"] = {
-            "status_code": account_result.status_code,
-            "ok": account_result.ok,
-            "balances": extract_nonzero_balances(account_result.body) if account_result.ok else [],
-            "permissions": permissions,
-        }
-        if unsafe:
-            print(
-                "WARNING: Tabdeal API key has trade or withdrawal permission enabled -- "
-                "CLAUDE.md section 3.6 requires a read-only key before phase 6.",
-                file=sys.stderr,
-            )
-    else:
-        report["account"] = {"skipped": "no TBOT_TABDEAL_API_KEY / TBOT_TABDEAL_API_SECRET in environment"}
+
+def _probe_account(client: TabdealClient, prefix: str) -> tuple[dict[str, Any], bool]:
+    """Returns ``(account_report, key_permissions_unsafe)``. Prints a warning to stderr for
+    either the unsafe or the unknown case -- m9b (reviewer finding): "unknown" must be just as
+    loud as "unsafe", since silence is exactly what let the old fail-open bug go unnoticed."""
+    if not client.has_credentials:
+        return {"skipped": "no TBOT_TABDEAL_API_KEY / TBOT_TABDEAL_API_SECRET in environment"}, False
+
+    account_result = client.account(prefix=prefix)
+    state, permissions = classify_key_permissions(account_result.body)
+    if state == "unknown":
+        print(
+            "WARNING: could not determine Tabdeal API key permissions from the account "
+            "response (no canTrade/canWithdraw/permissions field found) -- verify MANUALLY in "
+            "the Tabdeal UI that this key has NO trade and NO withdrawal permission before phase "
+            "6 (CLAUDE.md section 3.6). Note Binance-style canTrade/canWithdraw fields, even when "
+            "present, may describe the account rather than this specific key.",
+            file=sys.stderr,
+        )
+    elif state == "unsafe":
+        print(
+            "WARNING: Tabdeal API key has trade or withdrawal permission enabled -- "
+            "CLAUDE.md section 3.6 requires a read-only key before phase 6.",
+            file=sys.stderr,
+        )
+    account_report = {
+        "status_code": account_result.status_code,
+        "ok": account_result.ok,
+        "balances": extract_nonzero_balances(account_result.body) if account_result.ok else [],
+        "permissions": permissions,
+        "key_permissions": state,
+    }
+    return account_report, state == "unsafe"
+
+
+def run_probe(
+    client: TabdealClient,
+    clock: Clock,
+    args: argparse.Namespace,
+    report: dict[str, Any],
+    *,
+    on_depth_progress: Callable[[], None] | None = None,
+) -> int:
+    """Run every check, mutating ``report`` in place, and return the exit code.
+
+    ``report`` is supplied by the caller (not built here) so that if this function is
+    interrupted partway through (``KeyboardInterrupt``/SIGTERM during the depth-sampling loop --
+    m9a), the caller still holds a reference to whatever sections completed before that point.
+    Never raises on exchange errors -- every failure is captured in the report; only a genuinely
+    unreachable ``ping`` short-circuits.
+    """
+    report["generated_at"] = clock.now().isoformat()
+    report["base_url"] = client.base_url
+    report["key_permissions_unsafe"] = False
+
+    ping_summary, ping_chosen = _probe_ping(client)
+    report["ping"] = ping_summary
+    if ping_summary["answering_prefix"] is None:
+        report["fatal_error"] = describe_unreachable_failure(ping_chosen)
+        return 1
+
+    prefix = client.read_prefix if ping_summary["answering_prefix"] == "read" else client.write_prefix
+
+    report["time"] = _probe_time(client, clock, prefix)
+
+    info_summary, symbols_report = _probe_symbols(client, args)
+    report["exchange_info"] = info_summary
+    report["symbols"] = symbols_report
+
+    primary_symbol = args.symbols[0] if args.symbols else "BTCUSDT"
+    depth_report: dict[str, Any] = {}
+    report["depth"] = {primary_symbol: depth_report}
+    _probe_depth(
+        client, clock, args, prefix, primary_symbol, depth_report=depth_report, on_progress=on_depth_progress
+    )
+
+    report["trades"] = _probe_trades(client, args, prefix, primary_symbol)
+
+    account_report, unsafe = _probe_account(client, prefix)
+    report["account"] = account_report
+    report["key_permissions_unsafe"] = unsafe
 
     # M5: an unsafe (trade/withdraw-capable) key must not exit 0 -- that would let a CI check or
     # an operator's shell script silently treat this as a pass. The report is still written.
-    exit_code = 2 if report["key_permissions_unsafe"] else 0
-    return report, exit_code
+    return 2 if unsafe else 0
 
 
-def _print_human_summary(report: dict[str, Any]) -> None:
-    print("=== Tabdeal probe summary ===")
-    ping = report.get("ping", {})
-    print(f"ping: answering_prefix={ping.get('answering_prefix')}")
-    time_block = report.get("time", {})
-    if "clock_skew_ms" in time_block:
-        print(f"clock skew: {time_block['clock_skew_ms']:.1f} ms")
+def _print_symbols_summary(report: dict[str, Any]) -> None:
     for symbol, info in report.get("symbols", {}).items():
         if info.get("found"):
             print(f"{symbol}: status={info.get('status')} filters_unknown={info.get('filters_unknown')}")
         else:
             print(f"{symbol}: NOT FOUND -- available BTC-like markets: {info.get('available_base_markets')}")
+
+
+def _print_depth_summary(report: dict[str, Any]) -> None:
     for symbol, depth_info in report.get("depth", {}).items():
         summary = depth_info.get("spread_summary", {})
         if summary:
@@ -673,19 +930,120 @@ def _print_human_summary(report: dict[str, Any]) -> None:
             f"{symbol} G0 spread sampling plan (>=30 samples, >=6h span) ok={plan_ok} "
             f"(samples={len(depth_info.get('samples', []))}, span_seconds={span_s})"
         )
-    trades = report.get("trades", {})
-    if trades:
-        print(f"trades: max_accepted_limit={trades.get('max_accepted_limit')}")
-        ws = trades.get("window_stats", {})
-        recommended_poll_s = ws.get("recommended_poll_interval_seconds")
-        print(f"trades: saturated={ws.get('saturated')} recommended_poll_s={recommended_poll_s}")
+        crossed_count = depth_info.get("crossed_book_count", 0)
+        if crossed_count:
+            # m9a: a crossed sample is evidence, not noise -- it must be visible in the summary
+            # Parham actually reads, not just buried in the JSON.
+            print(f"{symbol} WARNING: {crossed_count} crossed-book sample(s) observed (recorded, not fatal)")
+
+
+def _print_trades_summary(trades: dict[str, Any]) -> None:
+    print(f"trades: max_accepted_limit={trades.get('max_accepted_limit')}")
+    ws = trades.get("window_stats", {})
+    recommended_poll_s = ws.get("recommended_poll_interval_seconds")
+    print(f"trades: saturated={ws.get('saturated')} recommended_poll_s={recommended_poll_s}")
+    # m2: time_unit / ids_contiguous / window span, printed prominently as G0 checks -- not left
+    # buried in the JSON where a silently-wrong assumption (e.g. `time` not actually in ms) could
+    # pass unnoticed.
+    print(
+        f"trades G0: time_unit={ws.get('time_unit')} "
+        f"(disagrees_with_ms={ws.get('time_unit_disagrees_with_ms')}) "
+        f"ids_contiguous={ws.get('ids_contiguous')} missing_ids={ws.get('missing_ids')} "
+        f"window_span_seconds={ws.get('span_seconds')}"
+    )
+    if ws.get("time_unit_disagrees_with_ms"):
+        print(
+            "WARNING: /trades `time` does NOT look like milliseconds -- "
+            "tbot.data.tabdeal_recorder assumes ms; candle timestamps will be wrong until "
+            "this is fixed.",
+            file=sys.stderr,
+        )
+    if ws.get("ids_contiguous") is False:
+        print(
+            f"WARNING: /trades ids are NOT contiguous in this window -- "
+            f"missing_ids={ws.get('missing_ids')} (possible gap, or ids are not per-symbol)",
+            file=sys.stderr,
+        )
+
+
+def _print_account_summary(report: dict[str, Any]) -> None:
     if report.get("key_permissions_unsafe"):
         print("WARNING: key_permissions_unsafe = true")
     account = report.get("account", {})
     if "skipped" in account:
         print(f"account: {account['skipped']}")
     elif account:
-        print(f"account: ok={account.get('ok')} balances={len(account.get('balances', []))} non-zero")
+        print(
+            f"account: ok={account.get('ok')} balances={len(account.get('balances', []))} non-zero "
+            f"key_permissions={account.get('key_permissions')}"
+        )
+
+
+def _print_human_summary(report: dict[str, Any]) -> None:
+    print("=== Tabdeal probe summary ===")
+    ping = report.get("ping", {})
+    print(f"ping: answering_prefix={ping.get('answering_prefix')}")
+    time_block = report.get("time", {})
+    if "clock_skew_ms" in time_block:
+        print(f"clock skew: {time_block['clock_skew_ms']:.1f} ms")
+    _print_symbols_summary(report)
+    _print_depth_summary(report)
+    trades = report.get("trades", {})
+    if trades:
+        _print_trades_summary(trades)
+    _print_account_summary(report)
+
+
+class ProbeAbortError(Exception):
+    """Raised on the main thread when SIGTERM arrives mid-probe (e.g. systemd stopping the
+    service, or an operator's ``kill``) -- m9a (reviewer finding). Never raised directly;
+    only by the handler :func:`_install_sigterm_handler` installs, so ``main()`` can persist
+    whatever partial report already exists before exiting instead of losing it to an
+    uncaught-exception traceback."""
+
+
+def _install_sigterm_handler() -> Callable[[], None]:
+    """Install a SIGTERM handler that raises :class:`ProbeAbortError` on receipt; return a
+    callable that restores whatever handler was previously installed (call it in a ``finally``).
+    """
+    previous = signal.getsignal(signal.SIGTERM)
+
+    def _handler(_signum: int, _frame: Any) -> None:
+        raise ProbeAbortError("SIGTERM received")
+
+    signal.signal(signal.SIGTERM, _handler)
+
+    def _restore() -> None:
+        signal.signal(signal.SIGTERM, previous)
+
+    return _restore
+
+
+def _write_report_atomic(report: dict[str, Any], out_path: Path) -> None:
+    """Write ``report`` to ``out_path`` as JSON, atomically (write-then-rename) -- m9a: called
+    after every depth sample (not just once at the end) during a run that may span hours, so a
+    reader never observes a half-written file, and a kill at any point leaves the most recently
+    completed sample on disk rather than nothing at all.
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = out_path.with_name(out_path.name + ".tmp")
+    tmp_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    tmp_path.replace(out_path)
+
+
+def _build_client(config: Config, secrets: Secrets, clock: Clock) -> TabdealClient:
+    return TabdealClient(
+        base_url=config.exchange.base_url,
+        read_prefix=config.exchange.read_prefix,
+        write_prefix=config.exchange.write_prefix,
+        clock=clock,
+        api_key=secrets.tabdeal_api_key,
+        api_secret=secrets.tabdeal_api_secret,
+        recv_window_ms=config.exchange.recv_window_ms,
+        requests_per_second=config.exchange.requests_per_second,
+        timeout_seconds=config.exchange.timeout_seconds,
+        max_retries=config.exchange.max_retries,
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -702,30 +1060,47 @@ def main(argv: Sequence[str] | None = None) -> int:
     register_secrets_for_logging(secrets)
     configure_logging(config.runtime.log_level)
     clock: Clock = SystemClock()
-    client = TabdealClient(
-        base_url=config.exchange.base_url,
-        read_prefix=config.exchange.read_prefix,
-        write_prefix=config.exchange.write_prefix,
-        clock=clock,
-        api_key=secrets.tabdeal_api_key,
-        api_secret=secrets.tabdeal_api_secret,
-        recv_window_ms=config.exchange.recv_window_ms,
-        requests_per_second=config.exchange.requests_per_second,
-        timeout_seconds=config.exchange.timeout_seconds,
-        max_retries=config.exchange.max_retries,
-    )
+    client = _build_client(config, secrets, clock)
+    out_path = args.out or _default_out_path(clock.now())
+    report: dict[str, Any] = {
+        "generated_at": clock.now().isoformat(),
+        "base_url": client.base_url,
+        "key_permissions_unsafe": False,
+    }
+
+    # m9a: a long depth-sampling run must survive Ctrl+C (KeyboardInterrupt/SIGINT) and a
+    # systemd/operator `kill` (SIGTERM) without losing whatever was already collected -- both
+    # are caught below and the partial `report` (already kept current on disk by on_progress,
+    # see sample_depth_window) is written one last time with a clear marker, instead of an
+    # uncaught-exception traceback and whatever was or wasn't flushed to disk.
+    restore_sigterm = _install_sigterm_handler()
     try:
-        report, exit_code = run_probe(client, clock, args)
+        exit_code = run_probe(
+            client,
+            clock,
+            args,
+            report,
+            on_depth_progress=lambda: _write_report_atomic(report, out_path),
+        )
+    except (KeyboardInterrupt, ProbeAbortError) as exc:
+        report["interrupted"] = True
+        report["interrupted_reason"] = exc.__class__.__name__
+        _write_report_atomic(report, out_path)
+        print(
+            f"probe interrupted ({exc.__class__.__name__}) -- partial report written to {out_path}",
+            file=sys.stderr,
+        )
+        _print_human_summary(report)
+        return 143 if isinstance(exc, ProbeAbortError) else 130
     finally:
+        restore_sigterm()
         client.close()
 
     if exit_code != 0 and "fatal_error" in report:
         print(report["fatal_error"], file=sys.stderr)
         return exit_code
 
-    out_path = args.out or _default_out_path(clock.now())
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    _write_report_atomic(report, out_path)
     print(f"report written to {out_path}")
     _print_human_summary(report)
     return exit_code

@@ -42,9 +42,12 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode
 
 import httpx
+import structlog
 from pydantic import SecretStr
 
 from tbot.core.types import Clock
+
+logger = structlog.get_logger(__name__)
 
 __all__ = [
     "ProbeResult",
@@ -72,6 +75,14 @@ _RATE_LIMIT_HEADER_NAMES: tuple[str, ...] = (
 _BACKOFF_BASE_SECONDS = 0.5
 _BACKOFF_CAP_SECONDS = 8.0
 _BACKOFF_JITTER_SECONDS = 0.25
+
+# m4 (reviewer finding): a server-named Retry-After is a floor on the wait (MINOR-9), but an
+# uncapped one is a self-inflicted denial of service -- a single malicious or misconfigured
+# response (e.g. "Retry-After: 86400") would otherwise make this client sleep for a full day on
+# one HTTP call, with no way for a caller to notice or interrupt it. Cap it at a conservative
+# ceiling; CLAUDE.md section 6 already caps recvWindow at 60000ms, so 60s keeps the same order of
+# magnitude in mind for "how long is too long for one retry".
+_RETRY_AFTER_CAP_SECONDS = 60.0
 
 # MINOR-11 / M1: scrub a leaked ``signature=...`` query param out of any error string before it
 # reaches ProbeResult.error -- e.g. an httpx exception's ``str()`` can embed the full request URL.
@@ -341,13 +352,176 @@ class TabdealClient:
 
         MINOR-9: when the server names a ``Retry-After``, that is a floor, not a suggestion --
         never wait less than it, even if the computed exponential backoff would be shorter.
+        m4: that floor is itself capped at :data:`_RETRY_AFTER_CAP_SECONDS` -- an uncapped
+        server-named wait is a self-inflicted denial of service (see the constant's docstring).
         """
         base: float = min(_BACKOFF_CAP_SECONDS, _BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)))
         jitter: float = self._rng.uniform(0.0, _BACKOFF_JITTER_SECONDS)
         wait = base + jitter
-        if retry_after is not None and retry_after > wait:
-            wait = retry_after
+        if retry_after is not None:
+            if retry_after > _RETRY_AFTER_CAP_SECONDS:
+                logger.warning(
+                    "tabdeal_client.retry_after_capped",
+                    requested_seconds=retry_after,
+                    cap_seconds=_RETRY_AFTER_CAP_SECONDS,
+                )
+            capped_retry_after = min(retry_after, _RETRY_AFTER_CAP_SECONDS)
+            if capped_retry_after > wait:
+                wait = capped_retry_after
         return wait
+
+    @staticmethod
+    def _finalize(
+        path: str,
+        url: str,
+        *,
+        status_code: int | None,
+        latency_ms: float,
+        ok: bool,
+        error: str | None,
+        body: Any = None,
+        attempts: list[RetryAttempt],
+        rate_limit_headers: list[RateLimitObservation],
+    ) -> ProbeResult:
+        """Build the terminal :class:`ProbeResult` for one call -- whichever of the three ways
+        ``_get`` can finish (timeout retries exhausted, an unreachable/connection error, or an
+        actual HTTP response). m12 (reviewer finding): these three outcomes used to each build
+        their own near-identical ``ProbeResult(...)`` literal; folding them into one helper means
+        the ``retries``/``rate_limit_headers`` tuple-conversion and the ``method="GET"`` constant
+        exist in exactly one place.
+        """
+        return ProbeResult(
+            method="GET",
+            path=path,
+            url=url,
+            status_code=status_code,
+            latency_ms=latency_ms,
+            ok=ok,
+            error=error,
+            body=body,
+            retries=tuple(attempts),
+            rate_limit_headers=tuple(rate_limit_headers),
+        )
+
+    def _retry_after_waiting(
+        self,
+        attempt_no: int,
+        reason: str,
+        attempts: list[RetryAttempt],
+        *,
+        retry_after: float | None = None,
+    ) -> None:
+        """Compute the backoff wait, record it as a :class:`RetryAttempt`, and sleep.
+
+        Shared by the timeout and the retryable-HTTP-status branches of :meth:`_attempt` so the
+        "append then sleep" sequence exists in exactly one place.
+        """
+        wait = self._backoff_wait(attempt_no, retry_after=retry_after)
+        attempts.append(RetryAttempt(attempt_no, reason, wait))
+        self._sleep(wait)
+
+    def _send_or_retry(
+        self,
+        path: str,
+        headers: dict[str, str],
+        params_factory: Callable[[], dict[str, str]],
+        attempt_no: int,
+        attempts: list[RetryAttempt],
+        rate_limit_headers: list[RateLimitObservation],
+    ) -> tuple[httpx.Response, float] | ProbeResult | None:
+        """Build and send one request -- the part of :meth:`_attempt` that can fail before any
+        HTTP response exists at all.
+
+        Returns ``(response, latency_ms)`` on an actual HTTP response (whatever its status),
+        a terminal :class:`ProbeResult` if nothing here can retry (timeout retries exhausted, or
+        any other connection-level error), or ``None`` if a timeout was retried -- having already
+        appended to ``attempts`` and slept.
+        """
+        # M1 + MINOR-7: a fresh params dict (and, for signed calls, a fresh signature) every
+        # attempt -- never reused across retries. The query string is built here, once, by hand
+        # (`urlencode`) and sent as literal request-target bytes rather than handed to httpx as a
+        # dict for it to re-encode: those must be the exact bytes that were signed.
+        params = params_factory()
+        query_string = urlencode(params)
+        request_target = f"{path}?{query_string}" if query_string else path
+        request = self._http.build_request("GET", request_target, headers=dict(headers))
+        redacted_url = _redact_url(request.url)
+        start = self._clock.now()
+        try:
+            response = self._http.send(request)
+        except httpx.TimeoutException as exc:
+            latency_ms = (self._clock.now() - start).total_seconds() * 1000
+            if attempt_no > self._max_retries:
+                return self._finalize(
+                    path,
+                    redacted_url,
+                    status_code=None,
+                    latency_ms=latency_ms,
+                    ok=False,
+                    error=_scrub_signature(f"timeout: {exc.__class__.__name__}"),
+                    attempts=attempts,
+                    rate_limit_headers=rate_limit_headers,
+                )
+            self._retry_after_waiting(attempt_no, "timeout", attempts)
+            return None
+        except httpx.HTTPError as exc:
+            latency_ms = (self._clock.now() - start).total_seconds() * 1000
+            return self._finalize(
+                path,
+                redacted_url,
+                status_code=None,
+                latency_ms=latency_ms,
+                ok=False,
+                error=_scrub_signature(f"unreachable: {exc.__class__.__name__}: {exc}"),
+                attempts=attempts,
+                rate_limit_headers=rate_limit_headers,
+            )
+        latency_ms = (self._clock.now() - start).total_seconds() * 1000
+        return response, latency_ms
+
+    def _attempt(
+        self,
+        path: str,
+        headers: dict[str, str],
+        params_factory: Callable[[], dict[str, str]],
+        attempt_no: int,
+        attempts: list[RetryAttempt],
+        rate_limit_headers: list[RateLimitObservation],
+    ) -> ProbeResult | None:
+        """One HTTP attempt for :meth:`_get`.
+
+        Returns a terminal :class:`ProbeResult` (timeout retries exhausted, an
+        unreachable/connection error, or an actual HTTP response that is not itself being
+        retried), or ``None`` if this attempt decided to retry -- having already appended to
+        ``attempts`` and slept, so the caller's loop can simply try again.
+        """
+        sent = self._send_or_retry(path, headers, params_factory, attempt_no, attempts, rate_limit_headers)
+        if sent is None or isinstance(sent, ProbeResult):
+            return sent
+        response, latency_ms = sent
+
+        for name in _RATE_LIMIT_HEADER_NAMES:
+            if name in response.headers:
+                rate_limit_headers.append(RateLimitObservation(name, response.headers[name]))
+
+        if response.status_code in _RETRYABLE_STATUS and attempt_no <= self._max_retries:
+            retry_after = _parse_retry_after(response.headers.get("Retry-After"))
+            self._retry_after_waiting(
+                attempt_no, str(response.status_code), attempts, retry_after=retry_after
+            )
+            return None
+
+        return self._finalize(
+            path,
+            _redact_url(response.url),
+            status_code=response.status_code,
+            latency_ms=latency_ms,
+            ok=response.is_success,
+            error=None if response.is_success else _scrub_signature(f"HTTP {response.status_code}"),
+            body=_safe_json(response),
+            attempts=attempts,
+            rate_limit_headers=rate_limit_headers,
+        )
 
     def _get(
         self, path: str, params_factory: Callable[[], dict[str, str]], *, signed: bool = False
@@ -364,71 +538,6 @@ class TabdealClient:
         while True:
             attempt_no += 1
             self._bucket.acquire()
-            # M1 + MINOR-7: a fresh params dict (and, for signed calls, a fresh signature) every
-            # attempt -- never reused across retries. The query string is built here, once, by
-            # hand (`urlencode`) and sent as literal request-target bytes rather than handed to
-            # httpx as a dict for it to re-encode: those must be the exact bytes that were signed.
-            params = params_factory()
-            query_string = urlencode(params)
-            request_target = f"{path}?{query_string}" if query_string else path
-            request = self._http.build_request("GET", request_target, headers=dict(headers))
-            redacted_url = _redact_url(request.url)
-            start = self._clock.now()
-            try:
-                response = self._http.send(request)
-            except httpx.TimeoutException as exc:
-                latency_ms = (self._clock.now() - start).total_seconds() * 1000
-                if attempt_no > self._max_retries:
-                    return ProbeResult(
-                        method="GET",
-                        path=path,
-                        url=redacted_url,
-                        status_code=None,
-                        latency_ms=latency_ms,
-                        ok=False,
-                        error=_scrub_signature(f"timeout: {exc.__class__.__name__}"),
-                        retries=tuple(attempts),
-                        rate_limit_headers=tuple(rate_limit_headers),
-                    )
-                wait = self._backoff_wait(attempt_no)
-                attempts.append(RetryAttempt(attempt_no, "timeout", wait))
-                self._sleep(wait)
-                continue
-            except httpx.HTTPError as exc:
-                latency_ms = (self._clock.now() - start).total_seconds() * 1000
-                return ProbeResult(
-                    method="GET",
-                    path=path,
-                    url=redacted_url,
-                    status_code=None,
-                    latency_ms=latency_ms,
-                    ok=False,
-                    error=_scrub_signature(f"unreachable: {exc.__class__.__name__}: {exc}"),
-                    retries=tuple(attempts),
-                    rate_limit_headers=tuple(rate_limit_headers),
-                )
-
-            latency_ms = (self._clock.now() - start).total_seconds() * 1000
-            for name in _RATE_LIMIT_HEADER_NAMES:
-                if name in response.headers:
-                    rate_limit_headers.append(RateLimitObservation(name, response.headers[name]))
-
-            if response.status_code in _RETRYABLE_STATUS and attempt_no <= self._max_retries:
-                retry_after = _parse_retry_after(response.headers.get("Retry-After"))
-                wait = self._backoff_wait(attempt_no, retry_after=retry_after)
-                attempts.append(RetryAttempt(attempt_no, str(response.status_code), wait))
-                self._sleep(wait)
-                continue
-
-            return ProbeResult(
-                method="GET",
-                path=path,
-                url=_redact_url(response.url),
-                status_code=response.status_code,
-                latency_ms=latency_ms,
-                ok=response.is_success,
-                error=None if response.is_success else _scrub_signature(f"HTTP {response.status_code}"),
-                body=_safe_json(response),
-                retries=tuple(attempts),
-                rate_limit_headers=tuple(rate_limit_headers),
-            )
+            result = self._attempt(path, headers, params_factory, attempt_no, attempts, rate_limit_headers)
+            if result is not None:
+                return result
