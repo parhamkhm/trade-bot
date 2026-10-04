@@ -34,6 +34,7 @@ Nothing here is a real order, and nothing here can become one: see
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import signal
 import statistics
@@ -68,17 +69,20 @@ __all__ = [
     "compute_clock_skew_ms",
     "cumulative_depth",
     "describe_unreachable_failure",
+    "detect_id_space",
     "detect_time_unit",
     "discover_max_trades_limit",
     "extract_nonzero_balances",
     "find_base_asset_markets",
     "find_symbol_entry",
     "ids_contiguous_in_window",
+    "ids_monotonic_in_time",
     "is_saturated",
     "main",
     "probe_both_prefixes",
     "spread_bps_and_pct",
     "summarize_spreads",
+    "trade_activity_stats",
     "trades_window_stats",
 ]
 
@@ -176,6 +180,77 @@ def ids_contiguous_in_window(ids: Sequence[int]) -> tuple[bool | None, int]:
     span = max(distinct) - min(distinct) + 1
     missing = span - len(distinct)
     return missing == 0, missing
+
+
+IdSpace = Literal["global", "per_symbol", "unknown"]
+
+
+def _ids_and_times(trades: Any) -> list[tuple[int, int]]:
+    """``(id, time)`` pairs for every well-formed item of a ``/trades`` body."""
+    if not isinstance(trades, list):
+        return []
+    pairs: list[tuple[int, int]] = []
+    for item in trades:
+        if isinstance(item, dict) and isinstance(item.get("id"), int) and isinstance(item.get("time"), int):
+            pairs.append((item["id"], item["time"]))
+    return pairs
+
+
+def ids_monotonic_in_time(trades: Any) -> bool | None:
+    """Whether trade ids strictly increase with trade time inside one symbol's window.
+
+    This is the property the recorder's continuity rule depends on (a later trade always has a
+    larger id), independent of whether ids are contiguous. ``None`` with fewer than two trades.
+    """
+    pairs = sorted(_ids_and_times(trades), key=lambda p: (p[1], p[0]))
+    if len(pairs) < 2:
+        return None
+    return all(b[0] > a[0] for a, b in itertools.pairwise(pairs))
+
+
+def detect_id_space(trades_a: Any, trades_b: Any) -> IdSpace:
+    """Tell a global (cross-market) trade-id space from per-symbol numbering.
+
+    Two symbols' windows whose id ranges interleave without sharing a single id point to one
+    global id sequence (measured on the Turkey server, 2026-10-04: BTCUSDT and ETHUSDT ids
+    interleave). Shared ids point to per-symbol numbering. Disjoint ranges or identical windows
+    (e.g. the same body twice) prove nothing.
+    """
+    ids_a = {i for i, _ in _ids_and_times(trades_a)}
+    ids_b = {i for i, _ in _ids_and_times(trades_b)}
+    if len(ids_a) < 2 or len(ids_b) < 2 or ids_a == ids_b:
+        return "unknown"
+    if ids_a & ids_b:
+        return "per_symbol"
+    overlap = min(ids_a) <= max(ids_b) and min(ids_b) <= max(ids_a)
+    return "global" if overlap else "unknown"
+
+
+def trade_activity_stats(trades: Any) -> dict[str, float | int | None]:
+    """Trades per full UTC hour (min/median/max) and the longest gap between trades.
+
+    The recorder's staleness threshold and the G1b "hours complete" criterion both depend on
+    how thin the market is, so the probe measures it instead of assuming it.
+    """
+    times = sorted(t for _, t in _ids_and_times(trades))
+    if len(times) < 2:
+        return {"full_hours": 0, "empty_full_hours": None, "trades_per_hour_min": None,
+                "trades_per_hour_median": None, "trades_per_hour_max": None,
+                "max_inter_trade_gap_seconds": None}
+    per_hour: dict[int, int] = {}
+    for t in times:
+        per_hour[t // 3_600_000] = per_hour.get(t // 3_600_000, 0) + 1
+    first, last = times[0] // 3_600_000, times[-1] // 3_600_000
+    counts = [per_hour.get(h, 0) for h in range(first + 1, last)]  # full hours only
+    max_gap = max(b - a for a, b in itertools.pairwise(times)) / 1000.0
+    return {
+        "full_hours": len(counts),
+        "empty_full_hours": sum(1 for c in counts if c == 0) if counts else None,
+        "trades_per_hour_min": min(counts) if counts else None,
+        "trades_per_hour_median": statistics.median(counts) if counts else None,
+        "trades_per_hour_max": max(counts) if counts else None,
+        "max_inter_trade_gap_seconds": max_gap,
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -812,14 +887,23 @@ def _probe_trades(
     limit_attempts, max_accepted = discover_max_trades_limit(
         client, symbol, prefix, args.trades_limit_candidates
     )
+    other_symbol = next((s for s in args.symbols if s != symbol), "ETHUSDT")
+    other_body = client.trades(other_symbol, limit=500, prefix=prefix).body
+    monotonic = ids_monotonic_in_time(trades_chosen.body)
     return {
         "prefix_discovery": trades_prefix_summary,
         "window_stats": asdict(stats),
+        "activity": trade_activity_stats(trades_chosen.body),
         "max_limit_attempts": [asdict(a) for a in limit_attempts],
         "max_accepted_limit": max_accepted,
-        # m2: explicit G0 checks, not just numbers buried in window_stats.
+        # Informational: Tabdeal ids are global across markets (measured 2026-10-04 on the
+        # Turkey server), so a per-symbol window is never contiguous and that is not a failure.
+        "ids_contiguous": stats.ids_contiguous,
+        "id_space": detect_id_space(trades_chosen.body, other_body),
+        "id_space_compared_with": other_symbol,
+        # m2: explicit G0 checks the recorder actually depends on.
         "g0_time_unit_is_ms": stats.time_unit == "ms",
-        "g0_ids_contiguous": bool(stats.ids_contiguous),
+        "g0_ids_monotonic_in_time": bool(monotonic),
     }
 
 
@@ -948,20 +1032,32 @@ def _print_trades_summary(trades: dict[str, Any]) -> None:
     print(
         f"trades G0: time_unit={ws.get('time_unit')} "
         f"(disagrees_with_ms={ws.get('time_unit_disagrees_with_ms')}) "
-        f"ids_contiguous={ws.get('ids_contiguous')} missing_ids={ws.get('missing_ids')} "
+        f"ids_monotonic_in_time={trades.get('g0_ids_monotonic_in_time')} "
         f"window_span_seconds={ws.get('span_seconds')}"
     )
+    print(
+        f"trades info: id_space={trades.get('id_space')} "
+        f"(vs {trades.get('id_space_compared_with')}) ids_contiguous={ws.get('ids_contiguous')} "
+        f"missing_ids={ws.get('missing_ids')}"
+    )
+    activity = trades.get("activity", {})
+    print(
+        f"trades activity: per_full_hour min/median/max="
+        f"{activity.get('trades_per_hour_min')}/{activity.get('trades_per_hour_median')}/"
+        f"{activity.get('trades_per_hour_max')} empty_full_hours={activity.get('empty_full_hours')} "
+        f"max_inter_trade_gap_s={activity.get('max_inter_trade_gap_seconds')}"
+    )
+    if trades.get("g0_ids_monotonic_in_time") is False:
+        print(
+            "WARNING: /trades ids do NOT increase with time -- the recorder's continuity rule "
+            "depends on it.",
+            file=sys.stderr,
+        )
     if ws.get("time_unit_disagrees_with_ms"):
         print(
             "WARNING: /trades `time` does NOT look like milliseconds -- "
             "tbot.data.tabdeal_recorder assumes ms; candle timestamps will be wrong until "
             "this is fixed.",
-            file=sys.stderr,
-        )
-    if ws.get("ids_contiguous") is False:
-        print(
-            f"WARNING: /trades ids are NOT contiguous in this window -- "
-            f"missing_ids={ws.get('missing_ids')} (possible gap, or ids are not per-symbol)",
             file=sys.stderr,
         )
 

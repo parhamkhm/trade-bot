@@ -27,16 +27,19 @@ from scripts.tabdeal_probe import (
     compute_clock_skew_ms,
     cumulative_depth,
     describe_unreachable_failure,
+    detect_id_space,
     detect_time_unit,
     discover_max_trades_limit,
     find_base_asset_markets,
     find_symbol_entry,
     ids_contiguous_in_window,
+    ids_monotonic_in_time,
     is_saturated,
     main,
     probe_both_prefixes,
     spread_bps_and_pct,
     summarize_spreads,
+    trade_activity_stats,
     trades_window_stats,
 )
 
@@ -1034,3 +1037,44 @@ def test_main_registers_tabdeal_secrets_and_configures_logging(
     assert api_key not in rendered
     assert api_secret not in rendered
     assert REDACTED in rendered
+
+
+def _trades(pairs: list[tuple[int, int]]) -> list[dict[str, object]]:
+    return [{"id": i, "time": t, "price": "1", "qty": "1"} for i, t in pairs]
+
+
+def test_detect_id_space_global_when_ranges_interleave_without_shared_ids() -> None:
+    btc = _trades([(100, 1), (184, 2), (300, 3)])
+    eth = _trades([(90, 1), (150, 2), (250, 3)])
+    assert detect_id_space(btc, eth) == "global"
+
+
+def test_detect_id_space_per_symbol_when_ids_are_shared() -> None:
+    a = _trades([(1, 1), (2, 2), (3, 3)])
+    b = _trades([(2, 1), (3, 2), (4, 3)])
+    assert detect_id_space(a, b) == "per_symbol"
+
+
+def test_detect_id_space_unknown_for_identical_or_disjoint_windows() -> None:
+    body = _trades([(1, 1), (5, 2)])
+    assert detect_id_space(body, body) == "unknown"
+    assert detect_id_space(_trades([(1, 1), (2, 2)]), _trades([(10, 1), (11, 2)])) == "unknown"
+    assert detect_id_space([], body) == "unknown"
+
+
+def test_ids_monotonic_in_time() -> None:
+    assert ids_monotonic_in_time(_trades([(300, 3), (100, 1), (184, 2)])) is True
+    assert ids_monotonic_in_time(_trades([(100, 2), (184, 1)])) is False
+    assert ids_monotonic_in_time(_trades([(1, 1)])) is None
+
+
+def test_trade_activity_stats_counts_full_hours_only_and_max_gap() -> None:
+    hour = 3_600_000
+    times = [10 * hour + 5, 11 * hour + 1, 11 * hour + 2, 13 * hour + 7, 14 * hour + 9]
+    stats = trade_activity_stats(_trades([(i + 1, t) for i, t in enumerate(times)]))
+    # full hours strictly between the first (10) and last (14) hour: 11, 12, 13
+    assert stats["full_hours"] == 3
+    assert stats["empty_full_hours"] == 1
+    assert stats["trades_per_hour_min"] == 0
+    assert stats["trades_per_hour_max"] == 2
+    assert stats["max_inter_trade_gap_seconds"] == (13 * hour + 7 - (11 * hour + 2)) / 1000.0
