@@ -646,7 +646,8 @@ def test_main_warns_loudly_on_unknown_key_permissions(
 
     exit_code = main(_args_for(tmp_path))
 
-    assert exit_code == 0
+    # Review m-I: an unverifiable key is not a pass -- distinct non-zero exit code 3.
+    assert exit_code == 3
     captured = capsys.readouterr()
     assert "WARNING" in captured.err
     assert "verify" in captured.err.lower()
@@ -655,6 +656,7 @@ def test_main_warns_loudly_on_unknown_key_permissions(
     report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
     assert report["key_permissions_unsafe"] is False
     assert report["account"]["key_permissions"] == "unknown"
+    assert report["key_permissions"] == "unknown"
 
 
 def _mock_full_happy_path() -> None:

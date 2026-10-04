@@ -18,6 +18,7 @@ deploy/recorder.env
 research/reports/*.html
 # Probe reports contain account balances (MINOR-15) -- never committed.
 research/reports/tabdeal_probe_*.json
+research/reports/tabdeal_probe_*.json.tmp
 /out/
 /logs/
 *.log

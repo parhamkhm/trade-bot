@@ -22,6 +22,8 @@ Exit codes:
   trade or withdrawal permission enabled (see ``report["key_permissions_unsafe"]``).
   CLAUDE.md section 3.6 requires a read-only key before phase 6 -- this must not be silently
   exit-0'd by CI or an operator's shell script.
+* ``3`` -- the probe completed but the key's permissions could not be determined from the
+  account response (``report["key_permissions"] == "unknown"``); verify in the Tabdeal UI.
 * ``130`` / ``143`` -- (m9a) the probe was interrupted mid-run by Ctrl+C/SIGINT or by SIGTERM
   (e.g. systemd stopping the service) respectively, during what can be an hours-long
   depth-sampling loop. A partial report (``report["interrupted"] = true``) is still written to
@@ -987,10 +989,15 @@ def run_probe(
     account_report, unsafe = _probe_account(client, prefix)
     report["account"] = account_report
     report["key_permissions_unsafe"] = unsafe
+    # Three-valued top-level field: "skipped" (no credentials), "safe", "unsafe" or "unknown".
+    report["key_permissions"] = account_report.get("key_permissions", "skipped")
 
     # M5: an unsafe (trade/withdraw-capable) key must not exit 0 -- that would let a CI check or
     # an operator's shell script silently treat this as a pass. The report is still written.
-    return 2 if unsafe else 0
+    # Review m-I: an unverifiable key is not a pass either.
+    if unsafe:
+        return 2
+    return 3 if report["key_permissions"] == "unknown" else 0
 
 
 def _print_symbols_summary(report: dict[str, Any]) -> None:
