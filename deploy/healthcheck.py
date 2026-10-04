@@ -27,6 +27,13 @@ polling fine (so the two checks above pass) but the exchange's own trade feed ha
 stale, which neither of them can see. All three thresholds are env-overridable so an
 operator can tune them without rebuilding the image.
 
+NIT (fifth fix round): a database that has NEVER recorded a single trade (`last_new_trade_ts_ms`
+stays `null` forever -- a symbol/market mismatch, or an endpoint that always returns `[]`; see
+MAJOR-B in `tbot.data.tabdeal_recorder`) used to look healthy indefinitely, since `last_poll_ts`
+keeps being rewritten on every successful poll regardless. `first_poll_ts_ms` (the recorder's
+very first poll attempt ever) lets this script fail once that has been true for longer than the
+same trade-staleness threshold.
+
 m3 default (`TBOT_HEARTBEAT_MAX_TRADE_STALENESS_SECONDS=7200`): measured from the Turkey
 server 2026-10-04, BTCUSDT on Tabdeal is thin -- a 1000-trade/~29h sample had a p99
 inter-trade gap of 641s and a max of 2120s (35 min) -- so a tighter default (e.g. 1800s)
@@ -72,6 +79,56 @@ _MAX_CLOCK_SKEW_SECONDS = 5.0
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
+def _evaluate_trade_feed_staleness(
+    payload: dict[object, object], *, now: datetime, max_trade_staleness_seconds: float
+) -> tuple[bool, str]:
+    """The ``last_new_trade_ts_ms`` / ``first_poll_ts_ms`` half of ``evaluate_heartbeat``, pulled
+    out to keep that function itself at a glance-able size.
+
+    m3 (fourth fix round): ``last_new_trade_ts_ms`` absent entirely (an older heartbeat payload,
+    or a database with no trades recorded yet at all) is treated as unknown, not unhealthy -- this
+    field did not exist before that fix round. ``None`` (present but no trade has ever been
+    recorded) is likewise not itself a failure *by itself* -- see the ``first_poll_ts_ms`` check
+    below for when it becomes one.
+    """
+    if "last_new_trade_ts_ms" not in payload:
+        return True, "ok"
+    last_new_trade_ts_ms = payload["last_new_trade_ts_ms"]
+    if last_new_trade_ts_ms is not None:
+        if not isinstance(last_new_trade_ts_ms, int) or isinstance(last_new_trade_ts_ms, bool):
+            return False, "heartbeat payload has a malformed 'last_new_trade_ts_ms'"
+        last_new_trade_ts = _EPOCH + timedelta(milliseconds=last_new_trade_ts_ms)
+        trade_age_seconds = (now - last_new_trade_ts).total_seconds()
+        if trade_age_seconds > max_trade_staleness_seconds:
+            return (
+                False,
+                f"last_new_trade_ts_ms is {trade_age_seconds:.0f}s old "
+                f"(max {max_trade_staleness_seconds:.0f}s) -- the exchange trade feed looks stale",
+            )
+        return True, "ok"
+    # NIT (fifth fix round): no trade has EVER been recorded. `last_poll_ts`'s own staleness
+    # check alone cannot catch this -- the recorder can keep polling successfully forever (a
+    # fresh-looking heartbeat rewritten every cycle) while genuinely receiving zero trades, e.g.
+    # a symbol/market mismatch or an endpoint that always returns `[]`. `first_poll_ts_ms`
+    # (absent from an older heartbeat payload, in which case this is skipped -- still unknown,
+    # not unhealthy) says how long the recorder has had to see at least one trade; once that
+    # exceeds the same staleness threshold used above, this is unhealthy too.
+    first_poll_ts_ms = payload.get("first_poll_ts_ms")
+    if first_poll_ts_ms is None:
+        return True, "ok"
+    if not isinstance(first_poll_ts_ms, int) or isinstance(first_poll_ts_ms, bool):
+        return False, "heartbeat payload has a malformed 'first_poll_ts_ms'"
+    first_poll_ts = _EPOCH + timedelta(milliseconds=first_poll_ts_ms)
+    since_first_poll_seconds = (now - first_poll_ts).total_seconds()
+    if since_first_poll_seconds > max_trade_staleness_seconds:
+        return (
+            False,
+            f"no trade has ever been recorded, {since_first_poll_seconds:.0f}s since "
+            f"the first poll (max {max_trade_staleness_seconds:.0f}s)",
+        )
+    return True, "ok"
+
+
 def evaluate_heartbeat(
     payload: object,
     *,
@@ -114,26 +171,9 @@ def evaluate_heartbeat(
             "(the process is alive but every poll cycle is failing)",
         )
 
-    # m3 (fourth fix round): absent entirely (an older heartbeat payload, or a database with no
-    # trades recorded yet at all) is treated as unknown, not unhealthy -- this field did not exist
-    # before this fix round. `None` (present but no trade has ever been recorded) is likewise not
-    # itself a failure; `last_poll_ts`'s own staleness check already covers "nothing is happening
-    # at all" in that case.
-    if "last_new_trade_ts_ms" in payload:
-        last_new_trade_ts_ms = payload["last_new_trade_ts_ms"]
-        if last_new_trade_ts_ms is not None:
-            if not isinstance(last_new_trade_ts_ms, int) or isinstance(last_new_trade_ts_ms, bool):
-                return False, "heartbeat payload has a malformed 'last_new_trade_ts_ms'"
-            last_new_trade_ts = _EPOCH + timedelta(milliseconds=last_new_trade_ts_ms)
-            trade_age_seconds = (now - last_new_trade_ts).total_seconds()
-            if trade_age_seconds > max_trade_staleness_seconds:
-                return (
-                    False,
-                    f"last_new_trade_ts_ms is {trade_age_seconds:.0f}s old "
-                    f"(max {max_trade_staleness_seconds:.0f}s) -- the exchange trade feed looks stale",
-                )
-
-    return True, "ok"
+    return _evaluate_trade_feed_staleness(
+        payload, now=now, max_trade_staleness_seconds=max_trade_staleness_seconds
+    )
 
 
 class _PayloadReadError(Exception):
