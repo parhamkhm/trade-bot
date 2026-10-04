@@ -423,9 +423,14 @@ $ ssh -T git@github.com
 $ sudo mkdir -p /opt/tbot
 $ sudo chown tbot:tbot /opt/tbot
 $ cd /opt/tbot
-$ git clone git@github.com:<your-org-or-user>/trade-bot.git
+$ git clone git@github.com:parhamkhm/trade-bot.git
 $ cd trade-bot
+$ git checkout main
+$ git log --oneline -1
 ```
+
+The server always runs `main`. Feature branches are merged there only after review, so do
+not check out a feature branch on the server.
 
 Create `.env` from the committed template — **never** commit `.env` itself:
 
@@ -596,6 +601,23 @@ $ docker compose -f deploy/docker-compose.yml logs -f recorder    # follow logs 
 $ docker compose -f deploy/docker-compose.yml logs --since 1h recorder
 $ docker inspect --format '{{json .State.Health}}' tbot-recorder  # raw health-check history
 ```
+
+### Daily health check — do this by hand until phase 5
+
+Nothing alerts you yet: Telegram arrives in phase 5, and `restart: unless-stopped` only
+reacts when the process **exits**, not when the container turns `unhealthy`. A recorder that
+is up but failing every poll stays up, failing, until someone looks. Until alerting exists,
+run this once a day (it takes seconds):
+
+```
+$ docker inspect --format '{{.State.Health.Status}}' tbot-recorder
+$ sudo cat "$(docker volume inspect tbot-data --format '{{ .Mountpoint }}')/tabdeal/heartbeat.json"
+```
+
+The first line must print `healthy`. If it prints `unhealthy`, read the last hour of logs
+(`docker compose -f deploy/docker-compose.yml logs --since 1h recorder`) before restarting
+anything — a restart does not fix a Tabdeal outage or a blocked network path, and every
+unhealthy hour counts against gate G1b's "≥ 99 % of hours complete".
 
 Logs are structured JSON (one object per line — `src/tbot/monitoring/logging.py`), rotated by
 Docker itself per `deploy/docker-compose.yml`'s `logging:` block (10 MB × 5 files per
