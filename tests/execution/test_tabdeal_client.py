@@ -378,6 +378,55 @@ def test_retry_after_header_overrides_a_short_exponential_backoff(monkeypatch: p
 
 
 @respx.mock
+def test_retry_after_above_cap_is_capped_and_logged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """m4 (reviewer finding): an uncapped Retry-After would let one hostile/misconfigured
+    response make this client sleep for arbitrarily long (e.g. a full day) on a single call --
+    cap it at ``_RETRY_AFTER_CAP_SECONDS`` and log when the cap actually bites."""
+    sleeps: list[float] = []
+    monkeypatch.setattr("tbot.execution.tabdeal_client.time.sleep", lambda s: sleeps.append(s))
+    route = respx.get(f"{BASE_URL}{READ_PREFIX}/ping")
+    route.side_effect = [httpx.Response(429, headers={"Retry-After": "86400"}), httpx.Response(200, json={})]
+    client = make_client()
+
+    events: list[Any] = []
+    from collections.abc import MutableMapping
+
+    import structlog
+
+    def _capture(_logger: Any, _name: str, event_dict: MutableMapping[str, Any]) -> MutableMapping[str, Any]:
+        events.append(dict(event_dict))
+        return event_dict
+
+    structlog.configure(processors=[_capture, structlog.processors.JSONRenderer()])
+    try:
+        result = client.ping()
+    finally:
+        structlog.reset_defaults()
+
+    assert result.ok
+    assert len(sleeps) == 1
+    assert sleeps[0] == pytest.approx(60.0)
+    assert any(e.get("event") == "tabdeal_client.retry_after_capped" for e in events)
+    client.close()
+
+
+@respx.mock
+def test_retry_after_below_cap_is_unaffected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The cap must not kick in (or log) for an ordinary, well-behaved Retry-After value."""
+    sleeps: list[float] = []
+    monkeypatch.setattr("tbot.execution.tabdeal_client.time.sleep", lambda s: sleeps.append(s))
+    route = respx.get(f"{BASE_URL}{READ_PREFIX}/ping")
+    route.side_effect = [httpx.Response(429, headers={"Retry-After": "5"}), httpx.Response(200, json={})]
+    client = make_client()
+
+    result = client.ping()
+
+    assert result.ok
+    assert sleeps == [pytest.approx(5.0)]
+    client.close()
+
+
+@respx.mock
 def test_order_count_headers_are_never_captured() -> None:
     """MINOR-12: X-MBX-ORDER-COUNT-10S/-1D are order-placement counters that can never be
     populated at phase 0 (this client places no orders) -- listing them in the rate-limit
