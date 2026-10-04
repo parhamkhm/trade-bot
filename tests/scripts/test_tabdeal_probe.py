@@ -6,6 +6,7 @@ All HTTP is mocked with respx; no test may reach a real exchange and no test may
 from __future__ import annotations
 
 import logging
+import signal
 import sys
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
@@ -18,21 +19,25 @@ import pytest
 import respx
 import structlog
 from scripts.tabdeal_probe import (
+    ProbeAbortError,
+    _install_sigterm_handler,
     best_bid_ask,
     build_symbol_filters,
+    classify_key_permissions,
     compute_clock_skew_ms,
     cumulative_depth,
     describe_unreachable_failure,
+    detect_time_unit,
     discover_max_trades_limit,
     find_base_asset_markets,
     find_symbol_entry,
+    ids_contiguous_in_window,
     is_saturated,
     main,
     probe_both_prefixes,
     spread_bps_and_pct,
     summarize_spreads,
     trades_window_stats,
-    unsafe_key_permissions,
 )
 
 from tbot.execution.tabdeal_client import ProbeResult, TabdealClient
@@ -339,20 +344,119 @@ def test_build_symbol_filters_none_when_incomplete() -> None:
 # ---------------------------------------------------------------------------------
 
 
-def test_unsafe_key_permissions_flags_trade_or_withdraw() -> None:
-    unsafe, found = unsafe_key_permissions({"canTrade": True, "canWithdraw": False})
-    assert unsafe is True
+def test_classify_key_permissions_flags_trade_or_withdraw() -> None:
+    state, found = classify_key_permissions({"canTrade": True, "canWithdraw": False})
+    assert state == "unsafe"
     assert found == {"canTrade": True, "canWithdraw": False}
 
 
-def test_unsafe_key_permissions_safe_when_read_only() -> None:
-    unsafe, _ = unsafe_key_permissions({"canTrade": False, "canWithdraw": False})
-    assert unsafe is False
+def test_classify_key_permissions_safe_when_read_only() -> None:
+    state, _ = classify_key_permissions({"canTrade": False, "canWithdraw": False})
+    assert state == "safe"
 
 
-def test_unsafe_key_permissions_checks_permissions_list() -> None:
-    unsafe, _ = unsafe_key_permissions({"permissions": ["SPOT", "WITHDRAW"]})
-    assert unsafe is True
+def test_classify_key_permissions_checks_permissions_list() -> None:
+    state, _ = classify_key_permissions({"permissions": ["SPOT", "WITHDRAW"]})
+    assert state == "unsafe"
+
+
+# ---------------------------------------------------------------------------------
+# m9b: the fail-open bug -- "no permission field at all" must be "unknown", never "safe"
+# ---------------------------------------------------------------------------------
+
+
+def test_classify_key_permissions_unknown_when_no_indicator_field_present() -> None:
+    """Regression for m9b: an account body with none of canTrade/canWithdraw/permissions used
+    to report ``unsafe=False`` -- silently and incorrectly "safe" -- which could let a CI check
+    or an operator's shell script treat an *unverified* key as a confirmed-safe one."""
+    state, found = classify_key_permissions({"someOtherField": 1})
+    assert state == "unknown"
+    assert found == {}
+
+
+def test_classify_key_permissions_unknown_for_non_dict_body() -> None:
+    state, found = classify_key_permissions(None)
+    assert state == "unknown"
+    assert found == {}
+
+
+def test_classify_key_permissions_can_deposit_alone_is_unknown_not_safe() -> None:
+    """``canDeposit`` says nothing about trade/withdraw permission -- it must not make the key
+    look "safe" by itself."""
+    state, found = classify_key_permissions({"canDeposit": True})
+    assert state == "unknown"
+    assert found == {"canDeposit": True}
+
+
+# ---------------------------------------------------------------------------------
+# m2: /trades time-unit detection and id-contiguity
+# ---------------------------------------------------------------------------------
+
+
+def test_detect_time_unit_seconds() -> None:
+    assert detect_time_unit([1_700_000_000]) == "s"
+
+
+def test_detect_time_unit_milliseconds() -> None:
+    assert detect_time_unit([1_700_000_000_000]) == "ms"
+
+
+def test_detect_time_unit_microseconds() -> None:
+    assert detect_time_unit([1_700_000_000_000_000]) == "us"
+
+
+def test_detect_time_unit_empty_is_unknown() -> None:
+    assert detect_time_unit([]) == "unknown"
+
+
+def test_detect_time_unit_uses_median_not_first_element() -> None:
+    """One corrupted/zero timestamp must not flip the classification for an otherwise
+    consistent ms-scale window."""
+    assert detect_time_unit([0, 1_700_000_000_000, 1_700_000_001_000, 1_700_000_002_000]) == "ms"
+
+
+def test_ids_contiguous_in_window_true_for_a_tight_range() -> None:
+    contiguous, missing = ids_contiguous_in_window([10, 11, 12, 13])
+    assert contiguous is True
+    assert missing == 0
+
+
+def test_ids_contiguous_in_window_false_when_gap_present() -> None:
+    contiguous, missing = ids_contiguous_in_window([10, 11, 15])
+    assert contiguous is False
+    assert missing == 3  # 12, 13, 14
+
+
+def test_ids_contiguous_in_window_none_when_fewer_than_two_distinct_ids() -> None:
+    assert ids_contiguous_in_window([]) == (None, 0)
+    assert ids_contiguous_in_window([5]) == (None, 0)
+    assert ids_contiguous_in_window([5, 5]) == (None, 0)
+
+
+def test_trades_window_stats_reports_time_unit_and_contiguity() -> None:
+    trades = [{"id": i, "time": 1_700_000_000_000 + i * 1000} for i in range(5)]
+    stats = trades_window_stats(trades, requested_limit=500)
+    assert stats.time_unit == "ms"
+    assert stats.time_unit_disagrees_with_ms is False
+    assert stats.ids_contiguous is True
+    assert stats.missing_ids == 0
+
+
+def test_trades_window_stats_flags_time_unit_disagreement() -> None:
+    """A /trades response whose `time` is actually in seconds, not ms, must be flagged -- the
+    recorder (tbot.data.tabdeal_recorder) assumes ms and would otherwise silently build a
+    corrupted time axis."""
+    trades = [{"id": i, "time": 1_700_000_000 + i} for i in range(5)]
+    stats = trades_window_stats(trades, requested_limit=500)
+    assert stats.time_unit == "s"
+    assert stats.time_unit_disagrees_with_ms is True
+
+
+def test_trades_window_stats_flags_non_contiguous_ids() -> None:
+    trades = [{"id": i, "time": 1_700_000_000_000 + i * 1000} for i in (10, 11, 20)]
+    stats = trades_window_stats(trades, requested_limit=500)
+    assert stats.ids_contiguous is False
+    assert stats.missing_ids == 8
 
 
 # ---------------------------------------------------------------------------------
@@ -520,6 +624,36 @@ def test_main_warns_on_unsafe_key_permissions(
     assert "fake-key" not in report_text
 
 
+@respx.mock
+def test_main_warns_loudly_on_unknown_key_permissions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Regression for m9b: an `account` response with none of canTrade/canWithdraw/permissions
+    must not silently exit 0 as if the key were confirmed safe -- it must print a loud warning
+    telling Parham to check the Tabdeal UI by hand, and the JSON must say `key_permissions:
+    "unknown"` (while `key_permissions_unsafe` stays False, since nothing here says the key
+    actually has trade/withdraw permission either -- just that it is unverified)."""
+    monkeypatch.chdir(tmp_path)  # MINOR-16
+    monkeypatch.setenv("TBOT_TABDEAL_API_KEY", "fake-key")
+    monkeypatch.setenv("TBOT_TABDEAL_API_SECRET", "fake-secret")
+    _mock_full_happy_path()
+    respx.get(f"{BASE_URL}{READ_PREFIX}/account").mock(
+        return_value=httpx.Response(200, json={"balances": []})
+    )
+
+    exit_code = main(_args_for(tmp_path))
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "WARNING" in captured.err
+    assert "verify" in captured.err.lower()
+    import json
+
+    report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+    assert report["key_permissions_unsafe"] is False
+    assert report["account"]["key_permissions"] == "unknown"
+
+
 def _mock_full_happy_path() -> None:
     """Mock every endpoint the happy path touches, on the read prefix."""
     respx.get(f"{BASE_URL}{READ_PREFIX}/ping").mock(return_value=httpx.Response(200, json={}))
@@ -651,6 +785,175 @@ def test_main_end_to_end_happy_path_writes_report(tmp_path: Path, monkeypatch: p
     assert set(one_threshold_depth) == {"bid", "ask"}
     assert set(one_threshold_depth["bid"]) == {"base_qty", "quote_notional"}
     assert set(one_threshold_depth["ask"]) == {"base_qty", "quote_notional"}
+
+
+# ---------------------------------------------------------------------------------
+# m9a: a crossed-book depth sample must be counted and survived, never abort the run
+# ---------------------------------------------------------------------------------
+
+
+@respx.mock
+def test_crossed_book_sample_is_counted_and_does_not_abort_the_run(tmp_path: Path) -> None:
+    """Regression for m9a: ``spread_bps_and_pct`` raises ``ValueError`` on a crossed book -- a
+    multi-sample depth-sampling run must survive that on any single sample, not lose every
+    other sample collected around it."""
+    monkeypatch_chdir = tmp_path  # documents intent; actual chdir below via monkeypatch fixture
+
+    respx.get(f"{BASE_URL}{READ_PREFIX}/ping").mock(return_value=httpx.Response(200, json={}))
+    respx.get(f"{BASE_URL}{WRITE_PREFIX}/ping").mock(return_value=httpx.Response(404))
+    respx.get(f"{BASE_URL}{READ_PREFIX}/time").mock(
+        return_value=httpx.Response(200, json={"serverTime": 1_700_000_000_000})
+    )
+    respx.get(f"{BASE_URL}{WRITE_PREFIX}/time").mock(return_value=httpx.Response(404))
+    respx.get(f"{BASE_URL}{READ_PREFIX}/exchangeInfo").mock(
+        return_value=httpx.Response(200, json=EXCHANGE_INFO_BODY)
+    )
+    respx.get(f"{BASE_URL}{WRITE_PREFIX}/exchangeInfo").mock(return_value=httpx.Response(404))
+    trades_body = [
+        {"id": i, "price": "100.0", "qty": "0.1", "time": 1_700_000_000_000 + i * 1000} for i in range(50)
+    ]
+    respx.get(f"{BASE_URL}{READ_PREFIX}/trades").mock(return_value=httpx.Response(200, json=trades_body))
+    respx.get(f"{BASE_URL}{WRITE_PREFIX}/trades").mock(return_value=httpx.Response(404))
+    respx.get(f"{BASE_URL}{WRITE_PREFIX}/depth").mock(return_value=httpx.Response(404))
+
+    normal_body = {"bids": [["100.00", "1.0"]], "asks": [["100.10", "1.0"]]}
+    crossed_body = {"bids": [["101.00", "1.0"]], "asks": [["100.00", "1.0"]]}
+    call_count = {"n": 0}
+
+    def depth_handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        # Call 1 is the prefix-discovery probe, reused as sample i=0 (it was ok). The first
+        # *extra* network call the sampling loop makes (sample i=1) is the one we cross.
+        if call_count["n"] == 2:
+            return httpx.Response(200, json=crossed_body)
+        return httpx.Response(200, json=normal_body)
+
+    respx.get(f"{BASE_URL}{READ_PREFIX}/depth").mock(side_effect=depth_handler)
+
+    argv = _args_for(monkeypatch_chdir, samples=3, interval=0)
+    exit_code = main(argv)
+
+    assert exit_code == 0
+    import json
+
+    report = json.loads((monkeypatch_chdir / "report.json").read_text(encoding="utf-8"))
+    depth_report = report["depth"]["BTCUSDT"]
+    assert depth_report["crossed_book_count"] == 1
+    assert len(depth_report["crossed_book_samples"]) == 1
+    assert depth_report["crossed_book_samples"][0]["best_bid"] == "101.00"
+    assert depth_report["crossed_book_samples"][0]["best_ask"] == "100.00"
+    # The other two (ok) samples must still be present -- not lost because of the one crossed one.
+    assert len(depth_report["samples"]) == 2
+
+
+# ---------------------------------------------------------------------------------
+# m9a: interruption (KeyboardInterrupt / SIGTERM) mid-run must still write a partial report
+# ---------------------------------------------------------------------------------
+
+
+def _write_fast_config(tmp_path: Path) -> Path:
+    """A config directory whose ``requests_per_second`` is high enough that the client's own
+    token-bucket throttling never calls ``time.sleep`` -- needed because the interruption tests
+    below monkeypatch the process-global ``time.sleep`` (there is only one ``time`` module
+    object, shared by ``scripts.tabdeal_probe`` and ``tbot.execution.tabdeal_client``) and must
+    isolate that patch to the probe's own inter-sample sleep, not the token bucket's."""
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "default.yaml").write_text(
+        (REPO_ROOT / "config" / "default.yaml")
+        .read_text(encoding="utf-8")
+        .replace("requests_per_second: 5.0", "requests_per_second: 20.0"),
+        encoding="utf-8",
+    )
+    return config_dir
+
+
+def test_install_sigterm_handler_raises_abort_requested_and_restores() -> None:
+    previous_handler = signal.getsignal(signal.SIGTERM)
+    restore = _install_sigterm_handler()
+    try:
+        installed_handler = signal.getsignal(signal.SIGTERM)
+        assert installed_handler is not previous_handler
+        assert callable(installed_handler)
+        with pytest.raises(ProbeAbortError):
+            installed_handler(signal.SIGTERM, None)
+    finally:
+        restore()
+    assert signal.getsignal(signal.SIGTERM) == previous_handler
+
+
+@respx.mock
+def test_main_writes_partial_report_and_exits_130_on_keyboard_interrupt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A multi-hour depth-sampling run must not lose everything collected so far if the operator
+    hits Ctrl+C mid-run -- the partial report (with whatever samples were already gathered) must
+    still be written, with a clear marker and a distinct exit code, not an uncaught traceback."""
+    monkeypatch.chdir(tmp_path)  # MINOR-16
+    monkeypatch.delenv("TBOT_TABDEAL_API_KEY", raising=False)
+    monkeypatch.delenv("TBOT_TABDEAL_API_SECRET", raising=False)
+    _mock_full_happy_path()
+
+    sleep_calls = {"n": 0}
+
+    def _sleep(_seconds: float) -> None:
+        sleep_calls["n"] += 1
+        if sleep_calls["n"] == 2:
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr("scripts.tabdeal_probe.time.sleep", _sleep)
+
+    argv = _args_for(tmp_path, samples=5, interval=1, config_dir=str(_write_fast_config(tmp_path)))
+    exit_code = main(argv)
+
+    assert exit_code == 130
+    captured = capsys.readouterr()
+    assert "interrupted" in captured.err.lower()
+    assert "Traceback" not in captured.err
+    import json
+
+    report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+    assert report["interrupted"] is True
+    assert report["interrupted_reason"] == "KeyboardInterrupt"
+    depth_report = report["depth"]["BTCUSDT"]
+    assert len(depth_report["samples"]) == 2  # i=0 and i=1 completed before the 2nd sleep raised
+
+
+@respx.mock
+def test_main_writes_partial_report_and_exits_143_on_sigterm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SIGTERM (systemd stopping the service) must be handled the same way as Ctrl+C -- partial
+    report written, distinct exit code, no uncaught traceback. Simulated here by raising
+    `ProbeAbortError` from the probe's own inter-sample sleep, exactly as the real SIGTERM
+    handler installed by `_install_sigterm_handler` would."""
+    monkeypatch.chdir(tmp_path)  # MINOR-16
+    monkeypatch.delenv("TBOT_TABDEAL_API_KEY", raising=False)
+    monkeypatch.delenv("TBOT_TABDEAL_API_SECRET", raising=False)
+    _mock_full_happy_path()
+
+    sleep_calls = {"n": 0}
+
+    def _sleep(_seconds: float) -> None:
+        sleep_calls["n"] += 1
+        if sleep_calls["n"] == 2:
+            raise ProbeAbortError("SIGTERM received")
+
+    monkeypatch.setattr("scripts.tabdeal_probe.time.sleep", _sleep)
+
+    argv = _args_for(tmp_path, samples=5, interval=1, config_dir=str(_write_fast_config(tmp_path)))
+    exit_code = main(argv)
+
+    assert exit_code == 143
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+    import json
+
+    report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+    assert report["interrupted"] is True
+    assert report["interrupted_reason"] == "ProbeAbortError"
+    depth_report = report["depth"]["BTCUSDT"]
+    assert len(depth_report["samples"]) == 2
 
 
 # ---------------------------------------------------------------------------------
