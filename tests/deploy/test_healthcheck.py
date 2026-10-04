@@ -43,6 +43,7 @@ def clean_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         "TBOT_HEARTBEAT_FILE",
         "TBOT_HEARTBEAT_MAX_AGE_SECONDS",
         "TBOT_HEARTBEAT_MAX_CONSECUTIVE_ERRORS",
+        "TBOT_HEARTBEAT_MAX_TRADE_STALENESS_SECONDS",
     ):
         monkeypatch.delenv(name, raising=False)
     yield
@@ -215,6 +216,100 @@ def test_last_poll_ts_far_in_the_future_is_unhealthy() -> None:
     assert "future" in reason
 
 
+# --- evaluate_heartbeat: last_new_trade_ts_ms (m3, fourth fix round) ---------------
+
+
+def test_stale_last_new_trade_ts_ms_is_unhealthy_even_with_fresh_poll() -> None:
+    """m3's whole point: the process is polling fine (fresh last_poll_ts, zero
+    consecutive_errors -- both checks above would pass) but the exchange's own trade feed has
+    gone stale. Neither of the pre-existing checks can see that; this one must.
+    """
+    now = datetime(2026, 1, 1, 2, 0, 0, tzinfo=UTC)
+    stale_trade_ms = int(datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC).timestamp() * 1000)  # 2h old
+    payload = _payload(
+        last_poll_ts=now.isoformat(), consecutive_errors=0, last_new_trade_ts_ms=stale_trade_ms
+    )
+
+    healthy, reason = healthcheck.evaluate_heartbeat(
+        payload, now=now, max_age_seconds=180, max_consecutive_errors=10, max_trade_staleness_seconds=3600
+    )
+
+    assert healthy is False
+    assert "last_new_trade_ts_ms" in reason
+
+
+def test_fresh_last_new_trade_ts_ms_is_healthy() -> None:
+    now = datetime(2026, 1, 1, 2, 0, 0, tzinfo=UTC)
+    fresh_trade_ms = int(datetime(2026, 1, 1, 1, 59, 30, tzinfo=UTC).timestamp() * 1000)  # 30s old
+    payload = _payload(
+        last_poll_ts=now.isoformat(), consecutive_errors=0, last_new_trade_ts_ms=fresh_trade_ms
+    )
+
+    healthy, _ = healthcheck.evaluate_heartbeat(
+        payload, now=now, max_age_seconds=180, max_consecutive_errors=10, max_trade_staleness_seconds=3600
+    )
+
+    assert healthy is True
+
+
+def test_missing_last_new_trade_ts_ms_field_is_healthy_treated_as_unknown() -> None:
+    """A heartbeat payload from before this fix round (or any payload that simply omits the
+    field) must not be penalised for a field it never had."""
+    now = datetime(2026, 1, 1, 0, 0, 30, tzinfo=UTC)
+    payload = _payload(last_poll_ts="2026-01-01T00:00:00+00:00", consecutive_errors=0)
+    assert "last_new_trade_ts_ms" not in payload
+
+    healthy, _ = healthcheck.evaluate_heartbeat(
+        payload, now=now, max_age_seconds=180, max_consecutive_errors=10
+    )
+
+    assert healthy is True
+
+
+def test_null_last_new_trade_ts_ms_is_healthy_treated_as_unknown() -> None:
+    """Present but ``null`` (no trade has ever been recorded yet) is likewise not itself a
+    failure -- ``last_poll_ts``'s own staleness check already covers total silence."""
+    now = datetime(2026, 1, 1, 0, 0, 30, tzinfo=UTC)
+    payload = _payload(
+        last_poll_ts="2026-01-01T00:00:00+00:00", consecutive_errors=0, last_new_trade_ts_ms=None
+    )
+
+    healthy, _ = healthcheck.evaluate_heartbeat(
+        payload, now=now, max_age_seconds=180, max_consecutive_errors=10
+    )
+
+    assert healthy is True
+
+
+def test_malformed_last_new_trade_ts_ms_is_unhealthy_not_a_crash() -> None:
+    now = datetime(2026, 1, 1, 0, 0, 30, tzinfo=UTC)
+    payload = _payload(
+        last_poll_ts="2026-01-01T00:00:00+00:00", consecutive_errors=0, last_new_trade_ts_ms="not-an-int"
+    )
+
+    healthy, reason = healthcheck.evaluate_heartbeat(
+        payload, now=now, max_age_seconds=180, max_consecutive_errors=10
+    )
+
+    assert healthy is False
+    assert "last_new_trade_ts_ms" in reason
+
+
+def test_bool_last_new_trade_ts_ms_is_unhealthy_not_a_crash() -> None:
+    """bool is a subclass of int; a stray true/false must not silently coerce into 0/1 ms."""
+    now = datetime(2026, 1, 1, 0, 0, 30, tzinfo=UTC)
+    payload = _payload(
+        last_poll_ts="2026-01-01T00:00:00+00:00", consecutive_errors=0, last_new_trade_ts_ms=True
+    )
+
+    healthy, reason = healthcheck.evaluate_heartbeat(
+        payload, now=now, max_age_seconds=180, max_consecutive_errors=10
+    )
+
+    assert healthy is False
+    assert "last_new_trade_ts_ms" in reason
+
+
 # --- main(): file I/O + env var parsing, robust to a missing/malformed file --------
 
 
@@ -332,6 +427,51 @@ def test_main_falls_back_to_defaults_on_malformed_env_vars(
     monkeypatch.setenv("TBOT_HEARTBEAT_MAX_AGE_SECONDS", "not-a-number")
     monkeypatch.setenv("TBOT_HEARTBEAT_MAX_CONSECUTIVE_ERRORS", "also-not-a-number")
     assert healthcheck.main([]) == 0
+
+
+def test_main_is_unhealthy_when_trade_staleness_crosses_env_threshold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_env: None
+) -> None:
+    """m3 end to end: polling itself looks perfectly healthy, but the trade feed is stale per a
+    tightened TBOT_HEARTBEAT_MAX_TRADE_STALENESS_SECONDS."""
+    path = tmp_path / "heartbeat.json"
+    now = datetime.now(UTC)
+    stale_trade_ms = int((now - timedelta(seconds=120)).timestamp() * 1000)
+    payload = _payload(
+        last_poll_ts=now.isoformat(), consecutive_errors=0, last_new_trade_ts_ms=stale_trade_ms
+    )
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setenv("TBOT_HEARTBEAT_FILE", str(path))
+    monkeypatch.setenv("TBOT_HEARTBEAT_MAX_TRADE_STALENESS_SECONDS", "60")  # stricter than 120s old
+    assert healthcheck.main([]) == 1
+
+
+def test_main_uses_default_trade_staleness_when_env_var_is_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_env: None
+) -> None:
+    """Without an override, the built-in default (7200s, sized against BTCUSDT's measured
+    inter-trade gap -- see the module docstring) must not false-alarm on an ordinary quiet
+    period."""
+    path = tmp_path / "heartbeat.json"
+    now = datetime.now(UTC)
+    quiet_but_fine_ms = int((now - timedelta(seconds=2000)).timestamp() * 1000)  # > old 1800s default
+    payload = _payload(
+        last_poll_ts=now.isoformat(), consecutive_errors=0, last_new_trade_ts_ms=quiet_but_fine_ms
+    )
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setenv("TBOT_HEARTBEAT_FILE", str(path))
+    assert healthcheck.main([]) == 0
+
+
+def test_main_falls_back_to_default_trade_staleness_on_malformed_env_var(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_env: None
+) -> None:
+    path = tmp_path / "heartbeat.json"
+    payload = _payload(last_poll_ts=datetime.now(UTC).isoformat(), consecutive_errors=0)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setenv("TBOT_HEARTBEAT_FILE", str(path))
+    monkeypatch.setenv("TBOT_HEARTBEAT_MAX_TRADE_STALENESS_SECONDS", "not-a-number")
+    assert healthcheck.main([]) == 0  # must not crash; falls back to the default
 
 
 def test_module_is_self_contained_stdlib_only() -> None:

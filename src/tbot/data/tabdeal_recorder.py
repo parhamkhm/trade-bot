@@ -1,83 +1,82 @@
 """Tabdeal public-trades recorder, order-book snapshotter and candle-sweep driver.
 
 Tabdeal has no kline endpoint (CLAUDE.md section 6), so this module polls the public ``/trades``
-endpoint, persists every trade exactly once (SQLite, dedupe by trade id), detects real id
-discontinuities, and periodically asks ``tbot.data.candles`` to emit any 1h candle that is now
-due. It also polls the public ``/depth`` endpoint on its own interval and stores a
-cumulative-depth snapshot (decision D-019) for phase 3's execution-cost model.
+endpoint, persists every trade exactly once (SQLite, dedupe by trade id), detects coverage loss
+against the previously-stored trades, and periodically asks ``tbot.data.candles`` to emit any 1h
+candle that is now due. It also polls the public ``/depth`` endpoint on its own interval and
+stores a cumulative-depth snapshot (decision D-019) for phase 3's execution-cost model.
 
 Reuse, not reimplementation: the depth/trade-window maths (``best_bid_ask``,
 ``spread_bps_and_pct``, ``cumulative_depth``, ``is_saturated``, ``parse_depth_levels``) is
-imported unchanged from ``tbot.data.depth`` -- a sibling module shared with
-``scripts/tabdeal_probe.py`` (decision D-025). It used to be imported from the probe script
-itself, which was the wrong dependency direction for a library module; ``tbot.data.depth`` is now
-the single implementation both sides import.
+imported unchanged from ``tbot.data.depth`` (decision D-025), shared with ``scripts/tabdeal_probe.py``.
 
-Saturation semantics (decision D-024, correcting the original design): Tabdeal's ``/trades`` is a
-*recent-trades* endpoint, so ``count == limit`` (what ``is_saturated`` checks) is true on
-essentially every poll once enough history exists and carries no information about whether a
-trade was actually missed. ``saturated`` is still stored on every ``poll_log`` row for raw
-fidelity, but it is **not** logged as a warning and **not** used to mark a candle incomplete. The
-two metrics that matter operationally, both stored on ``poll_log``, are:
+Saturation (decision D-024): ``count == limit`` (``is_saturated``) is stored for raw fidelity but
+is **not** an alert and **not** used to mark a candle incomplete -- on a recent-trades endpoint it
+is true on nearly every poll and is uninformative by itself. ``coverage_ratio =
+window_span_seconds / poll_interval_seconds`` (< 3 = at risk) is the operationally meaningful
+number, logged as a warning.
 
-* ``coverage_ratio = window_span_seconds / poll_interval_seconds`` -- how much margin the
-  returned window gives before it could plausibly evict an unseen trade. A poll is *at risk* when
-  ``coverage_ratio < 3``; that is what actually gets logged as a warning here.
-* a real trade-id gap (the lowest id in a poll exceeds ``last_stored_id + 1``) -- genuine data
-  loss, and the only thing (together with an empty-hour gap) that marks a candle
-  ``complete=False``.
+**Trade ids are global across symbols, not per-symbol-contiguous** (decision D-036, proposed --
+measured from the Turkey server 2026-10-04: BTCUSDT ids step by a median of 84, max 2069, as other
+symbols' trades interleave in the same id space). The old "first returned id > last_stored_id + 1"
+gap test therefore fired on nearly every poll for a thin market like BTCUSDT and would have made
+G1b unsatisfiable. It is replaced by an **overlap** test: a poll proves continuity iff the lowest
+id it returns is ``<= last_stored_id`` (the new window reaches back into what is already stored).
+When it does not, a ``window_no_overlap`` gap is recorded (see ``poll_trades_once``) -- this is
+the gap reason going forward; ``id_discontinuity`` no longer exists in the vocabulary. BTCUSDT is
+also thin (median inter-trade gap 46s, p99 641s, max 2120s over a 29h/1000-trade sample), which is
+why the heartbeat trade-staleness default (see ``m3`` below) is 7200s, not a tighter value.
 
 Causality / no forward-fill: an hour with zero recorded trades produces **no** candle, only a
 ``gaps`` row (``reason="no_trades_in_hour"``) -- see ``build_due_candles``.
 
-Second fix round, MAJOR-1: ``parse_trade_item`` used to reject any ``price``/``qty`` that was not
-already a JSON ``str``. That guard predates decision D-031, which changed ``TabdealClient`` to
-decode response bodies with ``json.loads(..., parse_float=Decimal)`` -- an unquoted JSON number in
-``/trades`` now arrives here as an exact ``Decimal``, and the old guard silently dropped every such
-trade (``n_trades=0`` with no warning, a green healthcheck, and a healthy-looking empty-hour log
-once an hour). This module now accepts ``str | Decimal`` for price/qty (reusing
-``tbot.data.depth.to_decimal``, which already does this losslessly) and still rejects a bare
-``float`` outright, since ``str()`` on a float that round-tripped through binary floating point is
-not the exchange's exact decimal literal. A poll whose response was non-empty but from which
-nothing parsed now also logs loudly (``tabdeal_recorder.unparsable_trades``) and records
-``n_items_received`` on ``poll_log`` so "exchange returned nothing" and "we dropped everything" are
-distinguishable after the fact.
+Fix-round history (one line each; see ``research/EXPERIMENTS.md``-adjacent task reports for the
+full narrative of each finding):
 
-Second fix round, MAJOR-2: ``RecorderStore.__init__`` now migrates an existing (pre-fix) SQLite
-file by adding any column the current schema expects but the on-disk table does not yet have
-(``window_span_seconds``/``coverage_ratio``/``n_items_received`` on ``poll_log``,
-``hour_close_ms`` on ``gaps``) -- ``CREATE TABLE IF NOT EXISTS`` alone is a no-op against an
-existing table and previously left an old database missing those columns, so the first
-``record_poll`` call after opening it raised ``OperationalError`` and ``run_forever``'s broad
-``except Exception`` turned that into a silent crash loop (trades still got inserted by
-``insert_trades``, which ran first, but no poll log, candle, or heartbeat was ever written again).
+* MAJOR-1 (parse): ``price``/``qty`` accepts ``str | Decimal`` (decision D-031 made an unquoted
+  JSON number arrive as ``Decimal``, not ``str``); a bare ``float`` is still rejected (no exact
+  decimal recoverable from it).
+* MAJOR-2 (schema): ``RecorderStore`` migrates an existing database by adding any column/table the
+  current schema expects but the file predates (``PRAGMA user_version``-gated, decision D-035);
+  ``CREATE TABLE IF NOT EXISTS`` alone is a no-op against an existing table.
+* M-A/M-B (poll shape): a non-list HTTP-200 body, and a partial mid-batch parse failure, both now
+  make ``PollOutcome.ok=False`` / record a ``partial_unparsable`` gap respectively, instead of
+  looking like a healthy empty poll.
+* MINOR-4 (poisoned rows): a non-finite/non-positive price or non-finite/negative qty is rejected
+  in ``parse_trade_item`` before persistence, with a second defensive filter in
+  ``tbot.data.candles.build_candle`` for a row written before this guard existed.
+* MINOR-6/7: a newer-than-supported schema version raises ``RecorderSchemaVersionError``; a
+  corrupt database raises ``RecorderDatabaseError`` naming the path.
 
-Third fix round: a non-list HTTP-200 body (MAJOR M-A) used to be indistinguishable from a
-genuinely empty response -- ``poll_trades_once`` now logs ``unexpected_body_type`` and reports the
-outcome as not ok, so ``_consecutive_errors`` climbs toward the healthcheck threshold. A partial
-mid-batch parse failure (MAJOR M-B) used to warn only when *every* item failed and was invisible to
-gap detection -- the warning now fires on any shortfall, and the affected hour(s) are recorded as a
-``partial_unparsable`` gap so the sweep builds them ``complete=False`` (see ``has_hour_gap``). A
-non-finite/non-positive price or non-finite/negative qty (reported as MINOR-4, treated as MAJOR) is
-now rejected in ``parse_trade_item`` before it is ever persisted, with a second, defensive filter in
-``tbot.data.candles.build_candle`` in case a poisoned row already reached the database -- previously
-such a row raised ``decimal.InvalidOperation`` inside ``process_once`` on every single cycle
-forever, a permanent wedge needing manual database surgery to clear. ``_EXPECTED_COLUMNS`` (MINOR-5)
-is now derived by executing ``_SCHEMA_SQL`` into an in-memory connection and reading back
-``PRAGMA table_info``, rather than a hand-maintained duplicate that could silently drift out of sync
-with the schema above. Opening a database at a schema version newer than this code supports
-(MINOR-6) now raises ``RecorderSchemaVersionError`` instead of silently "downgrading" it, and a
-corrupt database (MINOR-7) now raises ``RecorderDatabaseError`` naming the path instead of a bare
-``sqlite3.DatabaseError``.
+Fourth fix round (this task):
+
+* MAJOR-1': a candle could be written ``complete=True`` while the underlying polls across its
+  close time were failing (never verified), and a later id-overlap gap found against an
+  already-written candle was never reflected back onto it. See ``verified_poll_ts_ms`` /
+  ``build_due_candles`` / the gap-rewrite step in ``poll_trades_once``.
+* MAJOR-2': a 200 response whose every item failed to parse used to count as ``ok=True``.
+* MAJOR-3: all SQLite writes for one poll (trades + poll_log + gap rows + the verified-poll
+  marker) are now one atomic transaction (``RecorderStore.transaction``); ditto an hour-gap row
+  plus its sweep-cursor advance.
+* m1: a crossed order book (``spread_bps_and_pct`` raising) is caught, logged
+  ``orderbook_crossed``, and still written with ``spread_bps=None``.
+* m2: a trade whose ``ts`` is more than a day from the poll time is rejected (catches a unit bug --
+  seconds/microseconds/0 -- before it corrupts the sweep).
+* m3: the heartbeat carries ``last_new_trade_ts_ms``; the healthcheck can fail on a stale trade
+  feed even while polling itself looks healthy.
+* m4: the recorder backs off exponentially (cap 300s) once ``consecutive_errors > 5``.
+* m6: the database records which symbol it was started for (``meta`` table) and refuses to open
+  against a mismatched one.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -96,7 +95,7 @@ from tbot.data.depth import (
     spread_bps_and_pct,
     to_decimal,
 )
-from tbot.execution.tabdeal_client import TabdealClient
+from tbot.execution.tabdeal_client import ProbeResult, TabdealClient
 
 __all__ = [
     "HeartbeatState",
@@ -106,6 +105,7 @@ __all__ = [
     "RecorderSchemaVersionError",
     "RecorderSettings",
     "RecorderStore",
+    "RecorderSymbolMismatchError",
     "TabdealRecorderService",
     "build_due_candles",
     "is_candle_complete",
@@ -118,6 +118,16 @@ __all__ = [
 logger = structlog.get_logger(__name__)
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+# m2: a trade whose own timestamp is more than this far from the poll time is rejected outright --
+# guards against a unit bug (seconds/microseconds/0 instead of ms) walking the sweep from 1970 or
+# stalling it forever on a bogus future timestamp.
+_MAX_TRADE_AGE_MS = 24 * 60 * 60 * 1000
+
+# m4: once consecutive_errors exceeds this, run_forever backs off exponentially instead of
+# retrying at the nominal poll interval (see _next_wait_seconds).
+_BACKOFF_THRESHOLD_ERRORS = 5
+_BACKOFF_CAP_SECONDS = 300.0
 
 # Cumulative-depth thresholds, as fractions of mid price -- 0.1% / 0.5% / 1% (D-019, matches the
 # probe's own _DEPTH_THRESHOLDS_PCT).
@@ -160,6 +170,22 @@ CREATE TABLE IF NOT EXISTS sweep_cursor (
     last_swept_close_ms INTEGER NOT NULL
 );
 
+-- MAJOR-1' (fourth fix round): the last poll_ts_ms whose poll actually reached the exchange and
+-- either proved window overlap or recorded a gap -- i.e. is trustworthy for the sweep to build on.
+-- Separate table (not a sweep_cursor column) because sweep_cursor's own column is NOT NULL with no
+-- natural "never swept" sentinel that would not collide with a real hour_close_ms.
+CREATE TABLE IF NOT EXISTS recorder_state (
+    symbol TEXT PRIMARY KEY,
+    last_verified_poll_ts_ms INTEGER NOT NULL
+);
+
+-- m6: which symbol this database was recorded for, set on first use. A database must never be
+-- silently reused for a different symbol -- see RecorderStore.ensure_symbol.
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS orderbook (
     ts_ms INTEGER NOT NULL,
     best_bid TEXT,
@@ -183,11 +209,12 @@ def _dt_to_ms(dt: datetime) -> int:
 # schema migration (MAJOR-2, second fix round)
 # ---------------------------------------------------------------------------------
 
-# Current schema version. Bumped whenever a column is added to an existing table below --
-# ``PRAGMA user_version`` is set to this after every successful migration, purely as a readable
-# marker for operators inspecting the file; the actual repair logic is column-presence based (see
-# ``_migrate_schema``) so it is correct even against a database several fix-rounds old.
-_SCHEMA_VERSION = 2
+# Current schema version. Bumped whenever a column/table is added below -- ``PRAGMA user_version``
+# is set to this after every successful migration, purely as a readable marker for operators
+# inspecting the file; the actual repair logic is presence-based (see ``_migrate_schema``) so it
+# is correct even against a database several fix-rounds old. v3 (fourth fix round) added the
+# ``recorder_state`` and ``meta`` tables.
+_SCHEMA_VERSION = 3
 
 
 class RecorderSchemaVersionError(RuntimeError):
@@ -210,6 +237,16 @@ class RecorderDatabaseError(RuntimeError):
     database``) is right to fail fast rather than be silently papered over, but a *bare*
     ``sqlite3.DatabaseError`` propagating into the container's restart loop gives an operator no
     indication of *which* file is corrupt out of however many are mounted. This names it.
+    """
+
+
+class RecorderSymbolMismatchError(RuntimeError):
+    """m6 (fourth fix round): raised by ``RecorderStore.ensure_symbol`` when a database already
+    carries a ``meta`` row for a different symbol than the one this process is about to record.
+
+    Without this, pointing the recorder at the wrong database file (a config/CLI mistake) would
+    silently interleave two symbols' trades under one id space and one sweep cursor, corrupting
+    both -- there is no way to separate them after the fact.
     """
 
 
@@ -265,20 +302,38 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------------
 
 
-def parse_trade_item(item: Any) -> candles_mod.Trade | None:
+def _parse_is_buyer_maker(raw: Any) -> bool:
+    """Strictly parse ``isBuyerMaker``: a real ``bool`` or a ``"true"``/``"false"`` string
+    (case-insensitive); anything else (missing, other shapes) defaults to ``False``.
+
+    NIT (fourth fix round): ``bool(item.get("isBuyerMaker", False))`` turns the *string*
+    ``"false"`` into ``True`` (any non-empty string is truthy) -- a real bug if Tabdeal, or a
+    future response shape, ever sends this field as text rather than a JSON boolean.
+    """
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        if raw.lower() == "true":
+            return True
+        if raw.lower() == "false":
+            return False
+    return False
+
+
+def parse_trade_item(item: Any, *, now_ms: int) -> candles_mod.Trade | None:
     """Parse one ``/trades`` response item. Returns ``None`` (never raises) on anything
     malformed -- a single bad row must not abort the whole poll.
 
-    MAJOR-1 (second fix round): ``price``/``qty`` may be a JSON string (Tabdeal's documented
-    shape) **or** an already-exact ``Decimal`` -- decision D-031 changed ``TabdealClient`` to
-    decode response bodies with ``json.loads(..., parse_float=Decimal)``, so an unquoted JSON
-    number now arrives here as a ``Decimal``, not a ``float``. The old guard rejected anything that
-    was not already a ``str`` and therefore silently dropped every trade once D-031 landed. A bare
-    ``float`` is still rejected outright (and always will be): ``str()`` on a float that
-    round-tripped through binary floating point is not the exchange's exact decimal literal, and
-    there is no way to recover it from here. Parsing itself is delegated to
-    ``tbot.data.depth.to_decimal``, which already implements exactly this str-or-Decimal
-    acceptance for the probe's ``/depth`` levels.
+    ``price``/``qty`` accept ``str`` (Tabdeal's documented shape) or an already-exact ``Decimal``
+    (decision D-031: ``TabdealClient`` decodes with ``json.loads(..., parse_float=Decimal)``, so an
+    unquoted JSON number arrives here as ``Decimal``, not ``float``). A bare ``float`` is rejected
+    outright: ``str()`` on a float that round-tripped through binary floating point is not the
+    exchange's exact decimal literal, and there is no way to recover it from here.
+
+    ``now_ms`` (m2, fourth fix round): a trade whose ``ts_ms`` is more than a day from ``now_ms``
+    is rejected -- a wrong time unit (seconds, microseconds, or a literal ``0``) would otherwise
+    walk ``build_due_candles``'s sweep back to 1970 (or stall it on a bogus future hour) with no
+    error anywhere, since this function never raises.
     """
     if not isinstance(item, dict):
         return None
@@ -293,14 +348,13 @@ def parse_trade_item(item: Any) -> candles_mod.Trade | None:
         qty = to_decimal(raw_qty)
     except (KeyError, TypeError, ValueError, InvalidOperation):
         return None
-    # MAJOR, third fix round (reported as MINOR-4): a quoted "NaN"/"Infinity" price parses to a
-    # valid-but-meaningless Decimal and used to be persisted as-is -- candles.py's max()/min() then
-    # raised decimal.InvalidOperation on it inside process_once every single cycle thereafter (a
-    # permanent wedge, since the poisoned row is already stored). Same guard
-    # tbot.data.depth.parse_depth_levels already applies to order-book levels.
+    if abs(ts_ms - now_ms) > _MAX_TRADE_AGE_MS:
+        return None
+    # MINOR-4: a quoted "NaN"/"Infinity" price parses to a valid-but-meaningless Decimal that
+    # would wedge candles.build_candle's max()/min() forever once persisted (see its own guard).
     if not price.is_finite() or price <= 0 or not qty.is_finite() or qty < 0:
         return None
-    is_buyer_maker = bool(item.get("isBuyerMaker", False))
+    is_buyer_maker = _parse_is_buyer_maker(item.get("isBuyerMaker", False))
     return candles_mod.Trade(
         trade_id=trade_id, ts_ms=ts_ms, price=price, qty=qty, is_buyer_maker=is_buyer_maker
     )
@@ -345,6 +399,49 @@ class RecorderStore:
     def __exit__(self, *exc_info: object) -> None:
         self.close()
 
+    # -- atomicity (MAJOR-3, fourth fix round) -------------------------------------
+
+    @contextlib.contextmanager
+    def transaction(self) -> Iterator[None]:
+        """Wrap a block of writes in one atomic SQLite transaction (``BEGIN IMMEDIATE`` ...
+        ``COMMIT``, or ``ROLLBACK`` on any exception).
+
+        The connection is opened with ``isolation_level=None`` (autocommit), so without this,
+        each ``execute``/``executemany`` call committed independently -- a process killed between
+        e.g. ``insert_trades`` and ``record_gap`` permanently lost the gap row even though the
+        trades it describes were already durable, and there was no way to tell afterwards that
+        anything was missing.
+        """
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            self._conn.execute("ROLLBACK")
+            raise
+        else:
+            self._conn.execute("COMMIT")
+
+    # -- symbol identity (m6, fourth fix round) ------------------------------------
+
+    def ensure_symbol(self, symbol: str) -> None:
+        """Record ``symbol`` in the ``meta`` table on first use; raise
+        ``RecorderSymbolMismatchError`` if this database was already recorded for a different one.
+
+        Called once, at service construction -- not on every poll -- since the symbol a database
+        was opened for cannot change during a run.
+        """
+        row = self._conn.execute("SELECT value FROM meta WHERE key = 'symbol'").fetchone()
+        if row is None:
+            self._conn.execute("INSERT INTO meta (key, value) VALUES ('symbol', ?)", (symbol,))
+            return
+        recorded_symbol = row[0]
+        if recorded_symbol != symbol:
+            raise RecorderSymbolMismatchError(
+                f"this database was recorded for symbol {recorded_symbol!r}, refusing to run it "
+                f"for {symbol!r} -- point the recorder at the right --db-path/config, or a fresh "
+                "database for this symbol"
+            )
+
     # -- trades -------------------------------------------------------------------
 
     def insert_trades(self, trades: Sequence[candles_mod.Trade], *, recorded_ts_ms: int) -> int:
@@ -377,6 +474,18 @@ class RecorderStore:
     def trade_ts_ms(self, trade_id: int) -> int | None:
         row = self._conn.execute("SELECT ts_ms FROM trades WHERE trade_id = ?", (trade_id,)).fetchone()
         return row[0] if row is not None else None
+
+    def last_recorded_ts_ms(self) -> int | None:
+        """``MAX(recorded_ts_ms)`` across all trades -- the wall-clock time a genuinely new trade
+        (not a duplicate) was last inserted.
+
+        m3 (fourth fix round): this is the heartbeat's ``last_new_trade_ts_ms``. Unlike
+        ``last_poll_ts``/``consecutive_errors`` (which only say the HTTP round-trip is healthy),
+        this says the exchange's own trade feed is still producing data we have not already seen
+        -- derived straight from ``trades`` so it survives a process restart with no extra state.
+        """
+        row = self._conn.execute("SELECT MAX(recorded_ts_ms) FROM trades").fetchone()
+        return row[0] if row is not None and row[0] is not None else None
 
     def trades_in_range(self, open_ms: int, close_ms: int) -> list[candles_mod.Trade]:
         """Trades with ``open_ms < ts_ms <= close_ms`` (``closed='right'``)."""
@@ -463,20 +572,25 @@ class RecorderStore:
         filtered out by ``candles.build_candle``'s poisoned-row guard (``reason="poisoned_trades"``)
         -- that case has exactly the same "never re-walked, never crashes" requirement an empty
         hour does, and reusing the same cursor mechanism is what gives it that for free.
+
+        MAJOR-3 (fourth fix round): the gap row and the cursor advance are now one atomic
+        transaction -- previously a crash between the two could leave the gap unrecorded while the
+        cursor had already moved past that hour, silently losing the only trace of it forever.
         """
-        self.record_gap(
-            detected_ts_ms=detected_ts_ms,
-            from_id=None,
-            to_id=None,
-            reason=reason,
-            hour_close_ms=close_ms,
-        )
-        self._conn.execute(
-            "INSERT INTO sweep_cursor (symbol, last_swept_close_ms) VALUES (?, ?) "
-            "ON CONFLICT(symbol) DO UPDATE SET "
-            "last_swept_close_ms = MAX(last_swept_close_ms, excluded.last_swept_close_ms)",
-            (symbol, close_ms),
-        )
+        with self.transaction():
+            self.record_gap(
+                detected_ts_ms=detected_ts_ms,
+                from_id=None,
+                to_id=None,
+                reason=reason,
+                hour_close_ms=close_ms,
+            )
+            self._conn.execute(
+                "INSERT INTO sweep_cursor (symbol, last_swept_close_ms) VALUES (?, ?) "
+                "ON CONFLICT(symbol) DO UPDATE SET "
+                "last_swept_close_ms = MAX(last_swept_close_ms, excluded.last_swept_close_ms)",
+                (symbol, close_ms),
+            )
 
     def record_empty_hour_gap(self, *, symbol: str, close_ms: int, detected_ts_ms: int) -> None:
         """Record a ``no_trades_in_hour`` gap for the bucket ending at ``close_ms`` AND advance the
@@ -486,6 +600,30 @@ class RecorderStore:
         self.record_hour_gap(
             symbol=symbol, close_ms=close_ms, detected_ts_ms=detected_ts_ms, reason="no_trades_in_hour"
         )
+
+    def record_verified_poll(self, *, symbol: str, poll_ts_ms: int) -> None:
+        """Advance (never regress) ``recorder_state.last_verified_poll_ts_ms`` for ``symbol``.
+
+        MAJOR-1' (fourth fix round): called by ``poll_trades_once`` only when a poll's outcome is
+        trustworthy (``PollOutcome.ok``) -- i.e. it genuinely reached the exchange and either
+        proved window overlap with what is already stored or recorded a gap. ``build_due_candles``
+        caps the sweep's notion of "now" at this value so an hour is never swept while the polls
+        covering it were failing (see that function's docstring).
+        """
+        self._conn.execute(
+            "INSERT INTO recorder_state (symbol, last_verified_poll_ts_ms) VALUES (?, ?) "
+            "ON CONFLICT(symbol) DO UPDATE SET "
+            "last_verified_poll_ts_ms = MAX(last_verified_poll_ts_ms, excluded.last_verified_poll_ts_ms)",
+            (symbol, poll_ts_ms),
+        )
+
+    def verified_poll_ts_ms(self, symbol: str) -> int | None:
+        """The most recent ``poll_ts_ms`` recorded via ``record_verified_poll`` for ``symbol``, or
+        ``None`` if no poll has ever been verified (persists across restarts)."""
+        row = self._conn.execute(
+            "SELECT last_verified_poll_ts_ms FROM recorder_state WHERE symbol = ?", (symbol,)
+        ).fetchone()
+        return int(row[0]) if row is not None else None
 
     def last_swept_close_ms(self, symbol: str) -> int | None:
         """The close time (epoch ms) of the most recent hour recorded as empty for ``symbol``,
@@ -562,9 +700,10 @@ class RecorderStore:
     # -- read-back helpers (operational debugging + tests) ------------------------
 
     def all_gaps(self) -> list[tuple[int | None, int | None, str, int | None]]:
-        """``(from_id, to_id, reason, hour_close_ms)`` per row. ``hour_close_ms`` is only set on
-        ``no_trades_in_hour`` rows (MINOR-8); it is ``NULL`` on ``id_discontinuity`` rows, which
-        identify themselves via ``from_id``/``to_id`` instead."""
+        """``(from_id, to_id, reason, hour_close_ms)`` per row. ``hour_close_ms`` is set on
+        ``no_trades_in_hour``/``poisoned_trades``/``partial_unparsable`` rows (MINOR-8); it is
+        ``NULL`` on ``window_no_overlap`` rows, which identify themselves via ``from_id``/``to_id``
+        instead (the last previously-stored id and the new window's lowest id, respectively)."""
         rows = self._conn.execute(
             "SELECT from_id, to_id, reason, hour_close_ms FROM gaps ORDER BY detected_ts_ms"
         ).fetchall()
@@ -640,127 +779,223 @@ def _window_span_seconds(trades: Sequence[candles_mod.Trade]) -> float | None:
     return (max(times) - min(times)) / 1000.0
 
 
-def poll_trades_once(
-    client: TabdealClient,
-    store: RecorderStore,
-    *,
-    symbol: str,
-    limit: int,
-    poll_interval_seconds: float,
-    clock: Clock,
-) -> PollOutcome:
-    """One ``/trades`` poll: fetch, parse, dedupe-insert, detect an id discontinuity against the
-    previously-stored max id, and record the poll (plus any detected gap).
+@dataclass(frozen=True, slots=True)
+class _ParsedResponse:
+    """Everything derived from one ``/trades`` HTTP round-trip, before any store write."""
 
-    Resumption: ``prev_max`` is read from the store itself (not from any in-memory state), so a
-    freshly restarted process resumes exactly where the previous one left off -- a batch that
-    overlaps already-stored ids inserts zero new rows (``INSERT OR IGNORE``) and raises no gap.
+    result: ProbeResult
+    trades: list[candles_mod.Trade]
+    n_items_received: int
+    unexpected_body_type: bool
 
-    Saturation (D-024): ``saturated`` (``count == limit``) is recorded on every row for raw
-    fidelity but is never itself a warning or a reason to mark anything incomplete -- on a
-    recent-trades endpoint it is true on almost every poll and says nothing about data loss. The
-    metric that is actually alerted on is ``coverage_ratio = window_span_seconds /
-    poll_interval_seconds``: a poll is at risk of having evicted an unseen trade when that ratio
-    drops below 3, which is what triggers the warning here.
 
-    MAJOR-1 (second fix round): ``n_items_received`` (the raw response length, before parsing) is
-    tracked separately from ``n_trades`` (the number that actually parsed) and persisted on
-    ``poll_log``. When the response was non-empty but every item failed to parse, that is logged
-    loudly (``tabdeal_recorder.unparsable_trades``) instead of looking identical to "the exchange
-    returned nothing this poll" -- the two used to be indistinguishable after the fact.
-
-    MAJOR M-A (third fix round): an HTTP-200 whose body is not a list at all (a Binance-style
-    ``{"code":1101,"msg":...}`` error wrapper served with status 200, or a shape change to
-    ``{"trades":[...]}``) used to compute ``n_items_received = 0`` via the same
-    ``isinstance(result.body, list)`` guard that also gates parsing -- indistinguishable from a
-    genuinely empty response, with no warning, no error, and ``PollOutcome.ok=True`` forever
-    (``_consecutive_errors`` never climbs, the healthcheck never trips). This now mirrors what
-    ``poll_orderbook_once`` already does for ``/depth``: log
-    ``tabdeal_recorder.unexpected_body_type`` and report the outcome as *not* ok, so
-    ``_consecutive_errors`` climbs exactly as it would for an HTTP error.
-
-    MAJOR M-B (third fix round): the unparsable warning used to fire only when ``n_trades == 0``,
-    so a *partial* drop (e.g. one item in a multi-item batch has a bare float price) produced
-    ``n_items_received=2, n_trades=1`` with no warning at all -- invisible both operationally and
-    to gap detection, since the id-discontinuity check only compares this poll's minimum id to the
-    stored maximum and never notices an id missing *inside* a batch. The warning now fires whenever
-    ``n_trades < n_items_received`` (total or partial), and the hour(s) the surviving parsed trades
-    fall into (or, if every item in the poll was unparsable, the hour containing the poll itself)
-    are recorded as a ``gaps`` row and therefore built ``complete=False`` -- see
-    ``is_candle_complete``.
-    """
-    prev_max = store.max_trade_id()
+def _fetch_and_parse(client: TabdealClient, symbol: str, limit: int, *, now_ms: int) -> _ParsedResponse:
+    """Call ``/trades`` and parse its body. Never raises -- a malformed body or item degrades to
+    an empty/partial ``trades`` list, which the caller turns into the right warnings/gap rows."""
     result = client.trades(symbol, limit=limit)
-    now_ms = _dt_to_ms(clock.now())
-
     body_is_list = isinstance(result.body, list)
     unexpected_body_type = result.ok and not body_is_list
-    ok = result.ok and not unexpected_body_type
-
     n_items_received = len(result.body) if result.ok and body_is_list else 0
     trades: list[candles_mod.Trade] = []
     if result.ok and body_is_list:
         for item in result.body:
-            trade = parse_trade_item(item)
+            trade = parse_trade_item(item, now_ms=now_ms)
             if trade is not None:
                 trades.append(trade)
+    return _ParsedResponse(
+        result=result,
+        trades=trades,
+        n_items_received=n_items_received,
+        unexpected_body_type=unexpected_body_type,
+    )
 
+
+@dataclass(frozen=True, slots=True)
+class _PollMetrics:
+    """Everything ``poll_trades_once`` derives from a parsed response before touching the store."""
+
+    n_trades: int
+    first_id: int | None
+    last_id: int | None
+    saturated: bool
+    window_span_seconds: float | None
+    coverage_ratio: float | None
+    ok: bool
+    gap: tuple[int, int] | None
+
+
+def _derive_poll_metrics(
+    parsed: _ParsedResponse, prev_max: int | None, limit: int, poll_interval_seconds: float
+) -> _PollMetrics:
+    trades = parsed.trades
     n_trades = len(trades)
     first_id = min((t.trade_id for t in trades), default=None)
     last_id = max((t.trade_id for t in trades), default=None)
-    saturated = is_saturated(limit, n_trades)
     window_span_seconds = _window_span_seconds(trades)
     coverage_ratio = window_span_seconds / poll_interval_seconds if window_span_seconds is not None else None
-
-    inserted = store.insert_trades(trades, recorded_ts_ms=now_ms) if trades else 0
-
-    gap: tuple[int, int] | None = None
-    if result.ok and first_id is not None and prev_max is not None and first_id > prev_max + 1:
-        gap = (prev_max, first_id)
-        store.record_gap(detected_ts_ms=now_ms, from_id=prev_max, to_id=first_id, reason="id_discontinuity")
-        logger.warning("tabdeal_recorder.gap_detected", symbol=symbol, from_id=prev_max, to_id=first_id)
-
-    if n_trades < n_items_received:
-        # MAJOR M-B: mark every hour touched by this poll's surviving trades as having a known
-        # shortfall, so the candle sweep builds it complete=False rather than silently treating a
-        # partial drop as a fully-covered hour. If nothing at all parsed, there is no trade
-        # timestamp to anchor on -- fall back to the hour containing the poll itself, since a
-        # recent-trades endpoint's response is always close to "now".
-        affected_close_ms = {candles_mod.hour_bounds_ms(t.ts_ms)[1] for t in trades}
-        if not affected_close_ms:
-            affected_close_ms = {candles_mod.hour_bounds_ms(now_ms)[1]}
-        for close_ms in sorted(affected_close_ms):
-            store.record_gap(
-                detected_ts_ms=now_ms,
-                from_id=None,
-                to_id=None,
-                reason="partial_unparsable",
-                hour_close_ms=close_ms,
-            )
-
-    store.record_poll(
-        poll_ts_ms=now_ms,
+    result = parsed.result
+    ok = result.ok and not parsed.unexpected_body_type and not (parsed.n_items_received > 0 and n_trades == 0)
+    return _PollMetrics(
+        n_trades=n_trades,
         first_id=first_id,
         last_id=last_id,
-        n_trades=n_trades,
-        saturated=saturated,
-        http_status=result.status_code,
-        latency_ms=result.latency_ms,
+        saturated=is_saturated(limit, n_trades),
         window_span_seconds=window_span_seconds,
         coverage_ratio=coverage_ratio,
-        n_items_received=n_items_received,
+        ok=ok,
+        gap=_detect_window_gap(first_id, prev_max) if result.ok else None,
     )
-    if unexpected_body_type:
-        logger.error(
-            "tabdeal_recorder.unexpected_body_type",
-            symbol=symbol,
-            body_type=type(result.body).__name__,
+
+
+def _detect_window_gap(first_id: int | None, prev_max: int | None) -> tuple[int, int] | None:
+    """``(prev_max, first_id)`` iff this poll's lowest id does not reach back far enough to
+    overlap what is already stored -- see the module docstring's note on global, non-contiguous
+    trade ids (decision D-036, proposed). ``None`` on a cold start (``prev_max is None``): there
+    is nothing yet to overlap with, and ``is_candle_complete``'s cold-start check covers that case
+    separately.
+    """
+    if first_id is None or prev_max is None:
+        return None
+    if first_id > prev_max:
+        return (prev_max, first_id)
+    return None
+
+
+def _record_partial_unparsable(
+    store: RecorderStore,
+    trades: Sequence[candles_mod.Trade],
+    n_trades: int,
+    n_items_received: int,
+    now_ms: int,
+) -> None:
+    """MAJOR M-B: mark every hour touched by this poll's surviving trades as having a known
+    shortfall, so the candle sweep builds it ``complete=False`` rather than treating a partial
+    drop as full coverage. If nothing at all parsed, there is no trade timestamp to anchor on --
+    fall back to the hour containing the poll itself (a recent-trades endpoint's response is
+    always close to "now")."""
+    if n_trades >= n_items_received:
+        return
+    affected_close_ms = {candles_mod.hour_bounds_ms(t.ts_ms)[1] for t in trades}
+    if not affected_close_ms:
+        affected_close_ms = {candles_mod.hour_bounds_ms(now_ms)[1]}
+    for close_ms in sorted(affected_close_ms):
+        store.record_gap(
+            detected_ts_ms=now_ms,
+            from_id=None,
+            to_id=None,
+            reason="partial_unparsable",
+            hour_close_ms=close_ms,
         )
-    if n_trades < n_items_received:
+
+
+def _gap_touched_hour_closes(lo_ts_ms: int, hi_ts_ms: int) -> list[int]:
+    """Every hour-bucket close time whose ``(open, close]`` window could contain a timestamp
+    between ``lo_ts_ms`` and ``hi_ts_ms`` (order-independent), inclusive of both ends."""
+    start_close = candles_mod.hour_bounds_ms(min(lo_ts_ms, hi_ts_ms))[1]
+    end_close = candles_mod.hour_bounds_ms(max(lo_ts_ms, hi_ts_ms))[1]
+    closes = []
+    close_ms = start_close
+    while close_ms <= end_close:
+        closes.append(close_ms)
+        close_ms += candles_mod.HOUR_MS
+    return closes
+
+
+def _rewrite_candle_incomplete_if_written(
+    store: RecorderStore, parquet_root: Path, symbol: str, close_ms: int
+) -> None:
+    """If hour ``close_ms`` already has a candle on disk, rewrite it ``complete=False``.
+
+    MAJOR-1' (fourth fix round): a gap discovered *after* an hour was already swept (its candle
+    already written, possibly ``complete=True``) used to never be reflected back onto that
+    candle -- the sweep cursor had moved on, and nothing ever revisits a hour once it has a
+    candle. ``candles_mod.write_candle`` upserts by ``ts``, so this corrects the row in place
+    rather than duplicating it. A no-op if the hour has not been swept yet (the normal sweep will
+    build it correctly once it is due) or has no trades (defensive; should not happen since trades
+    are never deleted).
+    """
+    last_written_ms = candles_mod.last_written_close_ms(parquet_root, symbol)
+    if last_written_ms is None or close_ms > last_written_ms:
+        return
+    open_ms = close_ms - candles_mod.HOUR_MS
+    trades = store.trades_in_range(open_ms, close_ms)
+    record = candles_mod.build_candle(trades, open_ms, close_ms, complete=False)
+    if record is not None:
+        candles_mod.write_candle(parquet_root, symbol, record)
+        logger.warning("tabdeal_recorder.candle_rewritten_incomplete", symbol=symbol, hour_close_ms=close_ms)
+
+
+def _handle_detected_gap(
+    store: RecorderStore, parquet_root: Path | None, symbol: str, gap: tuple[int, int]
+) -> None:
+    """Log a detected window-no-overlap gap and, if ``parquet_root`` is given, immediately
+    correct any already-written candle it touches (see ``_rewrite_candle_incomplete_if_written``).
+    Pulled out of ``poll_trades_once`` purely to keep that function's transaction block the
+    visually dominant thing in it (m12)."""
+    logger.warning("tabdeal_recorder.gap_detected", symbol=symbol, from_id=gap[0], to_id=gap[1])
+    if parquet_root is None:
+        return
+    lo_ts, hi_ts = store.trade_ts_ms(gap[0]), store.trade_ts_ms(gap[1])
+    if lo_ts is None or hi_ts is None:
+        return
+    for close_ms in _gap_touched_hour_closes(lo_ts, hi_ts):
+        _rewrite_candle_incomplete_if_written(store, parquet_root, symbol, close_ms)
+
+
+def _persist_poll(
+    store: RecorderStore, *, now_ms: int, symbol: str, parsed: _ParsedResponse, m: _PollMetrics
+) -> int:
+    """The single atomic transaction (MAJOR-3) for one poll: the trades, any window-overlap gap
+    row, any partial-unparsable gap rows, the ``poll_log`` row, and -- only when ``m.ok`` -- the
+    verified-poll marker ``build_due_candles`` caps the sweep against. Returns the number of
+    genuinely new trades inserted.
+    """
+    result = parsed.result
+    with store.transaction():
+        inserted = store.insert_trades(parsed.trades, recorded_ts_ms=now_ms) if parsed.trades else 0
+        if m.gap is not None:
+            store.record_gap(
+                detected_ts_ms=now_ms, from_id=m.gap[0], to_id=m.gap[1], reason="window_no_overlap"
+            )
+        _record_partial_unparsable(store, parsed.trades, m.n_trades, parsed.n_items_received, now_ms)
+        store.record_poll(
+            poll_ts_ms=now_ms,
+            first_id=m.first_id,
+            last_id=m.last_id,
+            n_trades=m.n_trades,
+            saturated=m.saturated,
+            http_status=result.status_code,
+            latency_ms=result.latency_ms,
+            window_span_seconds=m.window_span_seconds,
+            coverage_ratio=m.coverage_ratio,
+            n_items_received=parsed.n_items_received,
+        )
+        if m.ok:
+            store.record_verified_poll(symbol=symbol, poll_ts_ms=now_ms)
+    return inserted
+
+
+def _log_poll_outcome(
+    *,
+    symbol: str,
+    parsed: _ParsedResponse,
+    n_trades: int,
+    coverage_ratio: float | None,
+    window_span_seconds: float | None,
+    poll_interval_seconds: float,
+) -> None:
+    """All of ``poll_trades_once``'s non-essential (logging-only) side effects, pulled out so the
+    transactional store-write block above it is easy to see at a glance (m12)."""
+    result = parsed.result
+    if parsed.unexpected_body_type:
+        logger.error(
+            "tabdeal_recorder.unexpected_body_type", symbol=symbol, body_type=type(result.body).__name__
+        )
+    if n_trades < parsed.n_items_received:
         logger.warning(
             "tabdeal_recorder.unparsable_trades",
             symbol=symbol,
-            received=n_items_received,
+            received=parsed.n_items_received,
             parsed=n_trades,
         )
     if coverage_ratio is not None and coverage_ratio < 3:
@@ -776,19 +1011,59 @@ def poll_trades_once(
             "tabdeal_recorder.poll_failed", symbol=symbol, status=result.status_code, error=result.error
         )
 
+
+def poll_trades_once(
+    client: TabdealClient,
+    store: RecorderStore,
+    *,
+    symbol: str,
+    limit: int,
+    poll_interval_seconds: float,
+    clock: Clock,
+    parquet_root: Path | None = None,
+) -> PollOutcome:
+    """One ``/trades`` poll: fetch, parse, detect a window-overlap gap against the
+    previously-stored max id, and persist all of it in one transaction (``_persist_poll``,
+    MAJOR-3).
+
+    Resumption is cursor-free: ``prev_max`` is read from the store itself, so a restarted process
+    resumes exactly where the previous one left off. ``ok`` (MAJOR-2') is ``True`` only when the
+    HTTP call succeeded, the body was a list, and items did not arrive with none of them parsing.
+    ``parquet_root``, when given, lets a newly-discovered gap immediately correct an
+    already-written candle (``_rewrite_candle_incomplete_if_written``); most tests omit it.
+    """
+    prev_max = store.max_trade_id()
+    now_ms = _dt_to_ms(clock.now())
+    parsed = _fetch_and_parse(client, symbol, limit, now_ms=now_ms)
+    result = parsed.result
+    m = _derive_poll_metrics(parsed, prev_max, limit, poll_interval_seconds)
+    inserted = _persist_poll(store, now_ms=now_ms, symbol=symbol, parsed=parsed, m=m)
+
+    if m.gap is not None:
+        _handle_detected_gap(store, parquet_root, symbol, m.gap)
+
+    _log_poll_outcome(
+        symbol=symbol,
+        parsed=parsed,
+        n_trades=m.n_trades,
+        coverage_ratio=m.coverage_ratio,
+        window_span_seconds=m.window_span_seconds,
+        poll_interval_seconds=poll_interval_seconds,
+    )
+
     return PollOutcome(
-        ok=ok,
+        ok=m.ok,
         status_code=result.status_code,
         latency_ms=result.latency_ms,
-        n_trades=n_trades,
-        n_items_received=n_items_received,
-        first_id=first_id,
-        last_id=last_id,
-        saturated=saturated,
-        window_span_seconds=window_span_seconds,
-        coverage_ratio=coverage_ratio,
+        n_trades=m.n_trades,
+        n_items_received=parsed.n_items_received,
+        first_id=m.first_id,
+        last_id=m.last_id,
+        saturated=m.saturated,
+        window_span_seconds=m.window_span_seconds,
+        coverage_ratio=m.coverage_ratio,
         inserted=inserted,
-        gap=gap,
+        gap=m.gap,
         error=result.error,
     )
 
@@ -816,7 +1091,17 @@ def poll_orderbook_once(
     client: TabdealClient, store: RecorderStore, *, symbol: str, depth_limit: int, clock: Clock
 ) -> OrderbookRow | None:
     """One ``/depth`` poll -> one ``orderbook`` row. Returns ``None`` (logged) on a failed poll
-    or an empty/one-sided book -- no row is written in that case, there is nothing to measure."""
+    or an empty/one-sided book -- no row is written in that case, there is nothing to measure.
+
+    m1 (fourth fix round): a crossed book (best ask < best bid -- a bad/transient snapshot)
+    used to make ``spread_bps_and_pct`` raise ``ValueError`` straight out of this function,
+    uncaught. In ``TabdealRecorderService.process_once`` that skipped the heartbeat rewrite for
+    the whole cycle (the exception propagated past it) and left ``_next_orderbook_due_ms`` unset,
+    so the next cycle retried ``/depth`` immediately instead of waiting out
+    ``orderbook_interval_seconds`` -- a crossed book then re-polled every poll cycle (every 5s)
+    until the book uncrossed. Caught here instead: the row is still written, with
+    ``spread_bps=None`` (depth itself is still meaningful on a crossed book; the spread is not).
+    """
     result = client.depth(symbol, limit=depth_limit)
     now_ms = _dt_to_ms(clock.now())
     if not result.ok or not isinstance(result.body, dict):
@@ -830,7 +1115,16 @@ def poll_orderbook_once(
         logger.warning("tabdeal_recorder.orderbook_empty_book", symbol=symbol)
         return None
     best_bid, best_ask = best
-    spread_bps, _spread_pct = spread_bps_and_pct(best_bid, best_ask)
+    try:
+        spread_bps, _spread_pct = spread_bps_and_pct(best_bid, best_ask)
+    except ValueError:
+        logger.warning(
+            "tabdeal_recorder.orderbook_crossed",
+            symbol=symbol,
+            best_bid=str(best_bid),
+            best_ask=str(best_ask),
+        )
+        spread_bps = None
     mid = (best_bid + best_ask) / 2
 
     depth_by_threshold: dict[Decimal, tuple[Decimal, Decimal]] = {}
@@ -861,17 +1155,18 @@ def poll_orderbook_once(
 
 
 def is_candle_complete(store: RecorderStore, open_ms: int, close_ms: int) -> bool:
-    """``False`` when a real trade-id gap overlaps the bucket -- never from the uninformative
-    ``saturated`` flag (decision D-024). An empty-hour gap never reaches this function at all:
-    ``build_due_candles`` skips writing a candle for that hour in the first place.
+    """``False`` when a window-no-overlap gap overlaps the bucket -- never from the
+    uninformative ``saturated`` flag (decision D-024). An empty-hour gap never reaches this
+    function at all: ``build_due_candles`` skips writing a candle for that hour in the first
+    place.
 
     MAJOR M4 (fix round): also ``False`` when the store has no recorded coverage of the bucket's
     *start* -- i.e. the earliest trade ever recorded landed after ``open_ms``. On a fresh
-    database there is no ``id_discontinuity`` gap row to catch this (there is nothing before the
-    first trade to be discontinuous with), so without this check the very first candle after a
-    cold start was written ``complete=True`` even though recording plainly started partway
-    through that hour (measured: first trade at 00:30, bar for 01:00 written complete=True with
-    n_trades=1) -- exactly what G1b's ">=99% complete" gate and the phase-3 basis model trust.
+    database there is no ``window_no_overlap`` gap row to catch this (there is nothing before the
+    first trade to overlap with), so without this check the very first candle after a cold start
+    was written ``complete=True`` even though recording plainly started partway through that hour
+    (measured: first trade at 00:30, bar for 01:00 written complete=True with n_trades=1) --
+    exactly what G1b's ">=99% complete" gate and the phase-3 basis model trust.
 
     MAJOR M-B (third fix round): also ``False`` when a ``partial_unparsable`` gap was recorded for
     this exact hour (via ``has_hour_gap``) -- a poll that dropped some items mid-batch leaves no
@@ -885,6 +1180,38 @@ def is_candle_complete(store: RecorderStore, open_ms: int, close_ms: int) -> boo
     return earliest_ms is None or earliest_ms <= open_ms
 
 
+def _sweep_now_ms(store: RecorderStore, symbol: str, clock_now_ms: int) -> int:
+    """The "now" ``build_due_candles`` is allowed to treat an hour as due against.
+
+    MAJOR-1' (fourth fix round): if a poll has ever been verified (see
+    ``RecorderStore.record_verified_poll``), the sweep is capped at that timestamp, never the raw
+    wall clock -- otherwise, while polls are failing across an hour's close time, the sweep kept
+    advancing on the wall clock alone and declared that hour "empty" (wrong reason) before a
+    later successful poll could backfill its late-arriving trades; by the time it was backfilled,
+    the sweep cursor had already moved past it and the candle was never corrected. If no poll has
+    *ever* been verified (a fresh database, or one only ever populated by direct seeding, as many
+    of this module's own unit tests do without going through ``poll_trades_once`` at all), there
+    is no cap to apply yet and the raw wall clock is used, unchanged from before this fix.
+    """
+    verified_ms = store.verified_poll_ts_ms(symbol)
+    if verified_ms is None:
+        return clock_now_ms
+    return min(clock_now_ms, verified_ms)
+
+
+def _handle_poisoned_hour(store: RecorderStore, symbol: str, close_ms: int, now_ms: int) -> None:
+    """``candles_mod.build_candle`` returned ``None`` for a non-empty, already window-filtered
+    trade list -- the only way that happens is its defensive poisoned-row guard (a non-finite or
+    non-positive price, or negative qty, that reached the database before
+    ``parse_trade_item``'s own guard existed) filtering out every trade. Given the exact same
+    "accounted for once" treatment as an empty hour -- a ``poisoned_trades`` gap row plus a
+    sweep-cursor advance -- rather than a bare ``continue``, which would leave the hour
+    un-advanced and re-discovered as "due" on every future poll forever.
+    """
+    store.record_hour_gap(symbol=symbol, close_ms=close_ms, detected_ts_ms=now_ms, reason="poisoned_trades")
+    logger.warning("tabdeal_recorder.poisoned_hour", symbol=symbol, hour_close_ms=close_ms)
+
+
 def build_due_candles(
     store: RecorderStore,
     *,
@@ -895,8 +1222,9 @@ def build_due_candles(
 ) -> list[candles_mod.TabdealCandleRecord]:
     """Write every hourly candle that is now due (closed, past its grace period, not yet on
     disk). An hour with zero recorded trades writes a ``gaps`` row instead of a forward-filled
-    bar -- it is simply skipped, never synthesised."""
-    now_ms = _dt_to_ms(clock.now())
+    bar -- it is simply skipped, never synthesised. See ``_sweep_now_ms`` for why "due" is capped
+    at the last verified poll, not the raw wall clock."""
+    now_ms = _sweep_now_ms(store, symbol, _dt_to_ms(clock.now()))
     last_written_ms = candles_mod.last_written_close_ms(parquet_root, symbol)
     last_swept_ms = store.last_swept_close_ms(symbol)
     # MAJOR M3: the resumption cursor is the max of "last candle actually written" and "last
@@ -920,20 +1248,7 @@ def build_due_candles(
         complete = is_candle_complete(store, open_ms, close_ms)
         record = candles_mod.build_candle(trades, open_ms, close_ms, complete=complete)
         if record is None:
-            # ``trades`` is non-empty here (checked above) and already window-filtered by
-            # ``trades_in_range``, so the only way ``build_candle`` can still return ``None`` is its
-            # defensive poisoned-row guard filtering out every trade (a non-finite/non-positive
-            # price or negative qty that reached the database before ``parse_trade_item``'s own
-            # guard existed). Third fix round: this is given the exact same treatment as an empty
-            # hour -- a ``poisoned_trades`` gap row plus a sweep-cursor advance -- rather than a
-            # bare ``continue``, which left the hour silently un-written AND un-advanced, so
-            # ``pending_hour_bounds`` re-discovered it as "due" and re-attempted it on every single
-            # future poll forever (the same re-walk-forever shape MAJOR M3 already fixed for empty
-            # hours).
-            store.record_hour_gap(
-                symbol=symbol, close_ms=close_ms, detected_ts_ms=now_ms, reason="poisoned_trades"
-            )
-            logger.warning("tabdeal_recorder.poisoned_hour", symbol=symbol, hour_close_ms=close_ms)
+            _handle_poisoned_hour(store, symbol, close_ms, now_ms)
             continue
         candles_mod.write_candle(parquet_root, symbol, record)
         written.append(record)
@@ -958,17 +1273,21 @@ class HeartbeatState:
     last_trade_id: int | None
     n_trades_total: int
     consecutive_errors: int
+    # m3 (fourth fix round): wall-clock time the last genuinely new trade was recorded (not just
+    # "a poll succeeded") -- see RecorderStore.last_recorded_ts_ms and deploy/healthcheck.py.
+    last_new_trade_ts_ms: int | None = None
 
 
 def write_heartbeat(path: Path, state: HeartbeatState) -> None:
-    """Rewrite the heartbeat file. The deployment's HEALTHCHECK only looks at this file's mtime
-    (deploy/Dockerfile), so it must be rewritten on every poll, even one with zero new trades."""
+    """Rewrite the heartbeat file. deploy/healthcheck.py reads this file's contents (not just its
+    mtime), so it must be rewritten on every poll, even one with zero new trades."""
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "last_poll_ts": state.last_poll_ts.isoformat(),
         "last_trade_id": state.last_trade_id,
         "n_trades_total": state.n_trades_total,
         "consecutive_errors": state.consecutive_errors,
+        "last_new_trade_ts_ms": state.last_new_trade_ts_ms,
     }
     tmp_path = path.with_name(path.name + ".tmp")
     tmp_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -985,10 +1304,16 @@ class RecorderSettings:
     """Recorder-specific knobs. Every interval here is provisional until the probe's measured
     recommendation (``research/reports/tabdeal_probe_*.json``) replaces it -- see
     ``scripts/record_tabdeal.py`` for how each one is overridable from the CLI or config without
-    a code edit."""
+    a code edit.
+
+    ``trades_limit=1000`` (fourth fix round, raised from 500): measured from the Turkey server
+    2026-10-04, ``limit=1000`` is accepted and, for BTCUSDT (a thin market), covers roughly 29
+    hours of trades -- a wide safety margin against the window-no-overlap gap check for any poll
+    interval short of a day-long outage.
+    """
 
     symbol: str = "BTCUSDT"
-    trades_limit: int = 500
+    trades_limit: int = 1000
     poll_interval_seconds: float = 5.0
     orderbook_interval_seconds: float = 60.0
     grace_period_seconds: float = 60.0
@@ -1022,6 +1347,11 @@ class TabdealRecorderService:
     _stop: bool = field(default=False, init=False)
     _stop_event: threading.Event = field(default_factory=threading.Event, init=False)
 
+    def __post_init__(self) -> None:
+        # m6 (fourth fix round): refuse to run against a database recorded for another symbol --
+        # see RecorderStore.ensure_symbol. Checked once here, not on every poll.
+        self.store.ensure_symbol(self.settings.symbol)
+
     def request_stop(self) -> None:
         self._stop = True
         self._stop_event.set()
@@ -1037,6 +1367,7 @@ class TabdealRecorderService:
             limit=self.settings.trades_limit,
             poll_interval_seconds=self.settings.poll_interval_seconds,
             clock=self.clock,
+            parquet_root=self.parquet_root,
         )
         self._consecutive_errors = 0 if outcome.ok else self._consecutive_errors + 1
 
@@ -1066,21 +1397,38 @@ class TabdealRecorderService:
                 last_trade_id=self.store.max_trade_id(),
                 n_trades_total=self.store.total_trade_count(),
                 consecutive_errors=self._consecutive_errors,
+                last_new_trade_ts_ms=self.store.last_recorded_ts_ms(),
             ),
         )
         return outcome
 
-    def run_forever(self) -> None:
-        """Minor fix 10 (fix round): two problems with the old ``time.sleep(poll_interval_seconds)``.
+    def _next_wait_seconds(self, elapsed_seconds: float) -> float:
+        """Seconds to wait before the next cycle, given how long this one took.
 
-        1. It ignored how long the cycle itself took, so the *real* poll period drifted above
-           ``poll_interval_seconds`` while ``coverage_ratio`` kept being computed against the
-           nominal value -- flattering the D-024 risk metric exactly when the recorder is running
-           slow. Fixed by subtracting the measured cycle duration from the wait.
-        2. Per PEP 475, ``time.sleep`` resumes after an interrupting signal (SIGTERM/SIGINT)
-           rather than returning early, so a shutdown request arriving mid-sleep could still wait
-           out the rest of the interval. A deadline-based ``threading.Event.wait()`` returns the
-           instant ``request_stop()`` calls ``.set()``, so shutdown is immediate.
+        Minor fix 10 (fix round): subtracts the measured cycle duration from the nominal
+        ``poll_interval_seconds`` so the real poll period does not silently drift above it.
+
+        m4 (fourth fix round): once ``_consecutive_errors`` exceeds ``_BACKOFF_THRESHOLD_ERRORS``,
+        the base interval grows exponentially (doubling per additional consecutive error, capped
+        at ``_BACKOFF_CAP_SECONDS``) instead of retrying a dead/rate-limiting endpoint at the
+        nominal poll interval forever -- a 403/451/DNS failure was otherwise hammered every
+        ``poll_interval_seconds`` with no relief. The wait is still a ``threading.Event.wait()``
+        (see ``run_forever``), so it remains interruptible by ``request_stop()`` regardless of
+        length -- a long backoff never delays shutdown.
+        """
+        base = self.settings.poll_interval_seconds
+        if self._consecutive_errors > _BACKOFF_THRESHOLD_ERRORS:
+            factor = 2 ** (self._consecutive_errors - _BACKOFF_THRESHOLD_ERRORS)
+            base = min(base * factor, _BACKOFF_CAP_SECONDS)
+        return max(0.0, base - elapsed_seconds)
+
+    def run_forever(self) -> None:
+        """Runs ``process_once`` on a timer until ``request_stop`` is set (SIGTERM/SIGINT, wired
+        up in ``scripts/record_tabdeal.py``). See ``_next_wait_seconds`` for the wait's length and
+        why a deadline-based ``threading.Event.wait()`` (not ``time.sleep``) is used: per PEP 475,
+        ``time.sleep`` resumes after an interrupting signal rather than returning early, so a
+        shutdown request arriving mid-sleep could wait out the rest of the interval; ``Event.wait``
+        returns the instant ``request_stop()`` calls ``.set()``.
         """
         while not self._stop:
             cycle_start = time.monotonic()
@@ -1092,6 +1440,6 @@ class TabdealRecorderService:
             if self._stop:
                 break
             elapsed = time.monotonic() - cycle_start
-            remaining = max(0.0, self.settings.poll_interval_seconds - elapsed)
+            remaining = self._next_wait_seconds(elapsed)
             if remaining > 0:
                 self._stop_event.wait(remaining)
