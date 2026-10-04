@@ -120,8 +120,10 @@ def test_to_utc_datetime_us_is_exact() -> None:
 
 
 def test_parse_kline_csv_ms_era_close_ts_and_types() -> None:
-    records = bl.parse_kline_csv_bytes(_csv_bytes("klines_1h_2024-06_ms.txt"), timeframe=Timeframe.H1)
+    parsed = bl.parse_kline_csv_bytes(_csv_bytes("klines_1h_2024-06_ms.txt"), timeframe=Timeframe.H1)
+    records = parsed.records
     assert len(records) == 3
+    assert parsed.anomalies == ()
     first = records[0]
     assert first.ts == datetime(2024, 6, 1, 1, 0, 0, tzinfo=UTC)  # close = open (00:00) + 1h
     assert isinstance(first.open, Decimal)
@@ -136,8 +138,10 @@ def test_parse_kline_csv_ms_era_close_ts_and_types() -> None:
 
 
 def test_parse_kline_csv_us_era_close_ts_and_types() -> None:
-    records = bl.parse_kline_csv_bytes(_csv_bytes("klines_1h_2025-01_us.txt"), timeframe=Timeframe.H1)
+    parsed = bl.parse_kline_csv_bytes(_csv_bytes("klines_1h_2025-01_us.txt"), timeframe=Timeframe.H1)
+    records = parsed.records
     assert len(records) == 3
+    assert parsed.anomalies == ()
     first = records[0]
     assert first.ts == datetime(2025, 1, 1, 1, 0, 0, tzinfo=UTC)  # close = open (00:00) + 1h
     assert isinstance(first.close, Decimal)
@@ -150,10 +154,10 @@ def test_parse_kline_csv_us_era_close_ts_and_types() -> None:
 def test_parse_kline_csv_handles_the_ms_to_us_boundary() -> None:
     dec_records = bl.parse_kline_csv_bytes(
         _csv_bytes("klines_1h_2024-12-31T23_ms_tail.txt"), timeframe=Timeframe.H1
-    )
+    ).records
     jan_records = bl.parse_kline_csv_bytes(
         _csv_bytes("klines_1h_2025-01-01T00_us_head.txt"), timeframe=Timeframe.H1
-    )
+    ).records
     assert len(dec_records) == 1
     assert len(jan_records) == 1
     last_dec_close = dec_records[0].ts
@@ -174,18 +178,99 @@ def test_parse_kline_csv_rejects_mismatched_units_within_one_row() -> None:
         bl.parse_kline_csv_bytes(bad_row.encode(), timeframe=Timeframe.H1)
 
 
-def test_parse_kline_csv_rejects_close_time_inconsistent_with_interval() -> None:
-    # close_time does not equal open_time + 1h - 1ms: a corrupted/misaligned row.
-    bad_row = "1717200000000,100,101,99,100,1,1717200005000,100,1,1,1,0\n"
-    with pytest.raises(ValueError, match="close_time"):
-        bl.parse_kline_csv_bytes(bad_row.encode(), timeframe=Timeframe.H1)
-
-
 def test_parse_kline_csv_skips_a_header_row_defensively() -> None:
     header = "open_time,open,high,low,close,volume,close_time,quote_volume,count,x,y,z\n"
     body = _csv_bytes("klines_1h_2024-06_ms.txt").decode()
-    records = bl.parse_kline_csv_bytes((header + body).encode(), timeframe=Timeframe.H1)
-    assert len(records) == 3
+    parsed = bl.parse_kline_csv_bytes((header + body).encode(), timeframe=Timeframe.H1)
+    assert len(parsed.records) == 3
+    assert parsed.anomalies == ()
+
+
+# --- decision D-036: per-row source anomalies never abort the file ------------------------------
+
+
+def test_parse_kline_csv_classifies_a_short_bar_and_still_stores_it_flagged() -> None:
+    """close_time is nowhere near open_time + 1h - 1ms, but the row still has a trade --
+    decision D-036 classifies this ``short`` and stores it at the normal label (causal: the
+    label sits at or after the real data), flagged as an anomaly, instead of raising and
+    aborting the whole file as the old behaviour did."""
+    bad_row = "1717200000000,100,101,99,100,1,1717200005000,100,1,1,1,0\n"
+    parsed = bl.parse_kline_csv_bytes(bad_row.encode(), timeframe=Timeframe.H1)
+
+    assert len(parsed.records) == 1
+    assert parsed.records[0].ts == datetime(2024, 6, 1, 1, 0, 0, tzinfo=UTC)
+    assert len(parsed.anomalies) == 1
+    anomaly = parsed.anomalies[0]
+    assert anomaly.classification == "short"
+    assert anomaly.action == "stored_flagged"
+    assert anomaly.n_trades == 1
+    assert anomaly.raw_open_ts == datetime(2024, 6, 1, 0, 0, 0, tzinfo=UTC)
+
+
+def test_parse_kline_csv_classifies_a_long_bar_and_drops_it() -> None:
+    """``close_time`` lands about a whole extra interval after ``open_time + delta``: the row's
+    data extends past its label, which would be look-ahead if stored there. Dropped, not raised."""
+    bad_row = "1717200000000,100,101,99,100,5,1717207199999,500,10,2,250,0\n"
+    parsed = bl.parse_kline_csv_bytes(bad_row.encode(), timeframe=Timeframe.H1)
+
+    assert parsed.records == ()
+    assert len(parsed.anomalies) == 1
+    anomaly = parsed.anomalies[0]
+    assert anomaly.classification == "long"
+    assert anomaly.action == "dropped"
+    assert anomaly.n_trades == 10
+
+
+def test_parse_kline_csv_classifies_an_empty_irregular_bar_close_before_open() -> None:
+    """Real event (decision D-036 brief): BTCUSDT 1h close_time before open_time, zero volume,
+    zero trades. Dropped -- there is nothing causal to store."""
+    parsed = bl.parse_kline_csv_bytes(
+        _csv_bytes("klines_1h_anomalies_empty_irregular.txt"), timeframe=Timeframe.H1
+    )
+
+    # the two normal neighbours are stored; the zero-trade close-before-open row is dropped
+    assert len(parsed.records) == 2
+    assert len(parsed.anomalies) == 1
+    anomaly = parsed.anomalies[0]
+    assert anomaly.classification == "empty_irregular"
+    assert anomaly.action == "dropped"
+    assert anomaly.n_trades == 0
+    assert anomaly.raw_close_ts < anomaly.raw_open_ts  # close really is before open
+
+
+def test_parse_kline_csv_classifies_a_short_outage_bar_from_a_real_event() -> None:
+    """Real event (decision D-036 brief): BTCUSDT 1h 2018-01-04 03:00, duration 14.838s, 34
+    trades -- a short bar at the start of an exchange outage. Stored at the normal label."""
+    parsed = bl.parse_kline_csv_bytes(
+        _csv_bytes("klines_1h_anomalies_short_outage.txt"), timeframe=Timeframe.H1
+    )
+
+    assert len(parsed.records) == 3  # the short bar IS stored (flagged), plus its two neighbours
+    assert len(parsed.anomalies) == 1
+    anomaly = parsed.anomalies[0]
+    assert anomaly.classification == "short"
+    assert anomaly.action == "stored_flagged"
+    assert anomaly.n_trades == 34
+    assert anomaly.duration_seconds == pytest.approx(14.838)
+    stored_ts = [r.ts for r in parsed.records]
+    assert datetime(2018, 1, 4, 4, 0, 0, tzinfo=UTC) in stored_ts  # 03:00 bar stored at its label
+
+
+def test_parse_kline_csv_classifies_a_misaligned_run_and_drops_it() -> None:
+    """Real event (decision D-036 brief): roughly two days of 1h bars opening at HH:28:14.789
+    instead of the hour -- off-grid, with an otherwise-normal 1h duration. Grid alignment is
+    checked before duration, so these are dropped as ``misaligned`` regardless of how clean
+    their close_time otherwise looks."""
+    parsed = bl.parse_kline_csv_bytes(
+        _csv_bytes("klines_1h_anomalies_misaligned_run.txt"), timeframe=Timeframe.H1
+    )
+
+    assert len(parsed.records) == 2  # only the two on-grid neighbours are stored
+    assert len(parsed.anomalies) == 2
+    assert all(a.classification == "misaligned" for a in parsed.anomalies)
+    assert all(a.action == "dropped" for a in parsed.anomalies)
+    for anomaly in parsed.anomalies:
+        assert not bl._is_on_grid(anomaly.raw_open_ts, Timeframe.H1)
 
 
 # --- checksum parsing -----------------------------------------------------------------------
@@ -329,17 +414,91 @@ def test_ingest_checksum_mismatch_fails_loudly_and_writes_nothing(tmp_path: Path
     assert not part_path.is_file()
 
 
+# --- decision D-036: ingest-level anomaly persistence + gap auto-classification -----------------
+
+
+@respx.mock
+def test_ingest_persists_anomalies_and_auto_classifies_the_resulting_gap_as_exchange_outage(
+    tmp_path: Path,
+) -> None:
+    """The misaligned-run fixture drops two off-grid rows, leaving a real gap in the stored
+    series. Decision D-036 (point 4): that gap must come out classified ``exchange_outage``, not
+    ``unknown``, because the dropped anomaly rows already explain it -- and the anomaly rows
+    themselves must be in the outcome and the persisted sidecar (point 7)."""
+    config = make_data_config(tmp_path)
+    zip_bytes = _zip_bytes("klines_1h_anomalies_misaligned_run.txt", "BTCUSDT-1h-2024-06.csv")
+    checksum_hex = bl.sha256_hex(zip_bytes)
+    zip_url = bl.monthly_zip_url(config.binance_base_url, "BTCUSDT", Timeframe.H1, 2024, 6)
+    respx.get(bl.checksum_url(zip_url)).mock(
+        return_value=httpx.Response(200, text=f"{checksum_hex}  BTCUSDT-1h-2024-06.zip\n")
+    )
+    respx.get(zip_url).mock(return_value=httpx.Response(200, content=zip_bytes))
+
+    with httpx.Client() as client:
+        outcome = bl.ingest_symbol_timeframe(
+            client,
+            symbol="BTCUSDT",
+            timeframe=Timeframe.H1,
+            data_config=config,
+            now=datetime(2024, 7, 15, tzinfo=UTC),
+        )
+
+    assert len(outcome.anomalies) == 2
+    assert all(a.classification == "misaligned" for a in outcome.anomalies)
+    assert len(outcome.gaps) == 1
+    assert outcome.gaps[0].classification == "exchange_outage"
+
+    sidecar = _load_sidecar(config, "BTCUSDT", Timeframe.H1)
+    assert len(sidecar.anomalies) == 2
+    assert sidecar.gaps[0].classification == "exchange_outage"
+
+
+def test_ingest_rerun_skip_still_reports_persisted_anomalies_report_only_style(
+    tmp_path: Path,
+) -> None:
+    """Decision D-036 (point 7): a month whose file is already verified + on disk is skipped
+    (never re-parsed), but the anomalies recorded on the FIRST run must still show up on a
+    second, report-only-style run -- the report must not lose anomaly rows just because the CSV
+    was not re-downloaded."""
+    config = make_data_config(tmp_path)
+    _ingest_fixture_month(
+        config, symbol="BTCUSDT", year=2024, month=6, csv_fixture="klines_1h_anomalies_misaligned_run.txt"
+    )
+    parsed = bl.parse_kline_csv_bytes(
+        _csv_bytes("klines_1h_anomalies_misaligned_run.txt"), timeframe=Timeframe.H1
+    )
+    sidecar_file = store_mod.sidecar_path(
+        config.parquet_root, source="binance", symbol="BTCUSDT", timeframe=Timeframe.H1
+    )
+    sidecar = store_mod.load_sidecar(sidecar_file, source="binance", symbol="BTCUSDT", timeframe=Timeframe.H1)
+    sidecar.replace_anomalies_in_month(2024, 6, parsed.anomalies)
+    store_mod.save_sidecar(sidecar_file, sidecar)
+
+    with httpx.Client() as client:  # no respx mock registered: a reparse would error loudly
+        outcome = bl.ingest_symbol_timeframe(
+            client,
+            symbol="BTCUSDT",
+            timeframe=Timeframe.H1,
+            data_config=config,
+            now=datetime(2024, 7, 15, tzinfo=UTC),
+        )
+
+    assert outcome.downloaded == ()  # the month was skipped, not re-parsed
+    assert len(outcome.anomalies) == 2
+    assert all(a.classification == "misaligned" for a in outcome.anomalies)
+
+
 # --- load_bars / load_frame ------------------------------------------------------------------
 
 
 def _ingest_fixture_month(
     config: DataConfig, *, symbol: str, year: int, month: int, csv_fixture: str
 ) -> None:
-    records = bl.parse_kline_csv_bytes(_csv_bytes(csv_fixture), timeframe=Timeframe.H1)
+    parsed = bl.parse_kline_csv_bytes(_csv_bytes(csv_fixture), timeframe=Timeframe.H1)
     part_path = store_mod.month_part_path(
         config.parquet_root, source="binance", symbol=symbol, timeframe=Timeframe.H1, year=year, month=month
     )
-    store_mod.write_month_part(part_path, records)
+    store_mod.write_month_part(part_path, list(parsed.records))
     sidecar_file = store_mod.sidecar_path(
         config.parquet_root, source="binance", symbol=symbol, timeframe=Timeframe.H1
     )
@@ -774,6 +933,28 @@ def test_default_ordinary_sealed_read_never_resolves_the_default_log_path(
 
     assert len(bars) == 3
     assert len(df) == 3
+
+
+def test_the_real_research_holdout_log_is_never_touched_by_the_suite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reviewer finding m8: tests/conftest.py's autouse env-isolation fixture must redirect
+    ``_default_holdout_log_path`` for every test, including this one, so a holdout-access
+    attempt made WITHOUT an explicit ``holdout_log_path`` (exercising the real default-path
+    fallback) never appends to the real ``research/HOLDOUT_LOG.md`` -- this has already happened
+    once on this machine."""
+    real_log = bl._resolve_repo_root() / "research" / "HOLDOUT_LOG.md"
+    before = real_log.read_text(encoding="utf-8") if real_log.is_file() else None
+
+    monkeypatch.setenv(bl.HOLDOUT_UNSEAL_ENV, "wrong-value")  # exercises the "refused" _log() branch
+    config = make_data_config(tmp_path)
+    _ingest_june_2024_ms(config)
+
+    with pytest.raises(bl.HoldoutLockError):
+        bl.load_bars("BTCUSDT", Timeframe.H1, allow_holdout=True, config=config)  # no holdout_log_path!
+
+    after = real_log.read_text(encoding="utf-8") if real_log.is_file() else None
+    assert after == before  # untouched -- the autouse fixture redirected the default path
 
 
 def test_refused_or_unsealed_access_still_resolves_the_default_log_path_when_needed(

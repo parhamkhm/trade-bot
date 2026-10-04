@@ -91,6 +91,7 @@ def main(argv: list[str] | None = None) -> int:
                         rows=outcome.rows_in_store,
                         gaps=len(outcome.gaps),
                         unclassified_gaps=sum(1 for g in outcome.gaps if g.classification == "unknown"),
+                        source_anomalies=len(outcome.anomalies),
                     )
 
     if args.report or args.report_only:
@@ -122,6 +123,17 @@ def main(argv: list[str] | None = None) -> int:
                     timeframe=timeframe,
                 )
                 gap_classifications = {(g.from_ts, g.to_ts): g.classification for g in sidecar.gaps}
+                anomalies_1h: list[store_mod.AnomalyRecord] = []
+                if timeframe in (Timeframe.H4, Timeframe.D1):
+                    sidecar_1h = store_mod.load_sidecar(
+                        store_mod.sidecar_path(
+                            data_config.parquet_root, source="binance", symbol=symbol, timeframe=Timeframe.H1
+                        ),
+                        source="binance",
+                        symbol=symbol,
+                        timeframe=Timeframe.H1,
+                    )
+                    anomalies_1h = sidecar_1h.anomalies
                 report = quality.build_quality_report(
                     source="binance",
                     symbol=symbol,
@@ -129,6 +141,8 @@ def main(argv: list[str] | None = None) -> int:
                     df=frames[timeframe],
                     df_1h_for_reconciliation=df_1h,
                     gap_classifications=gap_classifications,
+                    anomalies=sidecar.anomalies,
+                    anomalies_1h_for_reconciliation=anomalies_1h,
                 )
                 json_path, md_path = quality.write_report(report, report_dir, date_tag=date_tag)
                 logger.info(

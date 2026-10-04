@@ -36,8 +36,10 @@ raise, the whole test run refuses to start rather than silently running with a b
 
 from __future__ import annotations
 
+import os
 import socket
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -115,3 +117,38 @@ def _block_real_sockets() -> Iterator[None]:
     if not _guard_is_active():
         _install_network_guard()
     yield
+
+
+# ---------------------------------------------------------------------------------
+# reviewer finding m8: isolate every test from the real shell environment and the real
+# repo-level holdout log
+# ---------------------------------------------------------------------------------
+#
+# Two concrete incidents in this repo's history motivate this fixture:
+#
+# 1. A stray ``TBOT_UNSEAL_HOLDOUT=G4`` left set in a developer's shell silently flipped which
+#    branch of the sealed-holdout double lock several tests in tests/data exercised -- the tests
+#    still "passed", but against the wrong code path, which is worse than a visible failure.
+# 2. ``ingest_symbol_timeframe``/``load_bars``/``load_frame`` calls made in tests WITHOUT an
+#    explicit ``holdout_log_path`` fall through to ``_default_holdout_log_path()``, which walks
+#    up to the real repo root and appends to the real ``research/HOLDOUT_LOG.md`` -- this has
+#    already happened once from a test run on this machine.
+#
+# Clearing every ``TBOT_*`` variable before each test closes incident 1 (any test that needs one
+# sets it itself via ``monkeypatch.setenv``, same as today). Redirecting the default holdout-log
+# path to this test's own ``tmp_path`` closes incident 2 for every call that does not pass
+# ``holdout_log_path`` explicitly, without changing behaviour for tests that patch
+# ``_default_holdout_log_path`` themselves afterwards (``monkeypatch.setattr`` on the same
+# target simply wins, last call first, and both unwind correctly at teardown).
+
+
+@pytest.fixture(autouse=True)
+def _isolate_tbot_env_and_holdout_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    for key in list(os.environ):
+        if key.startswith("TBOT_"):
+            monkeypatch.delenv(key, raising=False)
+
+    from tbot.data import binance_loader as _binance_loader
+
+    fake_default_log = tmp_path / "HOLDOUT_LOG.md"
+    monkeypatch.setattr(_binance_loader, "_default_holdout_log_path", lambda: fake_default_log)
