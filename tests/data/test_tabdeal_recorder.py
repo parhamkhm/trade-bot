@@ -48,6 +48,15 @@ HOUR1_MS = 1767229200000  # 2026-01-01T01:00:00Z
 HOUR2_MS = 1767232800000  # 2026-01-01T02:00:00Z
 HOUR3_MS = HOUR2_MS + candles_mod.HOUR_MS
 
+# m-C/m-D (fifth fix round): a verified-poll timestamp far enough in the future that
+# RecorderStore.verified_poll_ts_ms's quiet-hour-timeout branch (_hour_feed_has_moved_past) is
+# trivially satisfied for any hour used in this file, and _sweep_now_ms's "no verified poll ->
+# don't sweep at all" gate (m-D) never applies. Used by tests that seed the store directly (no
+# poll_trades_once call) and are not themselves about m-C/m-D's own gating -- a stand-in for "this
+# recorder has already been verified-polling for a long time", which is exactly what unblocks
+# those two gates in production.
+FAR_FUTURE_VERIFIED_MS = 10**15
+
 
 def _load_json(name: str) -> Any:
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
@@ -172,22 +181,48 @@ def test_parse_trade_item_accepts_decimal_valued_price_and_qty() -> None:
     )
 
 
-@pytest.mark.parametrize(
-    "offset_ms",
-    [25 * 60 * 60 * 1000, -25 * 60 * 60 * 1000],  # 25h in the future / past
-)
-def test_parse_trade_item_rejects_timestamp_far_from_now(offset_ms: int) -> None:
-    """m2 (fourth fix round): a trade more than a day from the poll time is rejected outright --
-    this is what stops a wrong time unit (seconds, microseconds, or a literal 0) from silently
-    walking ``build_due_candles``'s sweep back to 1970 or stalling it on a bogus future hour."""
-    now_ms = 1700000000000
-    item = {"id": 1, "price": "100", "qty": "1", "time": now_ms + offset_ms}
+def test_parse_trade_item_accepts_an_old_trade_well_beyond_24h() -> None:
+    """MAJOR-A (fifth fix round): the old 24h age window rejected a trade purely for being old --
+    ~17% of a normal ~29h/1000-trade /trades window, manufacturing a partial_unparsable gap (and
+    an incomplete candle) on nearly every poll. A trade's age, however large, is not itself a
+    reason to reject it; dedupe makes re-insertion of an already-known-old trade harmless."""
+    now_ms = 1_767_225_600_000  # 2026-01-01T00:00:00Z
+    old_ms = now_ms - 29 * 60 * 60 * 1000  # 29h old -- well beyond the old 24h cutoff
+    item = {"id": 1, "price": "100", "qty": "1", "time": old_ms}
+    assert parse_trade_item(item, now_ms=now_ms) is not None
+
+
+def test_parse_trade_item_rejects_seconds_scale_timestamp() -> None:
+    """MAJOR-A: a seconds-scale (not ms) timestamp lands far below any plausible ms-epoch value
+    for any date this exchange has ever operated -- must be rejected as implausible, not accepted
+    as an extremely old (1970s-ish) trade."""
+    now_ms = 1_767_225_600_000
+    item = {"id": 1, "price": "100", "qty": "1", "time": now_ms // 1000}  # seconds, not ms
     assert parse_trade_item(item, now_ms=now_ms) is None
 
 
-def test_parse_trade_item_accepts_timestamp_just_within_one_day() -> None:
-    now_ms = 1700000000000
-    item = {"id": 1, "price": "100", "qty": "1", "time": now_ms - (24 * 60 * 60 * 1000 - 1)}
+def test_parse_trade_item_rejects_zero_timestamp() -> None:
+    item = {"id": 1, "price": "100", "qty": "1", "time": 0}
+    assert parse_trade_item(item, now_ms=1_767_225_600_000) is None
+
+
+def test_parse_trade_item_rejects_microsecond_scale_timestamp() -> None:
+    """MAJOR-A: a microsecond-scale (not ms) timestamp overshoots any plausible 'now' by a factor
+    of ~1000 -- caught by the future-skew bound, the same way an outright clock-skew artifact is."""
+    now_ms = 1_767_225_600_000
+    item = {"id": 1, "price": "100", "qty": "1", "time": now_ms * 1000}  # us, not ms
+    assert parse_trade_item(item, now_ms=now_ms) is None
+
+
+def test_parse_trade_item_rejects_timestamp_more_than_five_minutes_in_the_future() -> None:
+    now_ms = 1_767_225_600_000
+    item = {"id": 1, "price": "100", "qty": "1", "time": now_ms + 6 * 60 * 1000}
+    assert parse_trade_item(item, now_ms=now_ms) is None
+
+
+def test_parse_trade_item_accepts_timestamp_within_five_minutes_in_the_future() -> None:
+    now_ms = 1_767_225_600_000
+    item = {"id": 1, "price": "100", "qty": "1", "time": now_ms + 4 * 60 * 1000}
     assert parse_trade_item(item, now_ms=now_ms) is not None
 
 
@@ -208,15 +243,17 @@ def test_parse_trade_item_parses_is_buyer_maker_strictly(raw: Any, expected: boo
     """NIT (fourth fix round): ``bool(item.get("isBuyerMaker", False))`` turned the *string*
     "false" into True (any non-empty string is truthy). Only a real bool or a "true"/"false"
     string (any case) is accepted; anything else defaults to False, same as a missing field."""
-    item = {"id": 1, "price": "100", "qty": "1", "time": 1, "isBuyerMaker": raw}
-    trade = parse_trade_item(item, now_ms=1)
+    now_ms = 1_767_225_600_000
+    item = {"id": 1, "price": "100", "qty": "1", "time": now_ms, "isBuyerMaker": raw}
+    trade = parse_trade_item(item, now_ms=now_ms)
     assert trade is not None
     assert trade.is_buyer_maker is expected
 
 
 def test_parse_trade_item_missing_is_buyer_maker_defaults_to_false() -> None:
-    item = {"id": 1, "price": "100", "qty": "1", "time": 1}
-    trade = parse_trade_item(item, now_ms=1)
+    now_ms = 1_767_225_600_000
+    item = {"id": 1, "price": "100", "qty": "1", "time": now_ms}
+    trade = parse_trade_item(item, now_ms=now_ms)
     assert trade is not None
     assert trade.is_buyer_maker is False
 
@@ -234,7 +271,9 @@ def test_poll_trades_once_dedupes_overlapping_batch_without_a_gap(tmp_path: Path
             httpx.Response(200, json=_load_json("tabdeal_trades_overlap.json")),
         ]
     )
-    clock = FakeClock()
+    # MAJOR-A (fifth fix round): the fixtures' latest trade (id 108) is at 1767229100000 -- the
+    # clock must be at or after that (a trade can never be more than 5 minutes in the future).
+    clock = FakeClock(start=candles_mod.ms_to_utc(1767229100000))
     client = make_client(clock)
     store = RecorderStore(tmp_path / "trades.sqlite")
 
@@ -259,7 +298,8 @@ def test_poll_trades_once_dedupes_overlapping_batch_without_a_gap(tmp_path: Path
 def test_poll_trades_once_exact_duplicate_batch_inserts_nothing(tmp_path: Path) -> None:
     page1 = _load_json("tabdeal_trades_page1.json")
     respx.get(TRADES_URL).mock(side_effect=[httpx.Response(200, json=page1), httpx.Response(200, json=page1)])
-    clock = FakeClock()
+    # MAJOR-A: page1's latest trade (id 105) is at 1767228600000.
+    clock = FakeClock(start=candles_mod.ms_to_utc(1767228600000))
     client = make_client(clock)
     store = RecorderStore(tmp_path / "trades.sqlite")
 
@@ -282,10 +322,11 @@ def test_poll_trades_once_exact_duplicate_batch_inserts_nothing(tmp_path: Path) 
 def test_poll_trades_once_out_of_order_ids_do_not_cause_a_false_gap(tmp_path: Path) -> None:
     body = _load_json("tabdeal_trades_out_of_order.json")
     respx.get(TRADES_URL).mock(return_value=httpx.Response(200, json=body))
-    clock = FakeClock()
+    # MAJOR-A: the fixture's latest trade (id 114) is at 1767229260000.
+    clock = FakeClock(start=candles_mod.ms_to_utc(1767229260000))
     client = make_client(clock)
     store = RecorderStore(tmp_path / "trades.sqlite")
-    # Decision D-036 (proposed): trade ids are global across symbols, so continuity is proven by
+    # Decision D-037: trade ids are global across symbols, so continuity is proven by
     # *overlap* (this poll's lowest id <= what we already have), not by "+1" adjacency. Seed the
     # fixture's own lowest id (109) so the window overlaps exactly, isolating this test's actual
     # subject -- that a shuffled-order batch still computes first_id/last_id correctly -- from the
@@ -307,7 +348,7 @@ def test_poll_trades_once_out_of_order_ids_do_not_cause_a_false_gap(tmp_path: Pa
 
 @respx.mock
 def test_poll_trades_once_detects_window_no_overlap_and_records_a_gap(tmp_path: Path) -> None:
-    """Decision D-036 (proposed, fourth fix round): trade ids are global across symbols (measured
+    """Decision D-037: trade ids are global across symbols (measured
     from the Turkey server 2026-10-04: BTCUSDT ids step by a median of 84, max 2069), so the old
     "first returned id > last_stored_id + 1" test fired on nearly every poll for a thin market.
     Replaced by an overlap test: continuity is proven iff this poll's lowest id reaches back to
@@ -315,7 +356,8 @@ def test_poll_trades_once_detects_window_no_overlap_and_records_a_gap(tmp_path: 
     -- unambiguous data-loss risk, not ordinary cross-symbol interleaving.
     """
     respx.get(TRADES_URL).mock(return_value=httpx.Response(200, json=_load_json("tabdeal_trades_gap.json")))
-    clock = FakeClock()
+    # MAJOR-A: the fixture's latest trade (id 50118) is at 1767229600000.
+    clock = FakeClock(start=candles_mod.ms_to_utc(1767229600000))
     client = make_client(clock)
     store = RecorderStore(tmp_path / "trades.sqlite")
     _seed_trade(store, 108, HOUR1_MS - 1_000)
@@ -331,7 +373,81 @@ def test_poll_trades_once_detects_window_no_overlap_and_records_a_gap(tmp_path: 
 
 
 @respx.mock
-def test_poll_trades_once_empty_response_inserts_nothing_and_raises_no_gap(tmp_path: Path) -> None:
+def test_poll_trades_once_1000_item_window_spanning_29h_has_no_gaps_and_complete_candles(
+    tmp_path: Path,
+) -> None:
+    """MAJOR-A end to end: the exact measured shape of a real BTCUSDT /trades poll (limit=1000,
+    spanning ~29h) must parse in full -- no partial_unparsable gap, no window_no_overlap gap --
+    and a candle well inside that window (not the very first hour ever, which is always
+    cold-start-incomplete by construction, and not the freshest hour, which m-C withholds without
+    further evidence) must come back complete=True."""
+    n = 1000
+    span_ms = 29 * 60 * 60 * 1000  # 29h, matching the measured real-world window
+    start_ms = HOUR0_MS - 2 * candles_mod.HOUR_MS
+    step_ms = span_ms // (n - 1)
+    body: list[dict[str, Any]] = [
+        {"id": i + 1, "price": "100.0", "qty": "0.01", "time": start_ms + i * step_ms, "isBuyerMaker": False}
+        for i in range(n)
+    ]
+    end_ms = start_ms + (n - 1) * step_ms
+    respx.get(TRADES_URL).mock(return_value=httpx.Response(200, json=body))
+    clock = FakeClock(start=candles_mod.ms_to_utc(end_ms + 60_000))
+    client = make_client(clock)
+    store = RecorderStore(tmp_path / "trades.sqlite")
+    parquet_root = tmp_path / "parquet"
+
+    outcome = poll_trades_once(
+        client, store, symbol="BTCUSDT", limit=1000, poll_interval_seconds=5.0, clock=clock
+    )
+    assert outcome.ok is True
+    assert outcome.n_items_received == n
+    assert outcome.n_trades == n  # MAJOR-A: nothing dropped as "too old" anymore
+    assert outcome.gap is None
+
+    build_due_candles(
+        store, symbol="BTCUSDT", parquet_root=parquet_root, grace_period_seconds=60.0, clock=clock
+    )
+
+    assert store.all_gaps() == []  # no partial_unparsable, no window_no_overlap anywhere
+    target_close_ms = candles_mod.hour_bounds_ms(start_ms + 5 * candles_mod.HOUR_MS)[1]
+    table = candles_mod._read_candles(parquet_root, "BTCUSDT")
+    rows = {row["ts"]: row for row in table.to_pylist()}
+    assert rows[candles_mod.ms_to_utc(target_close_ms)]["complete"] is True
+    client.close()
+    store.close()
+
+
+@respx.mock
+def test_poll_trades_once_empty_response_on_a_cold_start_is_still_ok(tmp_path: Path) -> None:
+    """A genuinely empty market (nothing stored yet -- the normal cold-start case) is not
+    suspicious: there is nothing yet for ``[]`` to contradict. MAJOR-B's new "suspicious empty
+    response" rule must not fire here."""
+    respx.get(TRADES_URL).mock(return_value=httpx.Response(200, json=_load_json("tabdeal_trades_empty.json")))
+    clock = FakeClock()
+    client = make_client(clock)
+    store = RecorderStore(tmp_path / "trades.sqlite")
+
+    outcome = poll_trades_once(
+        client, store, symbol="BTCUSDT", limit=500, poll_interval_seconds=5.0, clock=clock
+    )
+
+    assert outcome.ok is True
+    assert outcome.n_trades == 0
+    assert outcome.n_items_received == 0
+    assert outcome.inserted == 0
+    assert outcome.gap is None
+    assert store.verified_poll_ts_ms("BTCUSDT") is not None
+    client.close()
+    store.close()
+
+
+@respx.mock
+def test_poll_trades_once_empty_response_after_data_already_recorded_is_not_ok(tmp_path: Path) -> None:
+    """MAJOR-B (fifth fix round, inverts the old cold-start-only test): an HTTP-200 empty list
+    used to count as a fully healthy, verified poll unconditionally. A recent-trades endpoint
+    never legitimately returns ``[]`` once the market has ever traded -- the previously-stored
+    trade is itself proof that it has. Reviewer-reproduced: `[]` for 2h20m made a hard-coded
+    98/120-trade hour complete=True and silently dropped two later hours."""
     respx.get(TRADES_URL).mock(return_value=httpx.Response(200, json=_load_json("tabdeal_trades_empty.json")))
     clock = FakeClock()
     client = make_client(clock)
@@ -343,15 +459,17 @@ def test_poll_trades_once_empty_response_inserts_nothing_and_raises_no_gap(tmp_p
             client, store, symbol="BTCUSDT", limit=500, poll_interval_seconds=5.0, clock=clock
         )
 
-    assert outcome.ok is True
+    assert outcome.ok is False  # MAJOR-B: must not look like a healthy, verified poll
     assert outcome.n_trades == 0
     assert outcome.n_items_received == 0  # MAJOR-1: genuinely empty, not "we dropped everything"
     assert outcome.inserted == 0
     assert outcome.first_id is None
     assert outcome.gap is None
     assert store.total_trade_count() == 1  # only the seeded trade
+    assert store.verified_poll_ts_ms("BTCUSDT") is None  # MAJOR-B: no verified-poll marker
     warnings = [log for log in logs if log["log_level"] == "warning"]
     assert not any(log["event"] == "tabdeal_recorder.unparsable_trades" for log in warnings)
+    assert any(log["event"] == "tabdeal_recorder.suspicious_empty_response" for log in warnings)
     client.close()
     store.close()
 
@@ -548,6 +666,9 @@ def test_poll_and_build_due_candles_partial_unparsable_drop_marks_hour_incomplet
     parquet_root = tmp_path / "parquet"
 
     poll_trades_once(client, store, symbol="BTCUSDT", limit=500, poll_interval_seconds=5.0, clock=clock)
+    # m-C (fifth fix round): this test is about partial-unparsable completeness, not m-C's own
+    # feed-evidence gate -- bypass it (see FAR_FUTURE_VERIFIED_MS).
+    store.record_verified_poll(symbol="BTCUSDT", poll_ts_ms=FAR_FUTURE_VERIFIED_MS)
     written = build_due_candles(
         store, symbol="BTCUSDT", parquet_root=parquet_root, grace_period_seconds=60.0, clock=clock
     )
@@ -591,7 +712,8 @@ def test_poll_trades_once_low_coverage_ratio_warns(tmp_path: Path) -> None:
     """``coverage_ratio < 3`` -- not ``saturated`` -- is the real at-risk signal (D-024)."""
     body = _load_json("tabdeal_trades_page1.json")  # trades span 2940s
     respx.get(TRADES_URL).mock(return_value=httpx.Response(200, json=body))
-    clock = FakeClock()
+    # MAJOR-A: page1's latest trade (id 105) is at 1767228600000.
+    clock = FakeClock(start=candles_mod.ms_to_utc(1767228600000))
     client = make_client(clock)
     store = RecorderStore(tmp_path / "trades.sqlite")
 
@@ -611,7 +733,8 @@ def test_poll_trades_once_low_coverage_ratio_warns(tmp_path: Path) -> None:
 def test_poll_trades_once_healthy_coverage_does_not_warn(tmp_path: Path) -> None:
     body = _load_json("tabdeal_trades_page1.json")  # trades span 2940s
     respx.get(TRADES_URL).mock(return_value=httpx.Response(200, json=body))
-    clock = FakeClock()
+    # MAJOR-A: page1's latest trade (id 105) is at 1767228600000.
+    clock = FakeClock(start=candles_mod.ms_to_utc(1767228600000))
     client = make_client(clock)
     store = RecorderStore(tmp_path / "trades.sqlite")
 
@@ -642,7 +765,8 @@ def test_restart_resumption_no_duplicates_no_skipped_ids(tmp_path: Path) -> None
             httpx.Response(200, json=_load_json("tabdeal_trades_overlap.json")),
         ]
     )
-    clock = FakeClock()
+    # MAJOR-A: the fixtures' latest trade (id 108) is at 1767229100000.
+    clock = FakeClock(start=candles_mod.ms_to_utc(1767229100000))
     client = make_client(clock)
 
     store_a = RecorderStore(db_path)
@@ -672,6 +796,11 @@ def test_restart_resumption_no_duplicates_no_skipped_ids(tmp_path: Path) -> None
 
 def test_build_due_candles_empty_hour_writes_a_gap_row_never_a_bar(tmp_path: Path) -> None:
     store = RecorderStore(tmp_path / "trades.sqlite")
+    # m-D (fifth fix round): this test seeds trades directly, never through poll_trades_once, so
+    # it must record a verified poll explicitly -- with no verified poll at all, the sweep now
+    # does nothing (see _sweep_now_ms). FAR_FUTURE_VERIFIED_MS also clears m-C's own gate for
+    # every hour here, since this test is not about either of those mechanisms.
+    store.record_verified_poll(symbol="BTCUSDT", poll_ts_ms=FAR_FUTURE_VERIFIED_MS)
     _seed_trade(store, 1, HOUR0_MS + 1_000)  # hour A has a trade
     _seed_trade(store, 2, HOUR2_MS + 1_000)  # hour C has a trade; hour B is empty
     parquet_root = tmp_path / "parquet"
@@ -698,6 +827,7 @@ def test_build_due_candles_several_empty_hours_in_one_sweep_are_individually_ide
     empty. Hours B and C here are both empty; their gap rows must carry distinct close times.
     """
     store = RecorderStore(tmp_path / "trades.sqlite")
+    store.record_verified_poll(symbol="BTCUSDT", poll_ts_ms=FAR_FUTURE_VERIFIED_MS)  # m-D
     hour4_ms = HOUR3_MS + candles_mod.HOUR_MS
     _seed_trade(store, 1, HOUR0_MS + 1_000)  # hour A: (HOUR0, HOUR1] has a trade
     _seed_trade(store, 2, HOUR3_MS + 1_000)  # hour D: (HOUR3, hour4_ms] has a trade
@@ -721,6 +851,7 @@ def test_build_due_candles_empty_hour_gap_is_not_rewalked_on_a_second_sweep(tmp_
     forever, since only writing an actual candle advanced the old resumption cursor. Measured:
     3 empty hours x 5 polls = 15 duplicate gap rows and 15 duplicate warnings."""
     store = RecorderStore(tmp_path / "trades.sqlite")
+    store.record_verified_poll(symbol="BTCUSDT", poll_ts_ms=FAR_FUTURE_VERIFIED_MS)  # m-D
     _seed_trade(store, 1, HOUR0_MS + 1_000)  # hour A has a trade; hour B is empty
     parquet_root = tmp_path / "parquet"
     clock = FakeClock(start=candles_mod.ms_to_utc(HOUR2_MS + 120_000))
@@ -744,6 +875,7 @@ def test_build_due_candles_empty_hour_gap_is_not_rewalked_on_a_second_sweep(tmp_
 
 def test_build_due_candles_withholds_a_too_fresh_hour_then_writes_once_grace_elapses(tmp_path: Path) -> None:
     store = RecorderStore(tmp_path / "trades.sqlite")
+    store.record_verified_poll(symbol="BTCUSDT", poll_ts_ms=FAR_FUTURE_VERIFIED_MS)  # m-D
     _seed_trade(store, 1, HOUR0_MS + 1_000)
     parquet_root = tmp_path / "parquet"
     clock = FakeClock(start=candles_mod.ms_to_utc(HOUR1_MS + 30_000))  # only 30s past close; grace is 60s
@@ -773,6 +905,9 @@ def test_poll_and_build_due_candles_boundary_trade_closes_the_earlier_hour(tmp_p
     parquet_root = tmp_path / "parquet"
 
     poll_trades_once(client, store, symbol="BTCUSDT", limit=500, poll_interval_seconds=5.0, clock=clock)
+    # m-C (fifth fix round): this test is about which hour a boundary trade closes, not m-C's own
+    # feed-evidence gate -- bypass it (see FAR_FUTURE_VERIFIED_MS).
+    store.record_verified_poll(symbol="BTCUSDT", poll_ts_ms=FAR_FUTURE_VERIFIED_MS)
     written = build_due_candles(
         store, symbol="BTCUSDT", parquet_root=parquet_root, grace_period_seconds=60.0, clock=clock
     )
@@ -818,6 +953,7 @@ def test_build_due_candles_poisoned_row_already_in_database_does_not_wedge_the_l
     defensive filter leaves the hour simply unwritten rather than forward-filled.
     """
     store = RecorderStore(tmp_path / "trades.sqlite")
+    store.record_verified_poll(symbol="BTCUSDT", poll_ts_ms=FAR_FUTURE_VERIFIED_MS)  # m-D/m-C
     store.insert_trades(
         [
             Trade(
@@ -853,6 +989,7 @@ def test_build_due_candles_poisoned_hour_is_not_rewalked_and_later_healthy_hour_
     taint a later, genuinely healthy hour.
     """
     store = RecorderStore(tmp_path / "trades.sqlite")
+    store.record_verified_poll(symbol="BTCUSDT", poll_ts_ms=FAR_FUTURE_VERIFIED_MS)  # m-D/m-C
     store.insert_trades(
         [
             Trade(  # hour A: (HOUR0, HOUR1] -- the only trade in it is poisoned
@@ -920,7 +1057,7 @@ def test_build_due_candles_saturated_but_healthy_coverage_still_complete(tmp_pat
     client = make_client(clock)
     store = RecorderStore(tmp_path / "trades.sqlite")
     parquet_root = tmp_path / "parquet"
-    # Decision D-036 (proposed): ids are global, so continuity needs genuine overlap, not "+1"
+    # Decision D-037: ids are global, so continuity needs genuine overlap, not "+1"
     # adjacency -- seed the fixture's own lowest id (201) so the poll below overlaps exactly.
     _seed_trade(store, 201, hour_minus1_ms + 1_000)
     candles_mod.write_candle(
@@ -951,6 +1088,11 @@ def test_build_due_candles_saturated_but_healthy_coverage_still_complete(tmp_pat
     # second verified poll at the later time is needed before the hour can become due -- jumping
     # the clock alone (without polling again) would correctly leave it un-swept.
     poll_trades_once(client, store, symbol="BTCUSDT", limit=4, poll_interval_seconds=5.0, clock=clock)
+    # m-C (fifth fix round): this test is about saturation/coverage, not m-C's own feed-evidence
+    # gate -- bypass it (see FAR_FUTURE_VERIFIED_MS). The cap asserted above (sweep_now_ms using
+    # the real poll's own, smaller now_ms) is unaffected: this only clears the *additional* m-C
+    # requirement for the hour that is already due by that cap.
+    store.record_verified_poll(symbol="BTCUSDT", poll_ts_ms=FAR_FUTURE_VERIFIED_MS)
     written = build_due_candles(
         store, symbol="BTCUSDT", parquet_root=parquet_root, grace_period_seconds=60.0, clock=clock
     )
@@ -967,6 +1109,7 @@ def test_build_due_candles_cold_start_first_partial_hour_is_incomplete(tmp_path:
     trade to overlap with), so without the fix this bucket was written complete=True.
     """
     store = RecorderStore(tmp_path / "trades.sqlite")
+    store.record_verified_poll(symbol="BTCUSDT", poll_ts_ms=FAR_FUTURE_VERIFIED_MS)  # m-D/m-C
     _seed_trade(store, 1, HOUR0_MS + 30 * 60_000)  # first trade ever, 30 min into the bucket
     parquet_root = tmp_path / "parquet"
     clock = FakeClock(start=candles_mod.ms_to_utc(HOUR1_MS + 61_000))
@@ -984,6 +1127,7 @@ def test_build_due_candles_cold_start_first_partial_hour_is_incomplete(tmp_path:
 def test_build_due_candles_second_hour_after_cold_start_is_complete(tmp_path: Path) -> None:
     """The cold-start flag must only ever hit the very first bucket, not every bucket forever."""
     store = RecorderStore(tmp_path / "trades.sqlite")
+    store.record_verified_poll(symbol="BTCUSDT", poll_ts_ms=FAR_FUTURE_VERIFIED_MS)  # m-D/m-C
     _seed_trade(store, 1, HOUR0_MS + 30 * 60_000)  # partial first hour
     _seed_trade(store, 2, HOUR1_MS + 1_000)  # second hour has full coverage from its own start
     parquet_root = tmp_path / "parquet"
@@ -1095,7 +1239,12 @@ def test_write_heartbeat_content(tmp_path: Path) -> None:
     path = tmp_path / "heartbeat.json"
     ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)
     state = HeartbeatState(
-        last_poll_ts=ts, last_trade_id=42, n_trades_total=7, consecutive_errors=1, last_new_trade_ts_ms=123
+        last_poll_ts=ts,
+        last_trade_id=42,
+        n_trades_total=7,
+        consecutive_errors=1,
+        last_new_trade_ts_ms=123,
+        first_poll_ts_ms=100,
     )
     write_heartbeat(path, state)
 
@@ -1106,6 +1255,7 @@ def test_write_heartbeat_content(tmp_path: Path) -> None:
         "n_trades_total": 7,
         "consecutive_errors": 1,
         "last_new_trade_ts_ms": 123,
+        "first_poll_ts_ms": 100,
     }
 
 
@@ -1117,6 +1267,7 @@ def test_write_heartbeat_last_new_trade_ts_ms_defaults_to_none(tmp_path: Path) -
 
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["last_new_trade_ts_ms"] is None
+    assert payload["first_poll_ts_ms"] is None
 
 
 @respx.mock
@@ -1185,6 +1336,62 @@ def test_process_once_heartbeat_last_new_trade_ts_ms_tracks_genuinely_new_insert
     service.process_once()  # the same trades again -> nothing new inserted
     second_payload = json.loads(heartbeat_file.read_text(encoding="utf-8"))
     assert second_payload["last_new_trade_ts_ms"] == first_payload["last_new_trade_ts_ms"]  # unchanged
+
+    service.close()
+    client.close()
+
+
+def test_first_poll_ts_ms_is_min_of_poll_log(tmp_path: Path) -> None:
+    store = RecorderStore(tmp_path / "trades.sqlite")
+    assert store.first_poll_ts_ms() is None  # nothing polled yet
+
+    def _record(poll_ts_ms: int) -> None:
+        store.record_poll(
+            poll_ts_ms=poll_ts_ms,
+            first_id=None,
+            last_id=None,
+            n_trades=0,
+            saturated=False,
+            http_status=200,
+            latency_ms=1.0,
+            window_span_seconds=None,
+            coverage_ratio=None,
+            n_items_received=0,
+        )
+
+    _record(500)
+    _record(100)  # out of order -- first_poll_ts_ms is still MIN
+    assert store.first_poll_ts_ms() == 100
+    store.close()
+
+
+@respx.mock
+def test_process_once_heartbeat_carries_first_poll_ts_ms(tmp_path: Path) -> None:
+    """NIT (fifth fix round): ``process_once`` must wire ``RecorderStore.first_poll_ts_ms`` into
+    the heartbeat it writes -- see ``deploy/healthcheck.py``'s "no trade ever recorded" check."""
+    respx.get(TRADES_URL).mock(return_value=httpx.Response(200, json=_load_json("tabdeal_trades_empty.json")))
+    respx.get(DEPTH_URL).mock(return_value=httpx.Response(200, json=_load_json("tabdeal_depth_sample.json")))
+    clock = FakeClock()
+    client = make_client(clock)
+    store = RecorderStore(tmp_path / "trades.sqlite")
+    heartbeat_file = tmp_path / "heartbeat.json"
+    service = TabdealRecorderService(
+        client=client,
+        store=store,
+        parquet_root=tmp_path / "parquet",
+        heartbeat_file=heartbeat_file,
+        settings=RecorderSettings(symbol="BTCUSDT"),
+        clock=clock,
+    )
+
+    service.process_once()
+    first_payload = json.loads(heartbeat_file.read_text(encoding="utf-8"))
+    assert first_payload["first_poll_ts_ms"] == trd._dt_to_ms(clock.now())
+
+    clock.advance(5.0)
+    service.process_once()  # first_poll_ts_ms must not move on a later poll
+    second_payload = json.loads(heartbeat_file.read_text(encoding="utf-8"))
+    assert second_payload["first_poll_ts_ms"] == first_payload["first_poll_ts_ms"]
 
     service.close()
     client.close()
@@ -1281,6 +1488,11 @@ def test_run_forever_subtracts_cycle_duration_and_stops_immediately(
         (10, 160.0),  # 5.0 * 2^5
         (13, 300.0),  # 5.0 * 2^8 = 1280, capped at 300
         (50, 300.0),  # deep into the backoff: still capped, never grows unbounded
+        # m-F (fifth fix round): ``5.0 * 2 ** (n - 5)`` overflows (OverflowError) around n=1029,
+        # outside any try/except -- the exponent must be capped before it is ever raised to a
+        # power, well before that point and well past it.
+        (1029, 300.0),
+        (5000, 300.0),
     ],
 )
 def test_next_wait_seconds_backs_off_exponentially_past_the_error_threshold(
@@ -1344,6 +1556,157 @@ def test_run_forever_backoff_wait_is_still_interruptible_by_stop(
     assert waits == [pytest.approx(10.0)]  # 5.0 * 2^1, not the nominal 5.0 -- and stop still landed
     service.close()
     client.close()
+
+
+# ---------------------------------------------------------------------------------
+# m-E: run_forever exits (raises) after too many consecutive process_once() exceptions
+# ---------------------------------------------------------------------------------
+
+
+def test_run_forever_raises_fatal_error_after_consecutive_cycle_exceptions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """m-E (fifth fix round): run_forever must not loop forever inside a permanently broken
+    process -- after ``_MAX_CONSECUTIVE_CYCLE_EXCEPTIONS`` consecutive ``process_once()``
+    exceptions it must raise ``RecorderFatalError`` and let the process exit non-zero, so
+    Docker's ``restart: unless-stopped`` policy (``deploy/docker-compose.yml``) can recover it."""
+    clock = FakeClock()
+    client = make_client(clock)
+    store = RecorderStore(tmp_path / "trades.sqlite")
+    service = TabdealRecorderService(
+        client=client,
+        store=store,
+        parquet_root=tmp_path / "parquet",
+        heartbeat_file=tmp_path / "heartbeat.json",
+        settings=RecorderSettings(symbol="BTCUSDT"),
+        clock=clock,
+    )
+    monkeypatch.setattr("tbot.data.tabdeal_recorder.time.monotonic", lambda: 0.0)
+
+    def fake_wait(self: threading.Event, _timeout: float | None = None) -> bool:
+        return False
+
+    monkeypatch.setattr(threading.Event, "wait", fake_wait)
+
+    def always_fails(self: TabdealRecorderService) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(TabdealRecorderService, "process_once", always_fails)
+
+    with pytest.raises(trd.RecorderFatalError):
+        service.run_forever()
+
+    assert service._consecutive_cycle_exceptions == trd._MAX_CONSECUTIVE_CYCLE_EXCEPTIONS
+    service.close()
+    client.close()
+
+
+def test_run_forever_resets_cycle_exception_counter_after_a_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fatal-exit counter is about *consecutive* exceptions -- an intervening successful
+    cycle must reset it, not let failures accumulate across unrelated successes forever."""
+    clock = FakeClock()
+    client = make_client(clock)
+    store = RecorderStore(tmp_path / "trades.sqlite")
+    service = TabdealRecorderService(
+        client=client,
+        store=store,
+        parquet_root=tmp_path / "parquet",
+        heartbeat_file=tmp_path / "heartbeat.json",
+        settings=RecorderSettings(symbol="BTCUSDT"),
+        clock=clock,
+    )
+    monkeypatch.setattr("tbot.data.tabdeal_recorder.time.monotonic", lambda: 0.0)
+    calls = {"n": 0}
+
+    def fake_wait(self: threading.Event, timeout: float | None = None) -> bool:
+        calls["n"] += 1
+        if calls["n"] >= 3:
+            service.request_stop()
+        return False
+
+    monkeypatch.setattr(threading.Event, "wait", fake_wait)
+
+    def flaky_process_once(self: TabdealRecorderService) -> None:
+        if calls["n"] == 1:  # fails once, then succeeds -- never two in a row
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(TabdealRecorderService, "process_once", flaky_process_once)
+
+    service.run_forever()  # must not raise -- the single failure never repeats back to back
+
+    assert service._consecutive_cycle_exceptions == 0
+    service.close()
+    client.close()
+
+
+# ---------------------------------------------------------------------------------
+# m-E: a failed COMMIT (or a pre-existing dangling transaction) must not wedge the connection
+# ---------------------------------------------------------------------------------
+
+
+class _FlakyCommitConn:
+    """Thin proxy around a real ``sqlite3.Connection`` that fails exactly one ``COMMIT`` --
+    ``sqlite3.Connection`` is a C type and does not allow monkeypatching its ``execute`` method
+    directly (``TypeError: cannot set 'execute' attribute of immutable type``), so this wraps the
+    real, already-open connection a ``RecorderStore`` holds instead."""
+
+    def __init__(self, real: sqlite3.Connection) -> None:
+        self._real = real
+        self._fail_next_commit = True
+
+    def execute(self, sql: str, *params: Any) -> Any:
+        if sql == "COMMIT" and self._fail_next_commit:
+            self._fail_next_commit = False
+            raise sqlite3.OperationalError("simulated commit failure")
+        return self._real.execute(sql, *params)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real, name)
+
+
+def test_transaction_commit_failure_is_rolled_back_and_store_remains_usable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """m-E (fifth fix round): a COMMIT that itself fails used to leave the connection wedged
+    inside an open transaction forever -- every later ``transaction()`` call then raised
+    ``sqlite3.OperationalError: cannot start a transaction within a transaction`` permanently,
+    needing a process restart to clear."""
+    store = RecorderStore(tmp_path / "trades.sqlite")
+    monkeypatch.setattr(store, "_conn", _FlakyCommitConn(store._conn))
+
+    with pytest.raises(sqlite3.OperationalError), store.transaction():
+        store._conn.execute("INSERT INTO meta (key, value) VALUES ('x', 'y')")
+
+    assert store._conn.in_transaction is False  # rolled back, not wedged
+
+    with store.transaction():  # must work normally afterwards
+        store._conn.execute("INSERT INTO meta (key, value) VALUES ('a', 'b')")
+    row = store._conn.execute("SELECT value FROM meta WHERE key = 'a'").fetchone()
+    assert row == ("b",)
+    store.close()
+
+
+def test_transaction_rolls_back_a_pre_existing_dangling_transaction_before_beginning(
+    tmp_path: Path,
+) -> None:
+    """m-E: if a previous crash (or the commit-failure path above) ever left the connection with
+    an open transaction, the NEXT ``transaction()`` call must recover by rolling it back first,
+    rather than raising "cannot start a transaction within a transaction" forever."""
+    store = RecorderStore(tmp_path / "trades.sqlite")
+    store._conn.execute("BEGIN IMMEDIATE")  # simulate a dangling transaction from a prior crash
+    store._conn.execute("INSERT INTO meta (key, value) VALUES ('leftover', 'uncommitted')")
+    assert store._conn.in_transaction is True
+
+    with store.transaction():
+        store._conn.execute("INSERT INTO meta (key, value) VALUES ('ok', 'value')")
+
+    row = store._conn.execute("SELECT value FROM meta WHERE key = 'leftover'").fetchone()
+    assert row is None  # the dangling, never-committed insert was rolled back
+    row2 = store._conn.execute("SELECT value FROM meta WHERE key = 'ok'").fetchone()
+    assert row2 == ("value",)
+    store.close()
 
 
 # ---------------------------------------------------------------------------------
@@ -1496,13 +1859,18 @@ def test_build_due_candles_backfills_late_trade_once_polling_recovers(tmp_path: 
     correctly from whatever trades are now in the store -- including one that arrived late,
     during the outage, which the capped sweep never got a chance to wrongly seal as empty."""
     late_trade_body = [{"id": 2, "price": "100", "qty": "1", "time": HOUR0_MS + 30 * 60_000}]
+    # m-C (fifth fix round): a poll that returns the late trade *inside* hour A is not, by itself,
+    # evidence the feed has moved PAST hour A's close -- a further poll returning something
+    # after HOUR1_MS (id 3, landing in hour B) is what actually proves that.
+    after_hour_a_body = [{"id": 3, "price": "100", "qty": "1", "time": HOUR1_MS + 500}]
     # Call 1: verified poll before the outage. Call 2: the outage. Call 3: recovery, with the
-    # late trade for hour A (id 2, contiguous with the seed).
+    # late trade for hour A (id 2, contiguous with the seed). Call 4: the m-C-satisfying poll.
     respx.get(TRADES_URL).mock(
         side_effect=[
             httpx.Response(200, json=[]),
             httpx.Response(500),
             httpx.Response(200, json=late_trade_body),
+            httpx.Response(200, json=after_hour_a_body),
         ]
     )
     clock = FakeClock(start=candles_mod.ms_to_utc(HOUR0_MS + 1_000))
@@ -1522,18 +1890,29 @@ def test_build_due_candles_backfills_late_trade_once_polling_recovers(tmp_path: 
     )
     assert withheld == []
 
-    # Recovery.
+    # Recovery: the late trade for hour A arrives. The seed's own hour (closing HOUR0_MS) already
+    # has evidence the feed moved past it -- that very trade, at HOUR0_MS + 30min -- but hour A
+    # itself (closing HOUR1_MS, which CONTAINS that trade) does not yet: m-C stops the sweep right
+    # there rather than sealing hour A early.
     clock.set(candles_mod.ms_to_utc(HOUR1_MS + 120_000))
+    poll_trades_once(client, store, symbol="BTCUSDT", limit=500, poll_interval_seconds=5.0, clock=clock)
+    partially_recovered = build_due_candles(
+        store, symbol="BTCUSDT", parquet_root=parquet_root, grace_period_seconds=60.0, clock=clock
+    )
+    assert [r.ts for r in partially_recovered] == [candles_mod.ms_to_utc(HOUR0_MS)]
+
+    # A further poll returning a trade after hour A's close is the evidence m-C needs for hour A.
+    clock.advance(5.0)
     poll_trades_once(client, store, symbol="BTCUSDT", limit=500, poll_interval_seconds=5.0, clock=clock)
     written = build_due_candles(
         store, symbol="BTCUSDT", parquet_root=parquet_root, grace_period_seconds=60.0, clock=clock
     )
 
-    # Two hours become due at once here: the seed's own (trivial) hour, and hour A -- the point
-    # under test is specifically that hour A now gets a candle at all (previously: never, since
-    # the sweep cursor would have moved past it during the outage with the wrong empty-hour gap).
-    assert [r.ts for r in written] == [candles_mod.ms_to_utc(HOUR0_MS), candles_mod.ms_to_utc(HOUR1_MS)]
-    hour_a = written[1]
+    # The point under test is specifically that hour A now gets a candle at all (previously:
+    # never, since the sweep cursor would have moved past it during the outage with the wrong
+    # empty-hour gap).
+    assert [r.ts for r in written] == [candles_mod.ms_to_utc(HOUR1_MS)]
+    hour_a = written[0]
     assert hour_a.n_trades == 1  # the late-arriving trade made it into its own hour's candle
     client.close()
     store.close()
@@ -1610,6 +1989,9 @@ def test_poll_trades_once_rewrites_an_already_written_candle_when_a_later_gap_ov
         ]
     )
     poll_trades_once(client, store, symbol="BTCUSDT", limit=500, poll_interval_seconds=5.0, clock=clock)
+    # m-C (fifth fix round): this test is about the rewrite-in-place mechanism, not m-C's own
+    # feed-evidence gate -- bypass it (see FAR_FUTURE_VERIFIED_MS) so hour A seals on this sweep.
+    store.record_verified_poll(symbol="BTCUSDT", poll_ts_ms=FAR_FUTURE_VERIFIED_MS)
     written = build_due_candles(
         store, symbol="BTCUSDT", parquet_root=parquet_root, grace_period_seconds=60.0, clock=clock
     )
@@ -1634,7 +2016,280 @@ def test_poll_trades_once_rewrites_an_already_written_candle_when_a_later_gap_ov
     hour_a_row = rows[candles_mod.ms_to_utc(HOUR1_MS)]
     assert hour_a_row["complete"] is False  # corrected
     assert hour_a_row["n_trades"] == 2  # ids 100 and 99999 both fall in hour A
+    # m-G (fifth fix round): the inline rewrite succeeded, so the gap row is marked rewritten --
+    # _recover_unrewritten_gaps has nothing left to redo on a later sweep.
+    assert store.unrewritten_overlap_gaps() == []
     client.close()
+    store.close()
+
+
+# ---------------------------------------------------------------------------------
+# m-C: hour due-ness needs actual feed evidence, not just the wall clock
+# ---------------------------------------------------------------------------------
+
+
+@respx.mock
+def test_build_due_candles_withholds_an_hour_with_a_frozen_response_until_a_trade_after_it_arrives(
+    tmp_path: Path,
+) -> None:
+    """m-C (fifth fix round), the exact scenario from the finding: responses are effectively
+    frozen (the same single trade, inside hour A) across several polls spanning hour A's close --
+    nowhere near the 2h quiet-market timeout -- so no candle must be written for hour A until a
+    poll actually returns a trade timestamped after its close."""
+    trade_in_hour_a = {"id": 1, "price": "100", "qty": "1", "time": HOUR0_MS + 55 * 60_000}  # 00:55
+    trade_after_hour_a = {"id": 2, "price": "100", "qty": "1", "time": HOUR1_MS + 1_000}
+    respx.get(TRADES_URL).mock(
+        side_effect=[
+            httpx.Response(200, json=[trade_in_hour_a]),  # poll at 00:55
+            httpx.Response(200, json=[trade_in_hour_a]),  # "frozen" repeat, 5 min later
+            httpx.Response(200, json=[trade_in_hour_a]),  # "frozen" repeat, 15 min after the first
+            httpx.Response(200, json=[trade_in_hour_a, trade_after_hour_a]),  # finally moves on
+        ]
+    )
+    clock = FakeClock(start=candles_mod.ms_to_utc(HOUR0_MS + 55 * 60_000))
+    client = make_client(clock)
+    store = RecorderStore(tmp_path / "trades.sqlite")
+    parquet_root = tmp_path / "parquet"
+
+    poll_trades_once(client, store, symbol="BTCUSDT", limit=500, poll_interval_seconds=5.0, clock=clock)
+    clock.advance(5 * 60.0)  # 01:00 -- hour A has just closed
+    poll_trades_once(client, store, symbol="BTCUSDT", limit=500, poll_interval_seconds=5.0, clock=clock)
+    no_candle_yet = build_due_candles(
+        store, symbol="BTCUSDT", parquet_root=parquet_root, grace_period_seconds=60.0, clock=clock
+    )
+    assert no_candle_yet == []
+
+    clock.advance(15 * 60.0)  # 01:15 -- 15 minutes past close, still frozen
+    poll_trades_once(client, store, symbol="BTCUSDT", limit=500, poll_interval_seconds=5.0, clock=clock)
+    still_no_candle = build_due_candles(
+        store, symbol="BTCUSDT", parquet_root=parquet_root, grace_period_seconds=60.0, clock=clock
+    )
+    assert still_no_candle == []  # 15 min << the 2h quiet-market timeout -- must not seal early
+
+    clock.advance(60.0)
+    poll_trades_once(client, store, symbol="BTCUSDT", limit=500, poll_interval_seconds=5.0, clock=clock)
+    written = build_due_candles(
+        store, symbol="BTCUSDT", parquet_root=parquet_root, grace_period_seconds=60.0, clock=clock
+    )
+
+    assert [r.ts for r in written] == [candles_mod.ms_to_utc(HOUR1_MS)]
+    assert written[0].n_trades == 1  # only the one trade that actually belongs to hour A
+    client.close()
+    store.close()
+
+
+def test_build_due_candles_quiet_market_timeout_seals_an_hour_with_no_trailing_trade(
+    tmp_path: Path,
+) -> None:
+    """m-C's other branch: on a genuinely quiet market, waiting forever for a trailing trade
+    would starve the sweep -- once the last verified poll is at least
+    ``quiet_hour_timeout_seconds`` past the hour's close, it is sealed anyway."""
+    store = RecorderStore(tmp_path / "trades.sqlite")
+    _seed_trade(store, 1, HOUR0_MS + 1_000)  # the only trade there will ever be
+    parquet_root = tmp_path / "parquet"
+
+    # Due by grace (61s > the 60s grace period) but nowhere near the 100s quiet-market timeout
+    # used here, and no trailing trade exists -- m-C must withhold it.
+    store.record_verified_poll(symbol="BTCUSDT", poll_ts_ms=HOUR1_MS + 61_000)
+    too_soon = build_due_candles(
+        store,
+        symbol="BTCUSDT",
+        parquet_root=parquet_root,
+        grace_period_seconds=60.0,
+        clock=FakeClock(start=candles_mod.ms_to_utc(HOUR1_MS + 61_000)),
+        quiet_hour_timeout_seconds=100.0,
+    )
+    assert too_soon == []
+
+    # Now past the quiet-market timeout -- sealed even with no trailing trade.
+    store.record_verified_poll(symbol="BTCUSDT", poll_ts_ms=HOUR1_MS + 101_000)
+    written = build_due_candles(
+        store,
+        symbol="BTCUSDT",
+        parquet_root=parquet_root,
+        grace_period_seconds=60.0,
+        clock=FakeClock(start=candles_mod.ms_to_utc(HOUR1_MS + 101_000)),
+        quiet_hour_timeout_seconds=100.0,
+    )
+    assert [r.ts for r in written] == [candles_mod.ms_to_utc(HOUR1_MS)]
+    store.close()
+
+
+# ---------------------------------------------------------------------------------
+# m-D: the sweep must not fall back to the raw wall clock with no verified poll at all
+# ---------------------------------------------------------------------------------
+
+
+def test_build_due_candles_never_sweeps_with_no_poll_ever_verified(tmp_path: Path) -> None:
+    """m-D (fifth fix round): a database only ever populated by direct seeding (or migrated from
+    a pre-v3 schema, whose ``recorder_state`` table starts out empty regardless of real history)
+    must not have its sweep fall back to the raw wall clock -- nothing is due until the first
+    poll is verified, no matter how far the clock has advanced."""
+    store = RecorderStore(tmp_path / "trades.sqlite")
+    _seed_trade(store, 1, HOUR0_MS + 1_000)
+    _seed_trade(store, 2, HOUR2_MS + 1_000)
+    parquet_root = tmp_path / "parquet"
+    clock = FakeClock(start=candles_mod.ms_to_utc(HOUR3_MS + 120_000))
+    assert store.verified_poll_ts_ms("BTCUSDT") is None
+
+    written = build_due_candles(
+        store, symbol="BTCUSDT", parquet_root=parquet_root, grace_period_seconds=60.0, clock=clock
+    )
+
+    assert written == []
+    assert store.all_gaps() == []  # in particular, no wrong no_trades_in_hour row for hour B
+    store.close()
+
+
+# ---------------------------------------------------------------------------------
+# NIT: an empty hour inside a known window_no_overlap gap is data loss, not a quiet market
+# ---------------------------------------------------------------------------------
+
+
+def test_build_due_candles_empty_hour_overlapping_a_known_gap_is_reason_window_no_overlap(
+    tmp_path: Path,
+) -> None:
+    """NIT (fifth fix round): an empty hour that sits inside an already-recorded
+    ``window_no_overlap`` gap's span is the data-loss case that very gap describes, not a quiet
+    market -- it must carry that same reason, not the misleading ``no_trades_in_hour``."""
+    store = RecorderStore(tmp_path / "trades.sqlite")
+    store.record_verified_poll(symbol="BTCUSDT", poll_ts_ms=FAR_FUTURE_VERIFIED_MS)
+    _seed_trade(store, 100, HOUR0_MS + 1_000)  # before the gap; hour A
+    _seed_trade(store, 200, HOUR2_MS + 1_000)  # after the gap; hour C -- hour B is empty
+    store.record_gap(detected_ts_ms=0, from_id=100, to_id=200, reason="window_no_overlap")
+    parquet_root = tmp_path / "parquet"
+    clock = FakeClock(start=candles_mod.ms_to_utc(HOUR3_MS + 120_000))
+
+    build_due_candles(
+        store, symbol="BTCUSDT", parquet_root=parquet_root, grace_period_seconds=60.0, clock=clock
+    )
+
+    gaps = store.all_gaps()
+    hour_b_gaps = [g for g in gaps if g[3] == HOUR2_MS]
+    assert len(hour_b_gaps) == 1
+    assert hour_b_gaps[0][2] == "window_no_overlap"  # not "no_trades_in_hour"
+    store.close()
+
+
+def test_build_due_candles_empty_hour_without_an_overlapping_gap_is_still_no_trades_in_hour(
+    tmp_path: Path,
+) -> None:
+    """The NIT fix must not relabel an ordinary quiet hour -- only one actually inside a recorded
+    window_no_overlap gap's span."""
+    store = RecorderStore(tmp_path / "trades.sqlite")
+    store.record_verified_poll(symbol="BTCUSDT", poll_ts_ms=FAR_FUTURE_VERIFIED_MS)
+    _seed_trade(store, 1, HOUR0_MS + 1_000)
+    _seed_trade(store, 2, HOUR2_MS + 1_000)  # hour B, in between, is empty -- no gap recorded
+    parquet_root = tmp_path / "parquet"
+    clock = FakeClock(start=candles_mod.ms_to_utc(HOUR3_MS + 120_000))
+
+    build_due_candles(
+        store, symbol="BTCUSDT", parquet_root=parquet_root, grace_period_seconds=60.0, clock=clock
+    )
+
+    gaps = store.all_gaps()
+    hour_b_gaps = [g for g in gaps if g[3] == HOUR2_MS]
+    assert len(hour_b_gaps) == 1
+    assert hour_b_gaps[0][2] == "no_trades_in_hour"
+    store.close()
+
+
+# ---------------------------------------------------------------------------------
+# m-G: schema v4 (gaps.rewritten) and self-healing an un-rewritten candle after a crash
+# ---------------------------------------------------------------------------------
+
+
+def test_build_due_candles_self_heals_an_unrewritten_gap_from_a_prior_crash(tmp_path: Path) -> None:
+    """m-G (fifth fix round): a crash between a poll's own transaction committing and its inline
+    candle-rewrite used to leave an already-written candle ``complete=True`` forever, with no
+    trace that it was ever supposed to be corrected. The ``gaps`` table's ``rewritten=0`` marker
+    lets ``build_due_candles`` retry this on its very next sweep."""
+    store = RecorderStore(tmp_path / "trades.sqlite")
+    store.record_verified_poll(symbol="BTCUSDT", poll_ts_ms=FAR_FUTURE_VERIFIED_MS)
+    _seed_trade(store, 100, HOUR0_MS + 1_000)
+    parquet_root = tmp_path / "parquet"
+    candles_mod.write_candle(
+        parquet_root,
+        "BTCUSDT",
+        candles_mod.TabdealCandleRecord(
+            ts=candles_mod.ms_to_utc(HOUR1_MS),
+            open=Decimal("1"),
+            high=Decimal("1"),
+            low=Decimal("1"),
+            close=Decimal("1"),
+            volume=Decimal("1"),
+            complete=True,
+            n_trades=1,
+        ),
+    )
+    _seed_trade(store, 50000, HOUR0_MS + 2_000)  # the "new" window's lowest id, also in hour A
+    # Simulates the crash: this row was committed by a poll's transaction, but the inline rewrite
+    # that should have followed it never ran -- rewritten stays at its default 0.
+    store.record_gap(detected_ts_ms=0, from_id=100, to_id=50000, reason="window_no_overlap")
+    assert store.unrewritten_overlap_gaps() == [(1, 100, 50000)]
+    clock = FakeClock(start=candles_mod.ms_to_utc(HOUR1_MS + 61_000))
+
+    build_due_candles(
+        store, symbol="BTCUSDT", parquet_root=parquet_root, grace_period_seconds=60.0, clock=clock
+    )
+
+    table = candles_mod._read_candles(parquet_root, "BTCUSDT")
+    rows = {row["ts"]: row for row in table.to_pylist()}
+    assert rows[candles_mod.ms_to_utc(HOUR1_MS)]["complete"] is False  # corrected on this sweep
+    assert rows[candles_mod.ms_to_utc(HOUR1_MS)]["n_trades"] == 2
+    assert store.unrewritten_overlap_gaps() == []  # marked rewritten -- won't be retried again
+    store.close()
+
+
+def test_recorder_store_migrates_a_v3_database_gains_rewritten_column_defaulting_to_zero(
+    tmp_path: Path,
+) -> None:
+    """m-G (fifth fix round, schema v4): a v3 database's ``gaps`` table predates the
+    ``rewritten`` column -- opening it must add ``rewritten INTEGER NOT NULL DEFAULT 0`` (not a
+    silently nullable column with no default), and every pre-existing gap row must read back as
+    ``rewritten=0`` (never confirmed rewritten, correctly re-processed by
+    ``_recover_unrewritten_gaps`` on the next sweep)."""
+    db_path = tmp_path / "v3.sqlite"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE trades (
+            trade_id INTEGER PRIMARY KEY, ts_ms INTEGER NOT NULL, price TEXT NOT NULL,
+            qty TEXT NOT NULL, is_buyer_maker INTEGER NOT NULL, recorded_ts_ms INTEGER NOT NULL
+        );
+        CREATE TABLE poll_log (
+            poll_ts_ms INTEGER NOT NULL, first_id INTEGER, last_id INTEGER,
+            n_trades INTEGER NOT NULL, saturated INTEGER NOT NULL, http_status INTEGER,
+            latency_ms REAL, window_span_seconds REAL, coverage_ratio REAL, n_items_received INTEGER
+        );
+        CREATE TABLE gaps (
+            detected_ts_ms INTEGER NOT NULL, from_id INTEGER, to_id INTEGER,
+            reason TEXT NOT NULL, hour_close_ms INTEGER
+        );
+        CREATE TABLE sweep_cursor (symbol TEXT PRIMARY KEY, last_swept_close_ms INTEGER NOT NULL);
+        CREATE TABLE recorder_state (symbol TEXT PRIMARY KEY, last_verified_poll_ts_ms INTEGER NOT NULL);
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE orderbook (
+            ts_ms INTEGER NOT NULL, best_bid TEXT, best_ask TEXT, spread_bps REAL,
+            depth_bid_01pct TEXT NOT NULL, depth_ask_01pct TEXT NOT NULL,
+            depth_bid_05pct TEXT NOT NULL, depth_ask_05pct TEXT NOT NULL,
+            depth_bid_1pct TEXT NOT NULL, depth_ask_1pct TEXT NOT NULL
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO gaps (detected_ts_ms, from_id, to_id, reason, hour_close_ms) "
+        "VALUES (1, 10, 20, 'window_no_overlap', NULL)"
+    )
+    conn.execute("PRAGMA user_version = 3")
+    conn.commit()
+    conn.close()
+
+    store = RecorderStore(db_path)  # must not raise
+
+    rows = store._conn.execute("SELECT rewritten FROM gaps").fetchall()
+    assert rows == [(0,)]
+    assert store.unrewritten_overlap_gaps() == [(1, 10, 20)]
     store.close()
 
 
@@ -1878,6 +2533,8 @@ def test_recorder_store_migrates_pre_v3_database_gains_recorder_state_and_meta_t
         {"poll_interval_seconds": 0.0},
         {"orderbook_interval_seconds": -5.0},
         {"grace_period_seconds": 0.0},
+        {"quiet_hour_timeout_seconds": 0.0},
+        {"quiet_hour_timeout_seconds": -1.0},
     ],
 )
 def test_recorder_settings_rejects_invalid_values(overrides: dict[str, Any]) -> None:
