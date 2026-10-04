@@ -198,11 +198,18 @@ Tabdeal has no kline endpoint, so 1h candles are built from polled public `/trad
   nothing" from "we received items and parsed none of them",
   `gaps(detected_ts_ms, from_id, to_id, reason, hour_close_ms)` — `hour_close_ms` identifies WHICH hour an
   empty-hour gap refers to, which G1b needs,
-  and `sweep_cursor` (how far the candle sweep has walked, so a trailing empty hour is not re-gapped on every
-  poll — see D-029).
+  `sweep_cursor` (how far the candle sweep has walked, so a trailing empty hour is not re-gapped on every
+  poll — see D-029), `recorder_state(symbol, last_verified_poll_ts_ms)` (the candle sweep never passes the
+  last poll that proved continuity or recorded a gap — D-038) and `meta(key, value)` (the symbol the database
+  belongs to; a different symbol is refused — D-038).
   The database carries `PRAGMA user_version` and migrates an older file in place by adding missing columns
   (D-035); it never silently runs against a schema it does not understand.
-- Dedupe by `trade_id` (primary key, `INSERT OR IGNORE`).
+- Dedupe by `trade_id` (primary key, `INSERT OR IGNORE`). All writes of one poll (trades, gap rows, poll log)
+  commit in a single `BEGIN IMMEDIATE` transaction (D-038).
+- **Trade ids are global across markets** (measured from the Turkey server, 2026-10-04 — D-037). Continuity is
+  therefore proven by **window overlap**: a poll is continuous iff its lowest returned id is ≤ the last stored
+  id. Otherwise a `window_no_overlap` gap is recorded and every hour it touches is `complete=False` (an
+  already-written candle is rewritten). Per-symbol id contiguity is meaningless and never checked.
 - **Saturation and data-loss risk (corrected, decision D-024 — provisional: observed from Parham's laptop, to be
   confirmed by the server probe).** Tabdeal's `/trades` appears to be a *recent trades*
   endpoint: it returns the most recent `limit` trades, so `count == limit` holds on essentially every poll
@@ -210,11 +217,12 @@ Tabdeal has no kline endpoint, so 1h candles are built from polled public `/trad
   **not** a gate criterion. The operational metrics are:
   * `coverage_ratio = window_span_seconds / poll_interval_seconds` — how much margin the returned window
     gives us. A poll is *at risk* when `coverage_ratio < 3`; that is what gets logged as a warning.
-  * actual data loss — the lowest returned trade id exceeds `last_stored_id + 1`. This is a real id gap and
-    already writes a `gaps` row.
+  * actual data loss — the returned window does not overlap what is stored (D-037). This writes a `gaps` row.
+  Measured from the Turkey server (2026-10-04): `limit=1000` is accepted and covers ~29 h of BTCUSDT trades, so
+  coverage is not the binding risk; the overlap rule is.
   `poll_log` therefore also stores `window_span_seconds` and `coverage_ratio`.
 - Candles are written to `data/parquet/klines/source=tabdeal/symbol=BTCUSDT/timeframe=1h/...` with the same
-  schema plus `complete BOOL` and `n_trades`. `complete=False` is driven by a real trade-id gap or an
+  schema plus `complete BOOL` and `n_trades`. `complete=False` is driven by a `window_no_overlap` gap or an
   empty-hour gap overlapping the bar — never by the uninformative `saturated` flag (D-024).
   Resampling uses `label='right', closed='right'`; an hour with no trades produces **no bar** and a gap row —
   never a forward-filled bar.
@@ -250,10 +258,13 @@ median bid/ask spread over ≥ 30 samples spread across ≥ 6 h is < 0.20 %; a s
 **G1a — Research data (Binance).** 1h/4h/1d for BTCUSDT and ETHUSDT from 2018-01-01 to `holdout_start`:
 every file checksum-verified, zero duplicate timestamps, zero out-of-order timestamps, and every missing
 bar classified (no `unknown` left); 4h/1d values reconcile with 1h resampling within 1e-9; the timestamp
-unit of every file is detected and normalised (see D-017).
+unit of every file is detected and normalised (see D-017). Source anomalies are handled per D-036.
+*Pending Parham (D-040), not yet in force:* how to treat reconciliation mismatches that sit in Binance's own
+files (see the phase 0–1 report). Until he decides, the criterion above applies unchanged.
 
 **G1b — Live data (Tabdeal).** The recorder has run ≥ 7 consecutive days with ≥ 99 % of hours complete,
-zero trade-id gaps, and `coverage_ratio ≥ 3` on every poll (D-024), and the Binance-vs-Tabdeal BTCUSDT basis
+zero trade-id gaps (*proposed wording, pending Parham — D-037:* zero `window_no_overlap` gaps, because per-symbol
+ids are never contiguous), and `coverage_ratio ≥ 3` on every poll (D-024), and the Binance-vs-Tabdeal BTCUSDT basis
 is measured (median and p95, in bps) over that window. G1a and G1b are decided separately: phase 2 may start once G1a passes (decision D-016).
 
 **G2 — Engine.** Truncation test passes exactly; a hand-computed 5-bar example matches the engine to the
@@ -318,6 +329,11 @@ drawdown exceeds the 95th percentile of the bootstrap distribution. Capital scal
 | D-033 | Secret redaction is **value-based**: the actual secret strings are registered and scrubbed from any rendered output, with the name/prefix patterns kept only as a second line of defence | a real Tabdeal key is a bare alphanumeric string, so pattern matching on `sk-`-style prefixes or `key=` shapes never catches it in a traceback |
 | D-034 | stdlib `logging` is routed through the structlog pipeline (`ProcessorFormatter`), plus a scrubbing `sys.excepthook` | silencing httpx was a point fix for one known leaker; phase 5 adds python-telegram-bot, which logs bot-token URLs |
 | D-035 | The recorder database carries `PRAGMA user_version` and an explicit migration path | `CREATE TABLE IF NOT EXISTS` silently skips new columns, which turned an existing database into a 5-second crash loop that the healthcheck could not see |
+| D-036 | Binance source anomalies are classified per row instead of aborting the file: `misaligned` (off-grid open), `empty_irregular` (irregular close, 0 trades) and `long` (closes after its label) are dropped; `short` (on-grid, ends early, has trades) is stored at the normal label and flagged. Anomalies persist in `_dataset.json`; a gap overlapping one is `exchange_outage`. File-level errors still abort | the real 2018-01 file aborted ingestion. A full scan (175,188 rows) found 60 irregular-duration rows and a 42-hour off-grid run (2018-02-09..11). Dropping or labelling at-or-after the real end is causal; nothing is filled or interpolated |
+| D-037 | Recorder continuity is proven by window overlap (lowest returned id ≤ last stored id), not by `first_id == last_stored_id + 1`; gap reason `window_no_overlap` | measured from the Turkey server on 2026-10-04 (curl to public `/trades`, limit 1000): BTCUSDT and ETHUSDT ids interleave in one global id space (median step 84 between consecutive BTCUSDT trades). The old rule would fire on every poll. **G1b wording change pending Parham** |
+| D-038 | Recorder hardening after review: one SQLite transaction per poll; the candle sweep never passes the last verified poll (`recorder_state`); a `meta` table pins the database to one symbol; recorder-level exponential backoff (cap 300 s) after 5 consecutive errors; the heartbeat carries `last_new_trade_ts_ms` and the healthcheck fails after 7200 s without a new trade | review MAJOR-1..3 and m3/m4/m6. 7200 s because the measured max gap between BTCUSDT trades on Tabdeal was 2120 s |
+| D-039 | **Proposed, pending Parham:** G1b's Binance-vs-Tabdeal basis needs Binance bars after `holdout_start`, which D-032 forbids downloading. Proposal: a separate live-comparison fetch (Binance REST, only the G1b window) into `data/live_compare/`, unreadable by the research loader and never used for strategy evaluation | the seal and G1b otherwise contradict each other (review m10) |
+| D-040 | **Open, pending Parham:** G1a reconciliation fails on exactly 3 timestamps (2021-01-21, 2021-04-23, 2022-04-13), volume only, identical in BTC and ETH and in both 4h and 1d — Binance's own files disagree; OHLC reconciles everywhere outside outages | §7 says criteria may never be relaxed after seeing data, so this is Parham's call, not the orchestrator's |
 
 ---
 
@@ -331,6 +347,6 @@ drawdown exceeds the 95th percentile of the bootstrap distribution. Capital scal
 5. **Server static IP** for the API-key whitelist.
 6. **`/trades` behaviour**: default and maximum `limit`, whether the window is id- or time-based — determines
    the recorder's polling interval.
-   *Partial, provisional:* from Parham's laptop it behaves as a recent-trades window (D-024). Still open until the
-   server probe confirms it and reports the maximum accepted `limit` and the window span.
+   *Answered from the Turkey server (2026-10-04, curl):* recent-trades window; `limit=1000` accepted (~29 h of
+   BTCUSDT); `time` in integer ms; ids global across markets (D-037). The full probe run will re-confirm.
 7. Whether CI should run on GitHub-hosted runners for a private repo (minutes cost) or a self-hosted runner.
