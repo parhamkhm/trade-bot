@@ -18,6 +18,8 @@
 !.env.example
 deploy/recorder.env
 !deploy/recorder.env.example
+*.pem
+*.key
 
 # --- VCS / editors / OS ---
 .git
@@ -26,6 +28,7 @@ deploy/recorder.env
 .idea
 .vscode
 .DS_Store
+Thumbs.db
 
 # --- Python environments / caches ---
 .venv
@@ -35,6 +38,7 @@ __pycache__
 .mypy_cache
 .ruff_cache
 .pytest_cache
+.hypothesis
 .coverage
 coverage.xml
 htmlcov
@@ -48,9 +52,12 @@ data
 *.sqlite
 *.sqlite3
 *.db
-research/reports
+research
 
 # --- Claude/agent scratch, docs not needed at runtime ---
 .claude
 docs
 KICKOFF.md
+
+# --- Tests are not needed in the runtime image ---
+tests
