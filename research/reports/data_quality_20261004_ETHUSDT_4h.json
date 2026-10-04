@@ -1,0 +1,1248 @@
+{
+  "source": "binance",
+  "symbol": "ETHUSDT",
+  "timeframe": "4h",
+  "rows": 16963,
+  "first_ts": "2018-01-01T04:00:00Z",
+  "last_ts": "2025-09-30T20:00:00Z",
+  "coverage_by_month": {
+    "2018-01": {
+      "expected": 186,
+      "actual": 185,
+      "coverage": 0.9946236559139785
+    },
+    "2018-02": {
+      "expected": 168,
+      "actual": 161,
+      "coverage": 0.9583333333333334
+    },
+    "2018-03": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2018-04": {
+      "expected": 180,
+      "actual": 180,
+      "coverage": 1.0
+    },
+    "2018-05": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2018-06": {
+      "expected": 180,
+      "actual": 178,
+      "coverage": 0.9888888888888889
+    },
+    "2018-07": {
+      "expected": 186,
+      "actual": 185,
+      "coverage": 0.9946236559139785
+    },
+    "2018-08": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2018-09": {
+      "expected": 180,
+      "actual": 180,
+      "coverage": 1.0
+    },
+    "2018-10": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2018-11": {
+      "expected": 180,
+      "actual": 179,
+      "coverage": 0.9944444444444445
+    },
+    "2018-12": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2019-01": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2019-02": {
+      "expected": 168,
+      "actual": 168,
+      "coverage": 1.0
+    },
+    "2019-03": {
+      "expected": 186,
+      "actual": 185,
+      "coverage": 0.9946236559139785
+    },
+    "2019-04": {
+      "expected": 180,
+      "actual": 180,
+      "coverage": 1.0
+    },
+    "2019-05": {
+      "expected": 186,
+      "actual": 184,
+      "coverage": 0.989247311827957
+    },
+    "2019-06": {
+      "expected": 180,
+      "actual": 180,
+      "coverage": 1.0
+    },
+    "2019-07": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2019-08": {
+      "expected": 186,
+      "actual": 185,
+      "coverage": 0.9946236559139785
+    },
+    "2019-09": {
+      "expected": 180,
+      "actual": 180,
+      "coverage": 1.0
+    },
+    "2019-10": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2019-11": {
+      "expected": 180,
+      "actual": 180,
+      "coverage": 1.0
+    },
+    "2019-12": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2020-01": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2020-02": {
+      "expected": 174,
+      "actual": 173,
+      "coverage": 0.9942528735632183
+    },
+    "2020-03": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2020-04": {
+      "expected": 180,
+      "actual": 180,
+      "coverage": 1.0
+    },
+    "2020-05": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2020-06": {
+      "expected": 180,
+      "actual": 180,
+      "coverage": 1.0
+    },
+    "2020-07": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2020-08": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2020-09": {
+      "expected": 180,
+      "actual": 180,
+      "coverage": 1.0
+    },
+    "2020-10": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2020-11": {
+      "expected": 180,
+      "actual": 180,
+      "coverage": 1.0
+    },
+    "2020-12": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2021-01": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2021-02": {
+      "expected": 168,
+      "actual": 168,
+      "coverage": 1.0
+    },
+    "2021-03": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2021-04": {
+      "expected": 180,
+      "actual": 180,
+      "coverage": 1.0
+    },
+    "2021-05": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2021-06": {
+      "expected": 180,
+      "actual": 180,
+      "coverage": 1.0
+    },
+    "2021-07": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2021-08": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2021-09": {
+      "expected": 180,
+      "actual": 180,
+      "coverage": 1.0
+    },
+    "2021-10": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2021-11": {
+      "expected": 180,
+      "actual": 180,
+      "coverage": 1.0
+    },
+    "2021-12": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2022-01": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2022-02": {
+      "expected": 168,
+      "actual": 168,
+      "coverage": 1.0
+    },
+    "2022-03": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2022-04": {
+      "expected": 180,
+      "actual": 180,
+      "coverage": 1.0
+    },
+    "2022-05": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2022-06": {
+      "expected": 180,
+      "actual": 180,
+      "coverage": 1.0
+    },
+    "2022-07": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2022-08": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2022-09": {
+      "expected": 180,
+      "actual": 180,
+      "coverage": 1.0
+    },
+    "2022-10": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2022-11": {
+      "expected": 180,
+      "actual": 180,
+      "coverage": 1.0
+    },
+    "2022-12": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2023-01": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2023-02": {
+      "expected": 168,
+      "actual": 168,
+      "coverage": 1.0
+    },
+    "2023-03": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2023-04": {
+      "expected": 180,
+      "actual": 180,
+      "coverage": 1.0
+    },
+    "2023-05": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2023-06": {
+      "expected": 180,
+      "actual": 180,
+      "coverage": 1.0
+    },
+    "2023-07": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2023-08": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2023-09": {
+      "expected": 180,
+      "actual": 180,
+      "coverage": 1.0
+    },
+    "2023-10": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2023-11": {
+      "expected": 180,
+      "actual": 180,
+      "coverage": 1.0
+    },
+    "2023-12": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2024-01": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2024-02": {
+      "expected": 174,
+      "actual": 174,
+      "coverage": 1.0
+    },
+    "2024-03": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2024-04": {
+      "expected": 180,
+      "actual": 180,
+      "coverage": 1.0
+    },
+    "2024-05": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2024-06": {
+      "expected": 180,
+      "actual": 180,
+      "coverage": 1.0
+    },
+    "2024-07": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2024-08": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2024-09": {
+      "expected": 180,
+      "actual": 180,
+      "coverage": 1.0
+    },
+    "2024-10": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2024-11": {
+      "expected": 180,
+      "actual": 180,
+      "coverage": 1.0
+    },
+    "2024-12": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2025-01": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2025-02": {
+      "expected": 168,
+      "actual": 168,
+      "coverage": 1.0
+    },
+    "2025-03": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2025-04": {
+      "expected": 180,
+      "actual": 180,
+      "coverage": 1.0
+    },
+    "2025-05": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2025-06": {
+      "expected": 180,
+      "actual": 180,
+      "coverage": 1.0
+    },
+    "2025-07": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2025-08": {
+      "expected": 186,
+      "actual": 186,
+      "coverage": 1.0
+    },
+    "2025-09": {
+      "expected": 180,
+      "actual": 180,
+      "coverage": 1.0
+    }
+  },
+  "duplicate_timestamps": [],
+  "out_of_order": [],
+  "gaps": [
+    {
+      "from": "2018-02-08T04:00:00Z",
+      "to": "2018-02-09T12:00:00Z",
+      "missing_bars": 7,
+      "classification": "unknown"
+    },
+    {
+      "from": "2018-06-26T04:00:00Z",
+      "to": "2018-06-26T16:00:00Z",
+      "missing_bars": 2,
+      "classification": "unknown"
+    },
+    {
+      "from": "2018-07-04T04:00:00Z",
+      "to": "2018-07-04T12:00:00Z",
+      "missing_bars": 1,
+      "classification": "unknown"
+    },
+    {
+      "from": "2018-11-14T04:00:00Z",
+      "to": "2018-11-14T12:00:00Z",
+      "missing_bars": 1,
+      "classification": "unknown"
+    },
+    {
+      "from": "2019-03-12T04:00:00Z",
+      "to": "2019-03-12T12:00:00Z",
+      "missing_bars": 1,
+      "classification": "unknown"
+    },
+    {
+      "from": "2019-05-15T04:00:00Z",
+      "to": "2019-05-15T16:00:00Z",
+      "missing_bars": 2,
+      "classification": "unknown"
+    },
+    {
+      "from": "2019-08-15T04:00:00Z",
+      "to": "2019-08-15T12:00:00Z",
+      "missing_bars": 1,
+      "classification": "unknown"
+    },
+    {
+      "from": "2020-02-19T12:00:00Z",
+      "to": "2020-02-19T20:00:00Z",
+      "missing_bars": 1,
+      "classification": "unknown"
+    }
+  ],
+  "zero_volume_bars": [],
+  "high_eq_low_bars": [],
+  "return_outliers": [
+    {
+      "ts": "2020-03-12T12:00:00Z",
+      "pct_return": -0.20406736204183906
+    },
+    {
+      "ts": "2020-03-13T00:00:00Z",
+      "pct_return": -0.2207848522078486
+    }
+  ],
+  "source_anomalies": [
+    {
+      "symbol": "ETHUSDT",
+      "timeframe": "4h",
+      "raw_open": "2018-01-04T00:00:00Z",
+      "raw_close": "2018-01-04T03:00:14.849000Z",
+      "duration_seconds": 10814.849,
+      "n_trades": 18649,
+      "volume": "13290.75778000",
+      "classification": "short",
+      "action": "stored_flagged"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "timeframe": "4h",
+      "raw_open": "2018-06-26T00:00:00Z",
+      "raw_close": "2018-06-26T01:59:59.999000Z",
+      "duration_seconds": 7199.999,
+      "n_trades": 9407,
+      "volume": "9200.14356000",
+      "classification": "short",
+      "action": "stored_flagged"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "timeframe": "4h",
+      "raw_open": "2018-07-04T00:00:00Z",
+      "raw_close": "2018-07-04T00:22:25.562000Z",
+      "duration_seconds": 1345.562,
+      "n_trades": 2362,
+      "volume": "2287.10440000",
+      "classification": "short",
+      "action": "stored_flagged"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "timeframe": "4h",
+      "raw_open": "2018-10-19T04:00:00Z",
+      "raw_close": "2018-10-19T05:59:59.999000Z",
+      "duration_seconds": 7199.999,
+      "n_trades": 10023,
+      "volume": "21405.69848000",
+      "classification": "short",
+      "action": "stored_flagged"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "timeframe": "4h",
+      "raw_open": "2018-11-14T00:00:00Z",
+      "raw_close": "2018-11-14T01:59:59.999000Z",
+      "duration_seconds": 7199.999,
+      "n_trades": 3861,
+      "volume": "9896.16004000",
+      "classification": "short",
+      "action": "stored_flagged"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "timeframe": "4h",
+      "raw_open": "2019-03-12T00:00:00Z",
+      "raw_close": "2019-03-12T01:59:59.999000Z",
+      "duration_seconds": 7199.999,
+      "n_trades": 8985,
+      "volume": "26092.49140000",
+      "classification": "short",
+      "action": "stored_flagged"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "timeframe": "4h",
+      "raw_open": "2019-05-15T00:00:00Z",
+      "raw_close": "2019-05-15T02:59:59.999000Z",
+      "duration_seconds": 10799.999,
+      "n_trades": 34884,
+      "volume": "124534.23021000",
+      "classification": "short",
+      "action": "stored_flagged"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "timeframe": "4h",
+      "raw_open": "2019-08-15T00:00:00Z",
+      "raw_close": "2019-08-15T01:59:59.999000Z",
+      "duration_seconds": 7199.999,
+      "n_trades": 13384,
+      "volume": "27285.50284000",
+      "classification": "short",
+      "action": "stored_flagged"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "timeframe": "4h",
+      "raw_open": "2019-11-13T00:00:00Z",
+      "raw_close": "2019-11-13T01:59:59.999000Z",
+      "duration_seconds": 7199.999,
+      "n_trades": 7616,
+      "volume": "13976.29838000",
+      "classification": "short",
+      "action": "stored_flagged"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "timeframe": "4h",
+      "raw_open": "2020-02-19T08:00:00Z",
+      "raw_close": "2020-02-19T11:35:32.298000Z",
+      "duration_seconds": 12932.298,
+      "n_trades": 42208,
+      "volume": "100503.93617000",
+      "classification": "short",
+      "action": "stored_flagged"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "timeframe": "4h",
+      "raw_open": "2020-04-25T00:00:00Z",
+      "raw_close": "2020-04-25T01:59:59.999000Z",
+      "duration_seconds": 7199.999,
+      "n_trades": 12590,
+      "volume": "44191.29534000",
+      "classification": "short",
+      "action": "stored_flagged"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "timeframe": "4h",
+      "raw_open": "2020-06-28T00:00:00Z",
+      "raw_close": "2020-06-28T01:59:59.999000Z",
+      "duration_seconds": 7199.999,
+      "n_trades": 13464,
+      "volume": "42088.08093000",
+      "classification": "short",
+      "action": "stored_flagged"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "timeframe": "4h",
+      "raw_open": "2020-12-21T12:00:00Z",
+      "raw_close": "2020-12-21T13:47:20.528000Z",
+      "duration_seconds": 6440.528,
+      "n_trades": 80391,
+      "volume": "144433.84092000",
+      "classification": "short",
+      "action": "stored_flagged"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "timeframe": "4h",
+      "raw_open": "2021-02-11T00:00:00Z",
+      "raw_close": "2021-02-11T03:40:55.829000Z",
+      "duration_seconds": 13255.829,
+      "n_trades": 86673,
+      "volume": "78669.51899000",
+      "classification": "short",
+      "action": "stored_flagged"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "timeframe": "4h",
+      "raw_open": "2021-04-20T00:00:00Z",
+      "raw_close": "2021-04-20T01:59:59.999000Z",
+      "duration_seconds": 7199.999,
+      "n_trades": 144549,
+      "volume": "125491.90313000",
+      "classification": "short",
+      "action": "stored_flagged"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "timeframe": "4h",
+      "raw_open": "2021-04-25T04:00:00Z",
+      "raw_close": "2021-04-25T04:00:59.271000Z",
+      "duration_seconds": 59.271,
+      "n_trades": 412,
+      "volume": "161.74877000",
+      "classification": "short",
+      "action": "stored_flagged"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "timeframe": "4h",
+      "raw_open": "2021-08-13T00:00:00Z",
+      "raw_close": "2021-08-13T01:59:59Z",
+      "duration_seconds": 7199.0,
+      "n_trades": 92871,
+      "volume": "50008.14934000",
+      "classification": "short",
+      "action": "stored_flagged"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "timeframe": "4h",
+      "raw_open": "2021-09-29T04:00:00Z",
+      "raw_close": "2021-09-29T06:59:59.999000Z",
+      "duration_seconds": 10799.999,
+      "n_trades": 87529,
+      "volume": "55910.93030000",
+      "classification": "short",
+      "action": "stored_flagged"
+    }
+  ],
+  "reconciliation": [
+    {
+      "ts": "2018-02-09T12:00:00Z",
+      "column": "open",
+      "resampled": NaN,
+      "stored": 781.66,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-09T12:00:00Z",
+      "column": "high",
+      "resampled": NaN,
+      "stored": 843.0,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-09T12:00:00Z",
+      "column": "low",
+      "resampled": NaN,
+      "stored": 781.66,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-09T12:00:00Z",
+      "column": "close",
+      "resampled": NaN,
+      "stored": 834.0,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-09T12:00:00Z",
+      "column": "volume",
+      "resampled": 0.0,
+      "stored": 17579.47185,
+      "diff": 17579.47185,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-09T16:00:00Z",
+      "column": "open",
+      "resampled": NaN,
+      "stored": 833.15,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-09T16:00:00Z",
+      "column": "high",
+      "resampled": NaN,
+      "stored": 862.0,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-09T16:00:00Z",
+      "column": "low",
+      "resampled": NaN,
+      "stored": 823.99,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-09T16:00:00Z",
+      "column": "close",
+      "resampled": NaN,
+      "stored": 845.38,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-09T16:00:00Z",
+      "column": "volume",
+      "resampled": 0.0,
+      "stored": 30018.10659,
+      "diff": 30018.10659,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-09T20:00:00Z",
+      "column": "open",
+      "resampled": NaN,
+      "stored": 845.02,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-09T20:00:00Z",
+      "column": "high",
+      "resampled": NaN,
+      "stored": 882.2,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-09T20:00:00Z",
+      "column": "low",
+      "resampled": NaN,
+      "stored": 843.29,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-09T20:00:00Z",
+      "column": "close",
+      "resampled": NaN,
+      "stored": 872.44,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-09T20:00:00Z",
+      "column": "volume",
+      "resampled": 0.0,
+      "stored": 25462.94565,
+      "diff": 25462.94565,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-10T00:00:00Z",
+      "column": "open",
+      "resampled": NaN,
+      "stored": 872.21,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-10T00:00:00Z",
+      "column": "high",
+      "resampled": NaN,
+      "stored": 882.0,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-10T00:00:00Z",
+      "column": "low",
+      "resampled": NaN,
+      "stored": 850.12,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-10T00:00:00Z",
+      "column": "close",
+      "resampled": NaN,
+      "stored": 877.0,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-10T00:00:00Z",
+      "column": "volume",
+      "resampled": 0.0,
+      "stored": 22387.1488,
+      "diff": 22387.1488,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-10T04:00:00Z",
+      "column": "open",
+      "resampled": NaN,
+      "stored": 876.3,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-10T04:00:00Z",
+      "column": "high",
+      "resampled": NaN,
+      "stored": 900.0,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-10T04:00:00Z",
+      "column": "low",
+      "resampled": NaN,
+      "stored": 867.55,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-10T04:00:00Z",
+      "column": "close",
+      "resampled": NaN,
+      "stored": 891.22,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-10T04:00:00Z",
+      "column": "volume",
+      "resampled": 0.0,
+      "stored": 33024.91285,
+      "diff": 33024.91285,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-10T08:00:00Z",
+      "column": "open",
+      "resampled": NaN,
+      "stored": 891.87,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-10T08:00:00Z",
+      "column": "high",
+      "resampled": NaN,
+      "stored": 911.2,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-10T08:00:00Z",
+      "column": "low",
+      "resampled": NaN,
+      "stored": 878.19,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-10T08:00:00Z",
+      "column": "close",
+      "resampled": NaN,
+      "stored": 897.02,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-10T08:00:00Z",
+      "column": "volume",
+      "resampled": 0.0,
+      "stored": 27666.93678,
+      "diff": 27666.93678,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-10T12:00:00Z",
+      "column": "open",
+      "resampled": NaN,
+      "stored": 897.26,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-10T12:00:00Z",
+      "column": "high",
+      "resampled": NaN,
+      "stored": 897.26,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-10T12:00:00Z",
+      "column": "low",
+      "resampled": NaN,
+      "stored": 851.03,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-10T12:00:00Z",
+      "column": "close",
+      "resampled": NaN,
+      "stored": 869.73,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-10T12:00:00Z",
+      "column": "volume",
+      "resampled": 0.0,
+      "stored": 47103.55384,
+      "diff": 47103.55384,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-10T16:00:00Z",
+      "column": "open",
+      "resampled": NaN,
+      "stored": 870.0,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-10T16:00:00Z",
+      "column": "high",
+      "resampled": NaN,
+      "stored": 884.98,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-10T16:00:00Z",
+      "column": "low",
+      "resampled": NaN,
+      "stored": 825.0,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-10T16:00:00Z",
+      "column": "close",
+      "resampled": NaN,
+      "stored": 829.21,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-10T16:00:00Z",
+      "column": "volume",
+      "resampled": 0.0,
+      "stored": 36958.12125,
+      "diff": 36958.12125,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-10T20:00:00Z",
+      "column": "open",
+      "resampled": NaN,
+      "stored": 829.97,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-10T20:00:00Z",
+      "column": "high",
+      "resampled": NaN,
+      "stored": 848.0,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-10T20:00:00Z",
+      "column": "low",
+      "resampled": NaN,
+      "stored": 800.0,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-10T20:00:00Z",
+      "column": "close",
+      "resampled": NaN,
+      "stored": 840.67,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-10T20:00:00Z",
+      "column": "volume",
+      "resampled": 0.0,
+      "stored": 42202.58759,
+      "diff": 42202.58759,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-11T00:00:00Z",
+      "column": "open",
+      "resampled": NaN,
+      "stored": 840.72,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-11T00:00:00Z",
+      "column": "high",
+      "resampled": NaN,
+      "stored": 854.99,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-11T00:00:00Z",
+      "column": "low",
+      "resampled": NaN,
+      "stored": 810.02,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-11T00:00:00Z",
+      "column": "close",
+      "resampled": NaN,
+      "stored": 851.15,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-11T00:00:00Z",
+      "column": "volume",
+      "resampled": 0.0,
+      "stored": 27861.95537,
+      "diff": 27861.95537,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-11T04:00:00Z",
+      "column": "open",
+      "resampled": NaN,
+      "stored": 851.15,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-11T04:00:00Z",
+      "column": "high",
+      "resampled": NaN,
+      "stored": 851.93,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-11T04:00:00Z",
+      "column": "low",
+      "resampled": NaN,
+      "stored": 794.01,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-11T04:00:00Z",
+      "column": "close",
+      "resampled": NaN,
+      "stored": 796.58,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-11T04:00:00Z",
+      "column": "volume",
+      "resampled": 0.0,
+      "stored": 33965.00941,
+      "diff": 33965.00941,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-11T08:00:00Z",
+      "column": "open",
+      "resampled": 796.98,
+      "stored": 796.97,
+      "diff": 0.009999999999990905,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-11T08:00:00Z",
+      "column": "volume",
+      "resampled": 33351.29115,
+      "stored": 33355.17166,
+      "diff": 3.880510000002687,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2020-12-21T16:00:00Z",
+      "column": "high",
+      "resampled": 608.82,
+      "stored": 613.29,
+      "diff": 4.469999999999914,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2020-12-21T16:00:00Z",
+      "column": "close",
+      "resampled": 608.31,
+      "stored": 610.45,
+      "diff": 2.1400000000001,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2020-12-21T16:00:00Z",
+      "column": "volume",
+      "resampled": 135653.05758,
+      "stored": 144433.84092,
+      "diff": 8780.783339999994,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2021-01-21T12:00:00Z",
+      "column": "volume",
+      "resampled": 541006.14541,
+      "stored": 484962.37608,
+      "diff": 56043.76932999998,
+      "in_outage_window": false
+    },
+    {
+      "ts": "2021-04-23T04:00:00Z",
+      "column": "volume",
+      "resampled": 733833.47508,
+      "stored": 735231.27455,
+      "diff": 1397.799469999969,
+      "in_outage_window": false
+    },
+    {
+      "ts": "2022-04-13T08:00:00Z",
+      "column": "volume",
+      "resampled": 44627.98,
+      "stored": 44629.0454,
+      "diff": 1.0653999999994994,
+      "in_outage_window": false
+    }
+  ],
+  "reconciliation_total_mismatches": 63,
+  "reconciliation_mismatches_outside_outages": 3,
+  "unclassified_gap_count": 8
+}

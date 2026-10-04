@@ -1,0 +1,620 @@
+{
+  "source": "binance",
+  "symbol": "ETHUSDT",
+  "timeframe": "1d",
+  "rows": 2829,
+  "first_ts": "2018-01-02T00:00:00Z",
+  "last_ts": "2025-09-30T00:00:00Z",
+  "coverage_by_month": {
+    "2018-01": {
+      "expected": 31,
+      "actual": 30,
+      "coverage": 0.967741935483871
+    },
+    "2018-02": {
+      "expected": 28,
+      "actual": 28,
+      "coverage": 1.0
+    },
+    "2018-03": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2018-04": {
+      "expected": 30,
+      "actual": 30,
+      "coverage": 1.0
+    },
+    "2018-05": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2018-06": {
+      "expected": 30,
+      "actual": 30,
+      "coverage": 1.0
+    },
+    "2018-07": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2018-08": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2018-09": {
+      "expected": 30,
+      "actual": 30,
+      "coverage": 1.0
+    },
+    "2018-10": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2018-11": {
+      "expected": 30,
+      "actual": 30,
+      "coverage": 1.0
+    },
+    "2018-12": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2019-01": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2019-02": {
+      "expected": 28,
+      "actual": 28,
+      "coverage": 1.0
+    },
+    "2019-03": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2019-04": {
+      "expected": 30,
+      "actual": 30,
+      "coverage": 1.0
+    },
+    "2019-05": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2019-06": {
+      "expected": 30,
+      "actual": 30,
+      "coverage": 1.0
+    },
+    "2019-07": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2019-08": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2019-09": {
+      "expected": 30,
+      "actual": 30,
+      "coverage": 1.0
+    },
+    "2019-10": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2019-11": {
+      "expected": 30,
+      "actual": 30,
+      "coverage": 1.0
+    },
+    "2019-12": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2020-01": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2020-02": {
+      "expected": 29,
+      "actual": 29,
+      "coverage": 1.0
+    },
+    "2020-03": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2020-04": {
+      "expected": 30,
+      "actual": 30,
+      "coverage": 1.0
+    },
+    "2020-05": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2020-06": {
+      "expected": 30,
+      "actual": 30,
+      "coverage": 1.0
+    },
+    "2020-07": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2020-08": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2020-09": {
+      "expected": 30,
+      "actual": 30,
+      "coverage": 1.0
+    },
+    "2020-10": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2020-11": {
+      "expected": 30,
+      "actual": 30,
+      "coverage": 1.0
+    },
+    "2020-12": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2021-01": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2021-02": {
+      "expected": 28,
+      "actual": 28,
+      "coverage": 1.0
+    },
+    "2021-03": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2021-04": {
+      "expected": 30,
+      "actual": 30,
+      "coverage": 1.0
+    },
+    "2021-05": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2021-06": {
+      "expected": 30,
+      "actual": 30,
+      "coverage": 1.0
+    },
+    "2021-07": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2021-08": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2021-09": {
+      "expected": 30,
+      "actual": 30,
+      "coverage": 1.0
+    },
+    "2021-10": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2021-11": {
+      "expected": 30,
+      "actual": 30,
+      "coverage": 1.0
+    },
+    "2021-12": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2022-01": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2022-02": {
+      "expected": 28,
+      "actual": 28,
+      "coverage": 1.0
+    },
+    "2022-03": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2022-04": {
+      "expected": 30,
+      "actual": 30,
+      "coverage": 1.0
+    },
+    "2022-05": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2022-06": {
+      "expected": 30,
+      "actual": 30,
+      "coverage": 1.0
+    },
+    "2022-07": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2022-08": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2022-09": {
+      "expected": 30,
+      "actual": 30,
+      "coverage": 1.0
+    },
+    "2022-10": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2022-11": {
+      "expected": 30,
+      "actual": 30,
+      "coverage": 1.0
+    },
+    "2022-12": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2023-01": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2023-02": {
+      "expected": 28,
+      "actual": 28,
+      "coverage": 1.0
+    },
+    "2023-03": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2023-04": {
+      "expected": 30,
+      "actual": 30,
+      "coverage": 1.0
+    },
+    "2023-05": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2023-06": {
+      "expected": 30,
+      "actual": 30,
+      "coverage": 1.0
+    },
+    "2023-07": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2023-08": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2023-09": {
+      "expected": 30,
+      "actual": 30,
+      "coverage": 1.0
+    },
+    "2023-10": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2023-11": {
+      "expected": 30,
+      "actual": 30,
+      "coverage": 1.0
+    },
+    "2023-12": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2024-01": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2024-02": {
+      "expected": 29,
+      "actual": 29,
+      "coverage": 1.0
+    },
+    "2024-03": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2024-04": {
+      "expected": 30,
+      "actual": 30,
+      "coverage": 1.0
+    },
+    "2024-05": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2024-06": {
+      "expected": 30,
+      "actual": 30,
+      "coverage": 1.0
+    },
+    "2024-07": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2024-08": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2024-09": {
+      "expected": 30,
+      "actual": 30,
+      "coverage": 1.0
+    },
+    "2024-10": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2024-11": {
+      "expected": 30,
+      "actual": 30,
+      "coverage": 1.0
+    },
+    "2024-12": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2025-01": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2025-02": {
+      "expected": 28,
+      "actual": 28,
+      "coverage": 1.0
+    },
+    "2025-03": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2025-04": {
+      "expected": 30,
+      "actual": 30,
+      "coverage": 1.0
+    },
+    "2025-05": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2025-06": {
+      "expected": 30,
+      "actual": 30,
+      "coverage": 1.0
+    },
+    "2025-07": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2025-08": {
+      "expected": 31,
+      "actual": 31,
+      "coverage": 1.0
+    },
+    "2025-09": {
+      "expected": 30,
+      "actual": 30,
+      "coverage": 1.0
+    }
+  },
+  "duplicate_timestamps": [],
+  "out_of_order": [],
+  "gaps": [],
+  "zero_volume_bars": [],
+  "high_eq_low_bars": [],
+  "return_outliers": [
+    {
+      "ts": "2020-03-13T00:00:00Z",
+      "pct_return": -0.44596886079852016
+    }
+  ],
+  "source_anomalies": [],
+  "reconciliation": [
+    {
+      "ts": "2018-02-10T00:00:00Z",
+      "column": "open",
+      "resampled": NaN,
+      "stored": 781.66,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-10T00:00:00Z",
+      "column": "high",
+      "resampled": NaN,
+      "stored": 882.2,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-10T00:00:00Z",
+      "column": "low",
+      "resampled": NaN,
+      "stored": 781.66,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-10T00:00:00Z",
+      "column": "close",
+      "resampled": NaN,
+      "stored": 877.0,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-10T00:00:00Z",
+      "column": "volume",
+      "resampled": 0.0,
+      "stored": 95447.67289,
+      "diff": 95447.67289,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-11T00:00:00Z",
+      "column": "open",
+      "resampled": NaN,
+      "stored": 876.3,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-11T00:00:00Z",
+      "column": "high",
+      "resampled": NaN,
+      "stored": 911.2,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-11T00:00:00Z",
+      "column": "low",
+      "resampled": NaN,
+      "stored": 800.0,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-11T00:00:00Z",
+      "column": "close",
+      "resampled": NaN,
+      "stored": 851.15,
+      "diff": NaN,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-11T00:00:00Z",
+      "column": "volume",
+      "resampled": 0.0,
+      "stored": 214818.06768,
+      "diff": 214818.06768,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-12T00:00:00Z",
+      "column": "open",
+      "resampled": 796.98,
+      "stored": 851.15,
+      "diff": 54.16999999999996,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2018-02-12T00:00:00Z",
+      "column": "volume",
+      "resampled": 155354.51808,
+      "stored": 189323.408,
+      "diff": 33968.88991999999,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2020-12-22T00:00:00Z",
+      "column": "volume",
+      "resampled": 834470.38231,
+      "stored": 843251.16565,
+      "diff": 8780.783339999965,
+      "in_outage_window": true
+    },
+    {
+      "ts": "2021-01-22T00:00:00Z",
+      "column": "volume",
+      "resampled": 2310208.57298,
+      "stored": 2254164.80365,
+      "diff": 56043.76933000004,
+      "in_outage_window": false
+    },
+    {
+      "ts": "2021-04-24T00:00:00Z",
+      "column": "volume",
+      "resampled": 2530844.64238,
+      "stored": 2532242.44185,
+      "diff": 1397.799469999969,
+      "in_outage_window": false
+    },
+    {
+      "ts": "2022-04-14T00:00:00Z",
+      "column": "volume",
+      "resampled": 419100.4286,
+      "stored": 419101.494,
+      "diff": 1.0654000000213273,
+      "in_outage_window": false
+    }
+  ],
+  "reconciliation_total_mismatches": 16,
+  "reconciliation_mismatches_outside_outages": 3,
+  "unclassified_gap_count": 0
+}
