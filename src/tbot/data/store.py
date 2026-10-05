@@ -111,8 +111,12 @@ class GapRecord:
     ``"anomaly_overlap"`` (a dropped source row's raw window overlaps the missing-bar window),
     ``"after_short_bar"`` (the gap starts right at a stored ``short`` bar's close label),
     ``"cross_symbol"`` (the exact same window is also a gap in another configured symbol's
-    series), or ``"manual"`` (a human recorded this directly, e.g. by editing the sidecar).
-    ``None`` whenever ``classification == "unknown"`` -- the two travel together.
+    series), ``"manual"`` (a human recorded this directly, e.g. by editing the sidecar -- must be
+    set explicitly; see ``from_dict``), or ``"legacy"`` (a non-``unknown`` classification loaded
+    with no ``classified_by`` at all -- an old sidecar written before this field existed, NOT
+    necessarily a human's own classification; ``_classify_fresh_gaps`` re-checks these against the
+    current D-042 rules rather than trusting them forever). ``None`` whenever ``classification ==
+    "unknown"`` -- the two travel together.
     """
 
     from_ts: datetime
@@ -137,14 +141,17 @@ class GapRecord:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> GapRecord:
         classification = str(data.get("classification", "unknown"))
-        # A sidecar hand-edited by a human (or written before this field existed) carries a
-        # non-"unknown" classification with no "classified_by" key at all -- that silence is
-        # itself the signal that no automated rule produced it, so it is stamped "manual" on
-        # load rather than left `None` (which this module reserves for "classification is
-        # unknown", see the class docstring).
+        # MINOR-4 (sixth fix round, amends m-J): a non-"unknown" classification with no
+        # "classified_by" key at all is stamped "legacy", not "manual" -- that silence only
+        # proves no CURRENT rule's name was recorded for it; it is equally consistent with an old
+        # sidecar written before this field existed (most likely) as with a human's own edit, and
+        # trusting it as "manual" forever would freeze a possibly over-broad old label beyond
+        # _classify_fresh_gaps's reach (that function never revisits a non-"unknown" gap). A
+        # human's own classification must now be written with "classified_by": "manual" set
+        # explicitly in the sidecar for it to be treated as such and never re-checked.
         classified_by = data.get("classified_by")
         if classified_by is None and classification != "unknown":
-            classified_by = "manual"
+            classified_by = "legacy"
         return cls(
             from_ts=datetime.fromisoformat(str(data["from"]).replace("Z", "+00:00")),
             to_ts=datetime.fromisoformat(str(data["to"]).replace("Z", "+00:00")),
