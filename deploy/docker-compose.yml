@@ -1,0 +1,103 @@
+# Compose project for the Tabdeal recorder. Managed on boot / on failure by
+# deploy/systemd/tbot-recorder.service — see deploy/SERVER_SETUP.md for the full
+# server walkthrough (this file alone is not the whole deployment story).
+#
+# Relative paths below (`context`, `env_file`) resolve against THIS file's
+# location, not the caller's working directory, so `docker compose` works the
+# same whether invoked from the repo root with `-f deploy/docker-compose.yml`
+# or from inside `deploy/`.
+#
+# Validate with: docker compose -f deploy/docker-compose.yml config
+
+services:
+  recorder:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: tbot-recorder:latest
+    container_name: tbot-recorder
+    restart: unless-stopped
+
+    # m-H (fifth fix round, corrects an overstated claim from the fourth): this grace period
+    # covers the *normal* shutdown path -- the recorder's own poll/candle/heartbeat loop waits on
+    # an interruptible threading.Event (TabdealRecorderService.run_forever / _next_wait_seconds),
+    # released the instant SIGTERM arrives -- so 30s is generous for that, rather than the 10s
+    # default. It deliberately does NOT need to cover one in-flight tbot.execution.tabdeal_client
+    # call's own retries/backoff in the worst case, which can block considerably longer than 30s
+    # across several uninterruptible retry sleeps; if SIGTERM lands mid-call, Docker simply
+    # SIGKILLs once this window elapses. That is still safe: every SQLite write goes through one
+    # atomic transaction (RecorderStore.transaction) and every Parquet write is a
+    # tmp-file-plus-atomic-rename (tbot.data.candles.write_candle), so a kill at any point leaves
+    # either the previous, fully-committed state or nothing -- never a half-written row or file.
+    stop_grace_period: 30s
+
+    # Secrets live only in .env on the server (CLAUDE.md section 3.6); never in this
+    # file, never in the image. The repo-root `.env` (from `.env.example`) holds the
+    # Tabdeal API key/secret and the Telegram bot token for services that are actually
+    # going to need them — the Telegram bot / TabdealBroker in phase 5+ — and is
+    # DELIBERATELY NOT referenced here. `recorder` only calls Tabdeal's public, unsigned
+    # endpoints (`/trades`, `/depth`; see `tbot.data.tabdeal_recorder`), so it has no
+    # business holding exchange credentials at all: not in its environment, not in
+    # `docker inspect tbot-recorder` output, not reachable by anyone in the server's
+    # `docker` group (fix-round finding, minor #5 — this container used to receive the
+    # whole `.env`, Tabdeal credentials included, even though it never signs a request).
+    # `deploy/recorder.env.example` is this service's own, non-secret template — copy it
+    # to `deploy/recorder.env` on the server (see deploy/SERVER_SETUP.md section 9).
+    #
+    # Deliberately NOT `required: false` (fix-round finding, minor #6): on a fresh clone
+    # `docker compose config`/`up` must fail loudly if the copy step was skipped, the same
+    # way it already does for the repo-root `.env`, rather than silently starting the
+    # recorder with none of this file's settings applied. SERVER_SETUP.md section 9 makes
+    # this explicit and sequences the copy step (section 9) before the first `docker
+    # compose config` sanity check (section 13), so a reader following the doc in order
+    # never hits this failure.
+    env_file:
+      - ../deploy/recorder.env
+    environment:
+      # Which config/<name>.yaml to load; override in the repo-root .env if ever needed
+      # (that's where compose's own ${...} substitution below reads it from — see
+      # deploy/SERVER_SETUP.md section 13 for why this is a *different* mechanism from
+      # `env_file:` above). Actually read by the container as of the fix round: the
+      # Dockerfile's ENTRYPOINT now passes it as `--config` to scripts.record_tabdeal.
+      TBOT_CONFIG: ${TBOT_CONFIG:-default}
+      TZ: UTC
+
+    volumes:
+      # Named volume, not a bind mount: survives `docker compose down` and image
+      # rebuilds. Holds the Tabdeal SQLite DB, the Parquet candle store and the
+      # heartbeat file (see Dockerfile's TBOT_HEARTBEAT_FILE). To copy this data
+      # to/from Parham's Windows laptop, see the "Copying data" section of
+      # deploy/SERVER_SETUP.md (you need the volume's host path from
+      # `docker volume inspect tbot-data`, since it is not a plain directory).
+      - tbot-data:/app/data
+
+    # json-file is Docker's default log driver; pin rotation explicitly so logs
+    # (JSON lines from src/tbot/monitoring/logging.py) cannot fill the disk.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+    # Modest limits for a small VPS. Raise if the recorder is ever observed
+    # hitting them (check `docker stats tbot-recorder`).
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.1"
+          memory: 128M
+
+    # HEALTHCHECK itself is baked into deploy/Dockerfile (it runs deploy/healthcheck.py,
+    # which parses the heartbeat file's JSON and fails unhealthy on a stale timestamp, a
+    # high `consecutive_errors` count, or a stale `last_new_trade_ts_ms`); nothing to
+    # override here unless the defaults (TBOT_HEARTBEAT_MAX_AGE_SECONDS /
+    # TBOT_HEARTBEAT_MAX_CONSECUTIVE_ERRORS / TBOT_HEARTBEAT_MAX_TRADE_STALENESS_SECONDS)
+    # stop fitting — add them under `environment:` above if they ever need a
+    # per-deployment override.
+
+volumes:
+  tbot-data:
+    name: tbot-data

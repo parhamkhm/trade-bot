@@ -1,0 +1,63 @@
+# Build context for deploy/Dockerfile is the REPO ROOT (`context: ..` in
+# deploy/docker-compose.yml), not deploy/ itself -- so this file has to live here, at the
+# root, to have any effect; a .dockerignore under deploy/ would be silently ignored.
+#
+# Nothing below is COPYed into an image layer today -- deploy/Dockerfile only COPYs
+# specific, named paths (pyproject.toml, uv.lock, src/, scripts/, config/, README.md,
+# deploy/healthcheck.py), never `COPY . .` -- but every path listed here is still sent to
+# the Docker daemon as part of the build context on every `docker compose build`/`up
+# --build`, whether or not a COPY instruction ever reads it (fix-round finding, minor #6).
+# Secrets specifically (.env*) must never even make that trip: a future edit that adds a
+# careless `COPY . .` would otherwise bake them straight into an image layer, and "it
+# wasn't in the build context" is a much stronger guarantee than "nothing currently COPYs
+# it" when someone edits the Dockerfile six months from now without re-reading this file.
+
+# --- Secrets: never sent to the Docker daemon, under any circumstances ---
+.env
+.env.*
+!.env.example
+deploy/recorder.env
+!deploy/recorder.env.example
+*.pem
+*.key
+
+# --- VCS / editors / OS ---
+.git
+.gitignore
+.github
+.idea
+.vscode
+.DS_Store
+Thumbs.db
+
+# --- Python environments / caches ---
+.venv
+venv
+__pycache__
+*.py[cod]
+.mypy_cache
+.ruff_cache
+.pytest_cache
+.hypothesis
+.coverage
+coverage.xml
+htmlcov
+dist
+build
+*.egg-info
+
+# --- Data and reports: large, never needed inside the image ---
+data
+*.parquet
+*.sqlite
+*.sqlite3
+*.db
+research
+
+# --- Claude/agent scratch, docs not needed at runtime ---
+.claude
+docs
+KICKOFF.md
+
+# --- Tests are not needed in the runtime image ---
+tests

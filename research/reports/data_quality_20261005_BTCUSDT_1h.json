@@ -1,0 +1,1278 @@
+{
+  "source": "binance",
+  "symbol": "BTCUSDT",
+  "timeframe": "1h",
+  "rows": 67752,
+  "first_ts": "2018-01-01T01:00:00Z",
+  "last_ts": "2025-09-30T23:00:00Z",
+  "coverage_by_month": {
+    "2018-01": {
+      "expected": 744,
+      "actual": 742,
+      "coverage": 0.9973118279569892
+    },
+    "2018-02": {
+      "expected": 672,
+      "actual": 597,
+      "coverage": 0.8883928571428571
+    },
+    "2018-03": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2018-04": {
+      "expected": 720,
+      "actual": 720,
+      "coverage": 1.0
+    },
+    "2018-05": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2018-06": {
+      "expected": 720,
+      "actual": 709,
+      "coverage": 0.9847222222222223
+    },
+    "2018-07": {
+      "expected": 744,
+      "actual": 737,
+      "coverage": 0.9905913978494624
+    },
+    "2018-08": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2018-09": {
+      "expected": 720,
+      "actual": 720,
+      "coverage": 1.0
+    },
+    "2018-10": {
+      "expected": 744,
+      "actual": 741,
+      "coverage": 0.9959677419354839
+    },
+    "2018-11": {
+      "expected": 720,
+      "actual": 713,
+      "coverage": 0.9902777777777778
+    },
+    "2018-12": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2019-01": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2019-02": {
+      "expected": 672,
+      "actual": 672,
+      "coverage": 1.0
+    },
+    "2019-03": {
+      "expected": 744,
+      "actual": 738,
+      "coverage": 0.9919354838709677
+    },
+    "2019-04": {
+      "expected": 720,
+      "actual": 720,
+      "coverage": 1.0
+    },
+    "2019-05": {
+      "expected": 744,
+      "actual": 734,
+      "coverage": 0.9865591397849462
+    },
+    "2019-06": {
+      "expected": 720,
+      "actual": 719,
+      "coverage": 0.9986111111111111
+    },
+    "2019-07": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2019-08": {
+      "expected": 744,
+      "actual": 736,
+      "coverage": 0.989247311827957
+    },
+    "2019-09": {
+      "expected": 720,
+      "actual": 720,
+      "coverage": 1.0
+    },
+    "2019-10": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2019-11": {
+      "expected": 720,
+      "actual": 716,
+      "coverage": 0.9944444444444445
+    },
+    "2019-12": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2020-01": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2020-02": {
+      "expected": 696,
+      "actual": 690,
+      "coverage": 0.9913793103448276
+    },
+    "2020-03": {
+      "expected": 744,
+      "actual": 743,
+      "coverage": 0.9986559139784946
+    },
+    "2020-04": {
+      "expected": 720,
+      "actual": 718,
+      "coverage": 0.9972222222222222
+    },
+    "2020-05": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2020-06": {
+      "expected": 720,
+      "actual": 717,
+      "coverage": 0.9958333333333333
+    },
+    "2020-07": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2020-08": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2020-09": {
+      "expected": 720,
+      "actual": 720,
+      "coverage": 1.0
+    },
+    "2020-10": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2020-11": {
+      "expected": 720,
+      "actual": 719,
+      "coverage": 0.9986111111111111
+    },
+    "2020-12": {
+      "expected": 744,
+      "actual": 739,
+      "coverage": 0.9932795698924731
+    },
+    "2021-01": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2021-02": {
+      "expected": 672,
+      "actual": 670,
+      "coverage": 0.9970238095238095
+    },
+    "2021-03": {
+      "expected": 744,
+      "actual": 743,
+      "coverage": 0.9986559139784946
+    },
+    "2021-04": {
+      "expected": 720,
+      "actual": 715,
+      "coverage": 0.9930555555555556
+    },
+    "2021-05": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2021-06": {
+      "expected": 720,
+      "actual": 720,
+      "coverage": 1.0
+    },
+    "2021-07": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2021-08": {
+      "expected": 744,
+      "actual": 740,
+      "coverage": 0.9946236559139785
+    },
+    "2021-09": {
+      "expected": 720,
+      "actual": 718,
+      "coverage": 0.9972222222222222
+    },
+    "2021-10": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2021-11": {
+      "expected": 720,
+      "actual": 720,
+      "coverage": 1.0
+    },
+    "2021-12": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2022-01": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2022-02": {
+      "expected": 672,
+      "actual": 672,
+      "coverage": 1.0
+    },
+    "2022-03": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2022-04": {
+      "expected": 720,
+      "actual": 720,
+      "coverage": 1.0
+    },
+    "2022-05": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2022-06": {
+      "expected": 720,
+      "actual": 720,
+      "coverage": 1.0
+    },
+    "2022-07": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2022-08": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2022-09": {
+      "expected": 720,
+      "actual": 720,
+      "coverage": 1.0
+    },
+    "2022-10": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2022-11": {
+      "expected": 720,
+      "actual": 720,
+      "coverage": 1.0
+    },
+    "2022-12": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2023-01": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2023-02": {
+      "expected": 672,
+      "actual": 672,
+      "coverage": 1.0
+    },
+    "2023-03": {
+      "expected": 744,
+      "actual": 742,
+      "coverage": 0.9973118279569892
+    },
+    "2023-04": {
+      "expected": 720,
+      "actual": 720,
+      "coverage": 1.0
+    },
+    "2023-05": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2023-06": {
+      "expected": 720,
+      "actual": 720,
+      "coverage": 1.0
+    },
+    "2023-07": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2023-08": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2023-09": {
+      "expected": 720,
+      "actual": 720,
+      "coverage": 1.0
+    },
+    "2023-10": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2023-11": {
+      "expected": 720,
+      "actual": 720,
+      "coverage": 1.0
+    },
+    "2023-12": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2024-01": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2024-02": {
+      "expected": 696,
+      "actual": 696,
+      "coverage": 1.0
+    },
+    "2024-03": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2024-04": {
+      "expected": 720,
+      "actual": 720,
+      "coverage": 1.0
+    },
+    "2024-05": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2024-06": {
+      "expected": 720,
+      "actual": 720,
+      "coverage": 1.0
+    },
+    "2024-07": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2024-08": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2024-09": {
+      "expected": 720,
+      "actual": 720,
+      "coverage": 1.0
+    },
+    "2024-10": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2024-11": {
+      "expected": 720,
+      "actual": 720,
+      "coverage": 1.0
+    },
+    "2024-12": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2025-01": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2025-02": {
+      "expected": 672,
+      "actual": 672,
+      "coverage": 1.0
+    },
+    "2025-03": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2025-04": {
+      "expected": 720,
+      "actual": 720,
+      "coverage": 1.0
+    },
+    "2025-05": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2025-06": {
+      "expected": 720,
+      "actual": 720,
+      "coverage": 1.0
+    },
+    "2025-07": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2025-08": {
+      "expected": 744,
+      "actual": 744,
+      "coverage": 1.0
+    },
+    "2025-09": {
+      "expected": 720,
+      "actual": 720,
+      "coverage": 1.0
+    }
+  },
+  "duplicate_timestamps": [],
+  "out_of_order": [],
+  "gaps": [
+    {
+      "from": "2018-01-04T04:00:00Z",
+      "to": "2018-01-04T06:00:00Z",
+      "missing_bars": 1,
+      "classification": "exchange_outage_after_short_bar",
+      "classified_by": "after_short_bar"
+    },
+    {
+      "from": "2018-02-08T01:00:00Z",
+      "to": "2018-02-11T05:00:00Z",
+      "missing_bars": 75,
+      "classification": "exchange_outage",
+      "classified_by": "anomaly_overlap"
+    },
+    {
+      "from": "2018-06-26T02:00:00Z",
+      "to": "2018-06-26T13:00:00Z",
+      "missing_bars": 10,
+      "classification": "exchange_wide_outage",
+      "classified_by": "cross_symbol"
+    },
+    {
+      "from": "2018-06-27T13:00:00Z",
+      "to": "2018-06-27T15:00:00Z",
+      "missing_bars": 1,
+      "classification": "exchange_wide_outage",
+      "classified_by": "cross_symbol"
+    },
+    {
+      "from": "2018-07-04T01:00:00Z",
+      "to": "2018-07-04T09:00:00Z",
+      "missing_bars": 7,
+      "classification": "exchange_outage_after_short_bar",
+      "classified_by": "after_short_bar"
+    },
+    {
+      "from": "2018-10-19T06:00:00Z",
+      "to": "2018-10-19T10:00:00Z",
+      "missing_bars": 3,
+      "classification": "exchange_wide_outage",
+      "classified_by": "cross_symbol"
+    },
+    {
+      "from": "2018-11-14T02:00:00Z",
+      "to": "2018-11-14T10:00:00Z",
+      "missing_bars": 7,
+      "classification": "exchange_wide_outage",
+      "classified_by": "cross_symbol"
+    },
+    {
+      "from": "2019-03-12T02:00:00Z",
+      "to": "2019-03-12T09:00:00Z",
+      "missing_bars": 6,
+      "classification": "exchange_wide_outage",
+      "classified_by": "cross_symbol"
+    },
+    {
+      "from": "2019-05-15T03:00:00Z",
+      "to": "2019-05-15T14:00:00Z",
+      "missing_bars": 10,
+      "classification": "exchange_wide_outage",
+      "classified_by": "cross_symbol"
+    },
+    {
+      "from": "2019-06-07T21:00:00Z",
+      "to": "2019-06-07T23:00:00Z",
+      "missing_bars": 1,
+      "classification": "exchange_outage",
+      "classified_by": "anomaly_overlap"
+    },
+    {
+      "from": "2019-08-15T02:00:00Z",
+      "to": "2019-08-15T11:00:00Z",
+      "missing_bars": 8,
+      "classification": "exchange_wide_outage",
+      "classified_by": "cross_symbol"
+    },
+    {
+      "from": "2019-11-13T02:00:00Z",
+      "to": "2019-11-13T05:00:00Z",
+      "missing_bars": 2,
+      "classification": "exchange_wide_outage",
+      "classified_by": "cross_symbol"
+    },
+    {
+      "from": "2019-11-25T02:00:00Z",
+      "to": "2019-11-25T05:00:00Z",
+      "missing_bars": 2,
+      "classification": "exchange_wide_outage",
+      "classified_by": "cross_symbol"
+    },
+    {
+      "from": "2020-02-09T02:00:00Z",
+      "to": "2020-02-09T04:00:00Z",
+      "missing_bars": 1,
+      "classification": "exchange_wide_outage",
+      "classified_by": "cross_symbol"
+    },
+    {
+      "from": "2020-02-19T12:00:00Z",
+      "to": "2020-02-19T18:00:00Z",
+      "missing_bars": 5,
+      "classification": "exchange_outage_after_short_bar",
+      "classified_by": "after_short_bar"
+    },
+    {
+      "from": "2020-03-04T10:00:00Z",
+      "to": "2020-03-04T12:00:00Z",
+      "missing_bars": 1,
+      "classification": "exchange_outage_after_short_bar",
+      "classified_by": "after_short_bar"
+    },
+    {
+      "from": "2020-04-25T02:00:00Z",
+      "to": "2020-04-25T05:00:00Z",
+      "missing_bars": 2,
+      "classification": "exchange_wide_outage",
+      "classified_by": "cross_symbol"
+    },
+    {
+      "from": "2020-06-28T02:00:00Z",
+      "to": "2020-06-28T06:00:00Z",
+      "missing_bars": 3,
+      "classification": "exchange_wide_outage",
+      "classified_by": "cross_symbol"
+    },
+    {
+      "from": "2020-11-30T06:00:00Z",
+      "to": "2020-11-30T08:00:00Z",
+      "missing_bars": 1,
+      "classification": "exchange_wide_outage",
+      "classified_by": "cross_symbol"
+    },
+    {
+      "from": "2020-12-21T14:00:00Z",
+      "to": "2020-12-21T19:00:00Z",
+      "missing_bars": 4,
+      "classification": "exchange_wide_outage",
+      "classified_by": "cross_symbol"
+    },
+    {
+      "from": "2020-12-25T02:00:00Z",
+      "to": "2020-12-25T04:00:00Z",
+      "missing_bars": 1,
+      "classification": "exchange_wide_outage",
+      "classified_by": "cross_symbol"
+    },
+    {
+      "from": "2021-02-11T03:00:00Z",
+      "to": "2021-02-11T06:00:00Z",
+      "missing_bars": 2,
+      "classification": "exchange_outage",
+      "classified_by": "anomaly_overlap"
+    },
+    {
+      "from": "2021-03-06T02:00:00Z",
+      "to": "2021-03-06T04:00:00Z",
+      "missing_bars": 1,
+      "classification": "exchange_wide_outage",
+      "classified_by": "cross_symbol"
+    },
+    {
+      "from": "2021-04-20T02:00:00Z",
+      "to": "2021-04-20T05:00:00Z",
+      "missing_bars": 2,
+      "classification": "exchange_wide_outage",
+      "classified_by": "cross_symbol"
+    },
+    {
+      "from": "2021-04-25T05:00:00Z",
+      "to": "2021-04-25T09:00:00Z",
+      "missing_bars": 3,
+      "classification": "exchange_outage_after_short_bar",
+      "classified_by": "after_short_bar"
+    },
+    {
+      "from": "2021-08-13T02:00:00Z",
+      "to": "2021-08-13T07:00:00Z",
+      "missing_bars": 4,
+      "classification": "exchange_wide_outage",
+      "classified_by": "cross_symbol"
+    },
+    {
+      "from": "2021-09-29T07:00:00Z",
+      "to": "2021-09-29T10:00:00Z",
+      "missing_bars": 2,
+      "classification": "exchange_wide_outage",
+      "classified_by": "cross_symbol"
+    },
+    {
+      "from": "2023-03-24T12:00:00Z",
+      "to": "2023-03-24T15:00:00Z",
+      "missing_bars": 2,
+      "classification": "exchange_outage",
+      "classified_by": "anomaly_overlap"
+    }
+  ],
+  "zero_volume_bars": [],
+  "high_eq_low_bars": [],
+  "return_outliers": [],
+  "source_anomalies": [
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-01-04T03:00:00Z",
+      "raw_close": "2018-01-04T03:00:14.838000Z",
+      "duration_seconds": 14.838,
+      "n_trades": 34,
+      "volume": "4.63518100",
+      "classification": "short",
+      "action": "stored_flagged"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-08T00:00:00Z",
+      "raw_close": "2018-02-08T00:28:14.788000Z",
+      "duration_seconds": 1694.788,
+      "n_trades": 12417,
+      "volume": "1521.53731800",
+      "classification": "short",
+      "action": "stored_flagged"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-09T09:28:14.789000Z",
+      "raw_close": "2018-02-09T10:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 10103,
+      "volume": "1451.89645000",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-09T10:28:14.789000Z",
+      "raw_close": "2018-02-09T11:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 12063,
+      "volume": "1252.61789200",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-09T11:28:14.789000Z",
+      "raw_close": "2018-02-09T12:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 13739,
+      "volume": "1275.86692600",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-09T12:28:14.789000Z",
+      "raw_close": "2018-02-09T13:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 12017,
+      "volume": "1059.13167400",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-09T13:28:14.789000Z",
+      "raw_close": "2018-02-09T14:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 17754,
+      "volume": "1745.80326500",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-09T14:28:14.789000Z",
+      "raw_close": "2018-02-09T15:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 20445,
+      "volume": "1960.35290800",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-09T15:28:14.789000Z",
+      "raw_close": "2018-02-09T16:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 17920,
+      "volume": "1309.92356600",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-09T16:28:14.789000Z",
+      "raw_close": "2018-02-09T17:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 16826,
+      "volume": "1269.88016900",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-09T17:28:14.789000Z",
+      "raw_close": "2018-02-09T18:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 32244,
+      "volume": "2394.53696400",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-09T18:28:14.789000Z",
+      "raw_close": "2018-02-09T19:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 22935,
+      "volume": "1276.53576700",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-09T19:28:14.789000Z",
+      "raw_close": "2018-02-09T20:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 20460,
+      "volume": "1027.38931700",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-09T20:28:14.789000Z",
+      "raw_close": "2018-02-09T21:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 24830,
+      "volume": "1306.37336400",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-09T21:28:14.789000Z",
+      "raw_close": "2018-02-09T22:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 23129,
+      "volume": "1273.84928000",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-09T22:28:14.789000Z",
+      "raw_close": "2018-02-09T23:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 21027,
+      "volume": "1123.29187100",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-09T23:28:14.789000Z",
+      "raw_close": "2018-02-10T00:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 20318,
+      "volume": "1914.87731300",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-10T00:28:14.789000Z",
+      "raw_close": "2018-02-10T01:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 26380,
+      "volume": "2819.88817300",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-10T01:28:14.789000Z",
+      "raw_close": "2018-02-10T02:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 21871,
+      "volume": "1799.50803100",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-10T02:28:14.789000Z",
+      "raw_close": "2018-02-10T03:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 17427,
+      "volume": "1354.39077500",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-10T03:28:14.789000Z",
+      "raw_close": "2018-02-10T04:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 22245,
+      "volume": "1800.98770800",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-10T04:28:14.789000Z",
+      "raw_close": "2018-02-10T05:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 15034,
+      "volume": "1192.82189100",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-10T05:28:14.789000Z",
+      "raw_close": "2018-02-10T06:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 9678,
+      "volume": "650.87740400",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-10T06:28:14.789000Z",
+      "raw_close": "2018-02-10T07:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 22145,
+      "volume": "1919.15046000",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-10T07:28:14.789000Z",
+      "raw_close": "2018-02-10T08:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 21321,
+      "volume": "2000.57196500",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-10T08:28:14.789000Z",
+      "raw_close": "2018-02-10T09:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 34482,
+      "volume": "3279.17705000",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-10T09:28:14.789000Z",
+      "raw_close": "2018-02-10T10:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 18611,
+      "volume": "1789.85041800",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-10T10:28:14.789000Z",
+      "raw_close": "2018-02-10T11:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 24342,
+      "volume": "2296.61261100",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-10T11:28:14.789000Z",
+      "raw_close": "2018-02-10T12:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 18155,
+      "volume": "1783.36702300",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-10T12:28:14.789000Z",
+      "raw_close": "2018-02-10T13:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 16636,
+      "volume": "1490.05165000",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-10T13:28:14.789000Z",
+      "raw_close": "2018-02-10T14:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 18180,
+      "volume": "1603.12585600",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-10T14:28:14.789000Z",
+      "raw_close": "2018-02-10T15:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 30652,
+      "volume": "3168.28572700",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-10T15:28:14.789000Z",
+      "raw_close": "2018-02-10T16:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 38010,
+      "volume": "3895.51999200",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-10T16:28:14.789000Z",
+      "raw_close": "2018-02-10T17:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 34157,
+      "volume": "3303.36916400",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-10T17:28:14.789000Z",
+      "raw_close": "2018-02-10T18:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 20980,
+      "volume": "1849.64350000",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-10T18:28:14.789000Z",
+      "raw_close": "2018-02-10T19:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 18204,
+      "volume": "1486.63621900",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-10T19:28:14.789000Z",
+      "raw_close": "2018-02-10T20:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 16900,
+      "volume": "1420.22880300",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-10T20:28:14.789000Z",
+      "raw_close": "2018-02-10T21:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 23061,
+      "volume": "2281.46146500",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-10T21:28:14.789000Z",
+      "raw_close": "2018-02-10T22:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 24981,
+      "volume": "2338.34355600",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-10T22:28:14.789000Z",
+      "raw_close": "2018-02-10T23:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 24339,
+      "volume": "2097.62034600",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-10T23:28:14.789000Z",
+      "raw_close": "2018-02-11T00:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 20098,
+      "volume": "1623.27807600",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-11T00:28:14.789000Z",
+      "raw_close": "2018-02-11T01:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 22882,
+      "volume": "1925.49739000",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-11T01:28:14.789000Z",
+      "raw_close": "2018-02-11T02:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 20055,
+      "volume": "1455.56531200",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-11T02:28:14.789000Z",
+      "raw_close": "2018-02-11T03:28:14.788000Z",
+      "duration_seconds": 3599.999,
+      "n_trades": 20519,
+      "volume": "1912.82015200",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-02-11T03:28:14.789000Z",
+      "raw_close": "2018-02-11T04:00:00.999000Z",
+      "duration_seconds": 1906.21,
+      "n_trades": 16506,
+      "volume": "1737.49397900",
+      "classification": "misaligned",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2018-07-04T00:00:00Z",
+      "raw_close": "2018-07-04T00:22:25.551000Z",
+      "duration_seconds": 1345.551,
+      "n_trades": 5307,
+      "volume": "1543.48440200",
+      "classification": "short",
+      "action": "stored_flagged"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2019-06-07T21:00:00Z",
+      "raw_close": "2019-06-07T21:13:13.524000Z",
+      "duration_seconds": 793.524,
+      "n_trades": 0,
+      "volume": "0E-8",
+      "classification": "empty_irregular",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2020-02-19T11:00:00Z",
+      "raw_close": "2020-02-19T11:35:32.286000Z",
+      "duration_seconds": 2132.286,
+      "n_trades": 4680,
+      "volume": "405.96951100",
+      "classification": "short",
+      "action": "stored_flagged"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2020-03-04T09:00:00Z",
+      "raw_close": "2020-03-04T09:21:46.694000Z",
+      "duration_seconds": 1306.694,
+      "n_trades": 3743,
+      "volume": "254.39256900",
+      "classification": "short",
+      "action": "stored_flagged"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2020-12-21T14:00:00Z",
+      "raw_close": "2020-12-21T13:47:20.521000Z",
+      "duration_seconds": -759.479,
+      "n_trades": 0,
+      "volume": "0E-8",
+      "classification": "empty_irregular",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2021-02-11T03:00:00Z",
+      "raw_close": "2021-02-11T03:40:54.773000Z",
+      "duration_seconds": 2454.773,
+      "n_trades": 0,
+      "volume": "0E-8",
+      "classification": "empty_irregular",
+      "action": "dropped"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2021-04-25T04:00:00Z",
+      "raw_close": "2021-04-25T04:00:58.146000Z",
+      "duration_seconds": 58.146,
+      "n_trades": 224,
+      "volume": "5.88703400",
+      "classification": "short",
+      "action": "stored_flagged"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2021-12-24T04:00:00Z",
+      "raw_close": "2021-12-24T04:59:54.362000Z",
+      "duration_seconds": 3594.362,
+      "n_trades": 22379,
+      "volume": "560.59259000",
+      "classification": "short",
+      "action": "stored_flagged"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "raw_open": "2023-03-24T12:00:00Z",
+      "raw_close": "2023-03-24T12:39:41.646000Z",
+      "duration_seconds": 2381.646,
+      "n_trades": 0,
+      "volume": "0E-8",
+      "classification": "empty_irregular",
+      "action": "dropped"
+    }
+  ],
+  "reconciliation": null,
+  "reconciliation_total_mismatches": null,
+  "reconciliation_mismatches_outside_outages": null,
+  "unclassified_gap_count": 0
+}

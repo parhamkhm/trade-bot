@@ -1,0 +1,46 @@
+# Default configuration. No secrets here — secrets live in .env (prefix TBOT_).
+# Every field is validated by src/tbot/core/config.py.
+
+runtime:
+  mode: backtest        # backtest | paper | live  (live also needs phase >= 6)
+  phase: 0              # current project phase, see CLAUDE.md section 9
+  quote_asset: USDT
+  base_asset: BTC
+  log_level: INFO
+
+costs:
+  # Tabdeal fee tier is unknown until the probe/account check; 20 bps per side is the
+  # conservative default fixed in CLAUDE.md section 3.4.
+  taker_fee_bps: "20"
+  maker_fee_bps: "20"
+  slippage_bps: "5"
+
+data:
+  parquet_root: data/parquet
+  raw_root: data/raw
+  tabdeal_db: data/tabdeal/trades.sqlite
+  binance_base_url: https://data.binance.vision
+  symbols: ["BTCUSDT", "ETHUSDT"]
+  timeframes: ["1h", "4h", "1d"]
+  history_start: 2018-01-01T00:00:00Z
+  # SEALED HOLDOUT — fixed calendar date, never a rolling window (decision D-008).
+  # No code may load bars with ts >= this value before gate G4.
+  # Editing this line does NOT unseal anything: the enforced boundary is the code constant
+  # CANONICAL_HOLDOUT_START, and a mismatch here is refused and logged (D-026, D-030).
+  holdout_start: 2025-10-01T00:00:00Z
+
+exchange:
+  base_url: https://api1.tabdeal.org
+  read_prefix: /r/api/v1
+  write_prefix: /api/v1
+  recv_window_ms: 5000
+  requests_per_second: 5.0
+  timeout_seconds: 10.0
+  max_retries: 5
+
+risk:
+  max_exposure: 1.0
+  annual_vol_target: 0.20
+  max_daily_loss_pct: 0.10
+  max_orders_per_hour: 6
+  max_data_age_seconds: 900
