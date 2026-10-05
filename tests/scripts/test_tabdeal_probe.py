@@ -25,6 +25,7 @@ from scripts.tabdeal_probe import (
     build_symbol_filters,
     classify_key_permissions,
     compute_clock_skew_ms,
+    compute_round_cross,
     cumulative_depth,
     describe_unreachable_failure,
     detect_id_space,
@@ -34,10 +35,12 @@ from scripts.tabdeal_probe import (
     find_symbol_entry,
     ids_contiguous_in_window,
     ids_monotonic_in_time,
+    is_irt_quoted,
     is_saturated,
     main,
     probe_both_prefixes,
     spread_bps_and_pct,
+    summarize_band_sizes,
     summarize_spreads,
     trade_activity_stats,
     trades_window_stats,
@@ -155,6 +158,101 @@ def test_summarize_spreads_reports_median_p95_min_max() -> None:
 
 def test_summarize_spreads_empty() -> None:
     assert summarize_spreads([]) == {}
+
+
+# ---------------------------------------------------------------------------------
+# is_irt_quoted / summarize_band_sizes / compute_round_cross (G0 depth-sampling extension)
+# ---------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "symbol,expected",
+    [("BTCIRT", True), ("USDTIRT", True), ("btcirt", True), ("BTCUSDT", False), ("ETHUSDT", False)],
+)
+def test_is_irt_quoted(symbol: str, expected: bool) -> None:
+    assert is_irt_quoted(symbol) is expected
+
+
+# Two hand-computed samples at one band threshold, both sides. ask/quote_notional = 100 and 300
+# -> median 200, p10 (nearest-rank of 2 -> rank=1) is the smaller of the two, 100.
+_TWO_SAMPLES = [
+    {
+        "depth": {
+            "0.001": {
+                "bid": {"base_qty": "1", "quote_notional": "99"},
+                "ask": {"base_qty": "1", "quote_notional": "100"},
+            }
+        }
+    },
+    {
+        "depth": {
+            "0.001": {
+                "bid": {"base_qty": "3", "quote_notional": "297"},
+                "ask": {"base_qty": "3", "quote_notional": "300"},
+            }
+        }
+    },
+]
+
+
+def test_summarize_band_sizes_hand_computed_median_and_p10() -> None:
+    summary = summarize_band_sizes(_TWO_SAMPLES)
+    ask = summary["0.001"]["ask"]
+    assert ask["median_quote_notional"] == "200"
+    assert ask["p10_quote_notional"] == "100"
+    assert ask["median_base_qty"] == "2"
+    assert ask["p10_base_qty"] == "1"
+    bid = summary["0.001"]["bid"]
+    assert bid["median_quote_notional"] == "198"
+    assert bid["p10_quote_notional"] == "99"
+
+
+def test_summarize_band_sizes_empty_samples_returns_empty() -> None:
+    assert summarize_band_sizes([]) == {}
+
+
+def test_summarize_band_sizes_includes_quote_usdt_only_when_present() -> None:
+    samples_without_usdt = _TWO_SAMPLES
+    assert "median_quote_usdt" not in summarize_band_sizes(samples_without_usdt)["0.001"]["ask"]
+
+    samples_with_usdt = [
+        {
+            "depth": {
+                "0.001": {
+                    "bid": {"base_qty": "1", "quote_notional": "99", "quote_usdt": "0.001"},
+                    "ask": {"base_qty": "1", "quote_notional": "100", "quote_usdt": "0.002"},
+                }
+            }
+        }
+    ]
+    ask = summarize_band_sizes(samples_with_usdt)["0.001"]["ask"]
+    assert ask["median_quote_usdt"] == "0.002"
+    assert ask["p10_quote_usdt"] == "0.002"
+
+
+def test_compute_round_cross_hand_computed() -> None:
+    mids = {
+        "BTCUSDT": Decimal("67000"),
+        "BTCIRT": Decimal("17956000000"),  # implied = 17956000000 / 268000 = 67000
+        "USDTIRT": Decimal("268000"),
+    }
+    cross = compute_round_cross(mids)
+    assert cross is not None
+    assert cross["implied_btc_usdt_price"] == "67000"
+    assert cross["basis_bps"] == pytest.approx(0.0)
+    assert cross["btcusdt_mid"] == "67000"
+    assert cross["btcirt_mid"] == "17956000000"
+    assert cross["usdtirt_mid"] == "268000"
+
+
+def test_compute_round_cross_none_when_a_leg_is_missing() -> None:
+    assert compute_round_cross({"BTCUSDT": Decimal("67000"), "BTCIRT": Decimal("1")}) is None
+    assert compute_round_cross({}) is None
+
+
+def test_compute_round_cross_none_when_usdtirt_mid_non_positive() -> None:
+    mids = {"BTCUSDT": Decimal("67000"), "BTCIRT": Decimal("1"), "USDTIRT": Decimal("0")}
+    assert compute_round_cross(mids) is None
 
 
 # ---------------------------------------------------------------------------------
@@ -548,10 +646,19 @@ def _args_for(tmp_path: Path, **overrides: Any) -> list[str]:
         "--samples", "1",
         "--interval", "0",
         "--symbols", "BTCUSDT",
+        # Single depth symbol by default: keeps every pre-existing test's call-counting
+        # assumptions exactly as they were before --depth-symbols existed. Tests that actually
+        # exercise multi-symbol sampling override this explicitly.
+        "--depth-symbols", "BTCUSDT",
         "--trades-limit-candidates", "100",
     ]
     for key, value in overrides.items():
-        argv.extend([f"--{key.replace('_', '-')}", str(value)])
+        flag = f"--{key.replace('_', '-')}"
+        if isinstance(value, list | tuple):
+            argv.append(flag)
+            argv.extend(str(v) for v in value)
+        else:
+            argv.extend([flag, str(value)])
     return argv
 
 
@@ -849,6 +956,178 @@ def test_crossed_book_sample_is_counted_and_does_not_abort_the_run(tmp_path: Pat
     assert depth_report["crossed_book_samples"][0]["best_ask"] == "100.00"
     # The other two (ok) samples must still be present -- not lost because of the one crossed one.
     assert len(depth_report["samples"]) == 2
+
+
+# ---------------------------------------------------------------------------------
+# multi-symbol depth sampling: --depth-symbols BTCUSDT BTCIRT USDTIRT (requirements 1-5)
+# ---------------------------------------------------------------------------------
+
+
+def _mock_multi_symbol_depth_bodies() -> None:
+    """ping/time/exchangeInfo/trades on the happy path, plus a /depth route that returns a
+    different, hand-chosen book per ``symbol`` query param so the cross-rate maths has an exact
+    answer: BTCUSDT mid 67000, BTCIRT mid 17956000000, USDTIRT mid 268000 ->
+    implied = 17956000000 / 268000 = 67000 exactly, so basis_bps == 0 exactly."""
+    respx.get(f"{BASE_URL}{READ_PREFIX}/ping").mock(return_value=httpx.Response(200, json={}))
+    respx.get(f"{BASE_URL}{WRITE_PREFIX}/ping").mock(return_value=httpx.Response(404))
+    respx.get(f"{BASE_URL}{READ_PREFIX}/time").mock(
+        return_value=httpx.Response(200, json={"serverTime": 1_700_000_000_000})
+    )
+    respx.get(f"{BASE_URL}{WRITE_PREFIX}/time").mock(return_value=httpx.Response(404))
+    respx.get(f"{BASE_URL}{READ_PREFIX}/exchangeInfo").mock(
+        return_value=httpx.Response(200, json=EXCHANGE_INFO_BODY)
+    )
+    respx.get(f"{BASE_URL}{WRITE_PREFIX}/exchangeInfo").mock(return_value=httpx.Response(404))
+    trades_body = [
+        {"id": i, "price": "100.0", "qty": "0.1", "time": 1_700_000_000_000 + i * 1000} for i in range(50)
+    ]
+    respx.get(f"{BASE_URL}{READ_PREFIX}/trades").mock(return_value=httpx.Response(200, json=trades_body))
+    respx.get(f"{BASE_URL}{WRITE_PREFIX}/trades").mock(return_value=httpx.Response(404))
+    respx.get(f"{BASE_URL}{WRITE_PREFIX}/depth").mock(return_value=httpx.Response(404))
+
+    bodies = {
+        "BTCUSDT": {"bids": [["66995", "2"]], "asks": [["67005", "2"]]},
+        "BTCIRT": {"bids": [["17955999999", "0.01"]], "asks": [["17956000001", "0.01"]]},
+        "USDTIRT": {"bids": [["267999", "5"]], "asks": [["268001", "5"]]},
+    }
+
+    def depth_handler(request: httpx.Request) -> httpx.Response:
+        symbol = dict(httpx.QueryParams(request.url.query))["symbol"]
+        return httpx.Response(200, json=bodies[symbol])
+
+    respx.get(f"{BASE_URL}{READ_PREFIX}/depth").mock(side_effect=depth_handler)
+
+
+@respx.mock
+def test_main_multi_symbol_depth_rounds_builds_comparison_only_flags_and_cross_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Requirements 1-4 end to end: BTCUSDT is the only symbol flagged for the G0 gate; BTCIRT
+    and USDTIRT are comparison_only; BTCIRT's book sizes carry a quote_usdt conversion using the
+    same round's USDTIRT mid; and the implied BTC/USDT cross is reported with its basis vs the
+    directly-quoted BTCUSDT mid (0 bps for this hand-chosen fixture)."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TBOT_TABDEAL_API_KEY", raising=False)
+    monkeypatch.delenv("TBOT_TABDEAL_API_SECRET", raising=False)
+    _mock_multi_symbol_depth_bodies()
+
+    argv = _args_for(tmp_path, samples=2, interval=0, depth_symbols=["BTCUSDT", "BTCIRT", "USDTIRT"])
+    exit_code = main(argv)
+
+    assert exit_code == 0
+    import json
+
+    report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+    depth = report["depth"]
+
+    # requirement 1: BTCUSDT alone carries the G0 gate; the other two are comparison_only.
+    assert depth["BTCUSDT"]["comparison_only"] is False
+    assert depth["BTCIRT"]["comparison_only"] is True
+    assert depth["USDTIRT"]["comparison_only"] is True
+
+    # requirement 2: best bid/ask/mid present on every sample, every symbol.
+    btcusdt_sample = depth["BTCUSDT"]["samples"][0]
+    assert btcusdt_sample["mid"] == "67000"
+    assert "quote_usdt" not in btcusdt_sample["depth"]["0.001"]["ask"]  # not IRT-quoted
+
+    # requirement 3: BTCIRT's levels carry a quote_usdt conversion via the same round's USDTIRT.
+    btcirt_sample = depth["BTCIRT"]["samples"][0]
+    assert btcirt_sample["depth"]["0.001"]["ask"]["quote_usdt"] is not None
+
+    # requirement 3: implied BTC/USDT cross and its basis vs BTCUSDT, exact for this fixture.
+    cross = report["depth_cross"]
+    assert len(cross["rounds"]) == 2
+    assert cross["rounds"][0]["implied_btc_usdt_price"] == "67000"
+    assert cross["rounds"][0]["basis_bps"] == pytest.approx(0.0)
+    assert cross["implied_btc_basis_bps_summary"]["median_bps"] == pytest.approx(0.0)
+
+    # requirement 4: band_summary (median/p10 fillable size) present for BTCUSDT.
+    band_summary = depth["BTCUSDT"]["band_summary"]
+    assert "median_quote_notional" in band_summary["0.001"]["ask"]
+    assert "p10_quote_notional" in band_summary["0.001"]["ask"]
+
+
+@respx.mock
+def test_main_one_symbol_failing_in_a_round_does_not_abort_the_round(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Requirement 5: a persistently-failing BTCIRT /depth fetch must not stop BTCUSDT or
+    USDTIRT from being sampled in the same round, and must not crash the probe."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TBOT_TABDEAL_API_KEY", raising=False)
+    monkeypatch.delenv("TBOT_TABDEAL_API_SECRET", raising=False)
+    _mock_multi_symbol_depth_bodies()  # sets up the happy-path depth_handler first...
+
+    bodies = {
+        "BTCUSDT": {"bids": [["66995", "2"]], "asks": [["67005", "2"]]},
+        "USDTIRT": {"bids": [["267999", "5"]], "asks": [["268001", "5"]]},
+    }
+
+    def depth_handler_with_one_failure(request: httpx.Request) -> httpx.Response:
+        symbol = dict(httpx.QueryParams(request.url.query))["symbol"]
+        if symbol == "BTCIRT":
+            return httpx.Response(500)
+        return httpx.Response(200, json=bodies[symbol])
+
+    # ...then override it with one that always fails BTCIRT specifically.
+    respx.get(f"{BASE_URL}{READ_PREFIX}/depth").mock(side_effect=depth_handler_with_one_failure)
+
+    argv = _args_for(tmp_path, samples=1, interval=0, depth_symbols=["BTCUSDT", "BTCIRT", "USDTIRT"])
+    exit_code = main(argv)
+
+    assert exit_code == 0
+    import json
+
+    report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+    depth = report["depth"]
+    # BTCIRT got nothing but a failure -- no successful samples, no crash.
+    assert depth["BTCIRT"]["samples"] == []
+    assert depth["BTCIRT"]["spread_summary"] == {}
+    # BTCUSDT and USDTIRT were sampled normally in the very same round.
+    assert len(depth["BTCUSDT"]["samples"]) == 1
+    assert len(depth["USDTIRT"]["samples"]) == 1
+    # No cross-rate round could be computed (BTCIRT's mid is missing) -- recorded as absent,
+    # not as a crash or a bogus value.
+    assert report["depth_cross"]["rounds"] == []
+
+
+@respx.mock
+def test_main_crossed_book_on_one_symbol_does_not_affect_siblings_in_the_same_round(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Requirement 5: a crossed BTCIRT book must be counted on BTCIRT alone -- BTCUSDT's and
+    USDTIRT's samples in the very same round must be unaffected."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TBOT_TABDEAL_API_KEY", raising=False)
+    monkeypatch.delenv("TBOT_TABDEAL_API_SECRET", raising=False)
+    _mock_multi_symbol_depth_bodies()
+
+    bodies = {
+        "BTCUSDT": {"bids": [["66995", "2"]], "asks": [["67005", "2"]]},
+        "BTCIRT": {"bids": [["17956000001", "0.01"]], "asks": [["17955999999", "0.01"]]},  # crossed
+        "USDTIRT": {"bids": [["267999", "5"]], "asks": [["268001", "5"]]},
+    }
+
+    def depth_handler_with_one_crossed(request: httpx.Request) -> httpx.Response:
+        symbol = dict(httpx.QueryParams(request.url.query))["symbol"]
+        return httpx.Response(200, json=bodies[symbol])
+
+    respx.get(f"{BASE_URL}{READ_PREFIX}/depth").mock(side_effect=depth_handler_with_one_crossed)
+
+    argv = _args_for(tmp_path, samples=1, interval=0, depth_symbols=["BTCUSDT", "BTCIRT", "USDTIRT"])
+    exit_code = main(argv)
+
+    assert exit_code == 0
+    import json
+
+    report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+    depth = report["depth"]
+    assert depth["BTCIRT"]["crossed_book_count"] == 1
+    assert depth["BTCIRT"]["samples"] == []
+    # Siblings in the same round are unaffected.
+    assert depth["BTCUSDT"]["crossed_book_count"] == 0
+    assert len(depth["BTCUSDT"]["samples"]) == 1
+    assert len(depth["USDTIRT"]["samples"]) == 1
 
 
 # ---------------------------------------------------------------------------------
