@@ -34,6 +34,14 @@ keeps being rewritten on every successful poll regardless. `first_poll_ts_ms` (t
 very first poll attempt ever) lets this script fail once that has been true for longer than the
 same trade-staleness threshold.
 
+MINOR-3 (sixth fix round): the payload also carries `last_cycle_error` (string | null -- the most
+recent `process_once()` cycle's own error text, already scrubbed through
+`tbot.monitoring.logging.redact_secrets` before it was ever written). This script does not use it
+to decide healthy/unhealthy on its own (a cycle can fail once and then recover before the next
+heartbeat write), but appends it to the diagnostic `reason` string whenever present and non-empty,
+on both the healthy and unhealthy path -- `docker inspect`'s health-check log then shows not just
+THAT something failed recently but roughly WHY, without needing to go dig through container logs.
+
 m3 default (`TBOT_HEARTBEAT_MAX_TRADE_STALENESS_SECONDS=7200`): measured from the Turkey
 server 2026-10-04, BTCUSDT on Tabdeal is thin -- a 1000-trade/~29h sample had a p99
 inter-trade gap of 641s and a max of 2120s (35 min) -- so a tighter default (e.g. 1800s)
@@ -129,6 +137,25 @@ def _evaluate_trade_feed_staleness(
     return True, "ok"
 
 
+def _append_last_cycle_error(payload: dict[object, object], reason: str) -> str:
+    """MINOR-3 (sixth fix round): surface the most recent cycle's own error text (already
+    scrubbed through the redaction pipeline when written -- see
+    ``tbot.data.tabdeal_recorder.TabdealRecorderService.process_once``) in this script's own
+    diagnostic output whenever present, so ``docker inspect``/``docker compose ps`` output alone
+    is enough to tell an operator not just THAT a cycle failed recently but roughly WHY, without
+    this script's own pass/fail checks (``consecutive_errors``, heartbeat age, ...) having any
+    other way to say more than a bare pass/fail. A no-op (returns ``reason`` unchanged) whenever
+    ``last_cycle_error`` is absent, ``None`` or empty -- an older heartbeat payload, or a cycle
+    that completed normally.
+    """
+    last_cycle_error = payload.get("last_cycle_error")
+    if not isinstance(last_cycle_error, str) or not last_cycle_error:
+        return reason
+    if reason == "ok":
+        return f"ok (last_cycle_error: {last_cycle_error})"
+    return f"{reason} (last_cycle_error: {last_cycle_error})"
+
+
 def evaluate_heartbeat(
     payload: object,
     *,
@@ -145,35 +172,39 @@ def evaluate_heartbeat(
     if not isinstance(payload, dict):
         return False, "heartbeat payload is not a JSON object"
 
+    def done(healthy: bool, reason: str) -> tuple[bool, str]:
+        return healthy, _append_last_cycle_error(payload, reason)
+
     last_poll_ts_raw = payload.get("last_poll_ts")
     if not isinstance(last_poll_ts_raw, str):
-        return False, "heartbeat payload missing string field 'last_poll_ts'"
+        return done(False, "heartbeat payload missing string field 'last_poll_ts'")
     try:
         last_poll_ts = datetime.fromisoformat(last_poll_ts_raw)
     except ValueError as exc:
-        return False, f"'last_poll_ts' is not a valid ISO-8601 timestamp: {exc}"
+        return done(False, f"'last_poll_ts' is not a valid ISO-8601 timestamp: {exc}")
     if last_poll_ts.tzinfo is None:
         last_poll_ts = last_poll_ts.replace(tzinfo=UTC)
 
     age_seconds = (now - last_poll_ts).total_seconds()
     if age_seconds < -_MAX_CLOCK_SKEW_SECONDS:
-        return False, f"'last_poll_ts' is {-age_seconds:.0f}s in the future"
+        return done(False, f"'last_poll_ts' is {-age_seconds:.0f}s in the future")
     if age_seconds > max_age_seconds:
-        return False, f"last_poll_ts is {age_seconds:.0f}s old (max {max_age_seconds:.0f}s)"
+        return done(False, f"last_poll_ts is {age_seconds:.0f}s old (max {max_age_seconds:.0f}s)")
 
     consecutive_errors = payload.get("consecutive_errors")
     if not isinstance(consecutive_errors, int) or isinstance(consecutive_errors, bool):
-        return False, "heartbeat payload missing integer field 'consecutive_errors'"
+        return done(False, "heartbeat payload missing integer field 'consecutive_errors'")
     if consecutive_errors >= max_consecutive_errors:
-        return (
+        return done(
             False,
             f"consecutive_errors={consecutive_errors} >= max {max_consecutive_errors} "
             "(the process is alive but every poll cycle is failing)",
         )
 
-    return _evaluate_trade_feed_staleness(
+    healthy, reason = _evaluate_trade_feed_staleness(
         payload, now=now, max_trade_staleness_seconds=max_trade_staleness_seconds
     )
+    return done(healthy, reason)
 
 
 class _PayloadReadError(Exception):

@@ -648,6 +648,88 @@ def _seed_gap(
     store_mod.save_sidecar(sidecar_file, sidecar)
 
 
+# --- MINOR-4 (sixth fix round, amends m-J): a "legacy" classification (no recorded provenance)
+# is re-checked against the current rules, never trusted indefinitely like "manual" is ----------
+
+
+def test_classify_fresh_gaps_rechecks_a_legacy_classification_against_current_rules() -> None:
+    """A previous classification stamped ``"legacy"`` (no ``classified_by`` at all on disk --
+    see ``store.GapRecord.from_dict``) must be re-derived from the current anomaly evidence, not
+    trusted forever the way a genuine ``"manual"`` or current-rule classification is."""
+    from_ts = datetime(2024, 6, 1, 0, tzinfo=UTC)
+    to_ts = from_ts + 2 * Timeframe.H1.delta
+    finding = quality_mod.GapFinding(from_ts=from_ts, to_ts=to_ts, missing_bars=1)
+    previous_legacy = store_mod.GapRecord(
+        from_ts=from_ts,
+        to_ts=to_ts,
+        missing_bars=1,
+        classification="some_stale_old_label",
+        classified_by="legacy",
+    )
+    # Evidence that _classify_gap_from_anomalies's rule (a) matches: a dropped anomaly whose raw
+    # window overlaps the missing-bar window (from_ts, to_ts - delta].
+    anomaly = store_mod.AnomalyRecord(
+        raw_open_ts=from_ts + timedelta(minutes=20),
+        raw_close_ts=from_ts + timedelta(minutes=40),
+        duration_seconds=1200.0,
+        n_trades=5,
+        volume=Decimal("1"),
+        classification="misaligned",
+        action="dropped",
+    )
+
+    result = bl._classify_fresh_gaps(
+        [finding], previous_gaps=[previous_legacy], anomalies=[anomaly], timeframe=Timeframe.H1
+    )
+
+    assert len(result) == 1
+    assert result[0].classification == "exchange_outage"  # re-derived, not the stale legacy label
+    assert result[0].classified_by == "anomaly_overlap"
+
+
+def test_classify_fresh_gaps_legacy_with_no_matching_rule_falls_back_to_unknown() -> None:
+    """A "legacy" classification that no current rule can explain is discarded, not kept."""
+    from_ts = datetime(2024, 6, 1, 0, tzinfo=UTC)
+    to_ts = from_ts + 2 * Timeframe.H1.delta
+    finding = quality_mod.GapFinding(from_ts=from_ts, to_ts=to_ts, missing_bars=1)
+    previous_legacy = store_mod.GapRecord(
+        from_ts=from_ts,
+        to_ts=to_ts,
+        missing_bars=1,
+        classification="some_stale_old_label",
+        classified_by="legacy",
+    )
+
+    result = bl._classify_fresh_gaps(
+        [finding], previous_gaps=[previous_legacy], anomalies=[], timeframe=Timeframe.H1
+    )
+
+    assert result[0].classification == "unknown"
+    assert result[0].classified_by is None
+
+
+def test_classify_fresh_gaps_never_revisits_a_genuine_manual_classification() -> None:
+    """A classification explicitly stamped ``classified_by="manual"`` is kept untouched, exactly
+    like before MINOR-4 -- the amendment only concerns the no-provenance ``"legacy"`` case."""
+    from_ts = datetime(2024, 6, 1, 0, tzinfo=UTC)
+    to_ts = from_ts + 2 * Timeframe.H1.delta
+    finding = quality_mod.GapFinding(from_ts=from_ts, to_ts=to_ts, missing_bars=1)
+    previous_manual = store_mod.GapRecord(
+        from_ts=from_ts,
+        to_ts=to_ts,
+        missing_bars=1,
+        classification="maintenance_announced",
+        classified_by="manual",
+    )
+
+    result = bl._classify_fresh_gaps(
+        [finding], previous_gaps=[previous_manual], anomalies=[], timeframe=Timeframe.H1
+    )
+
+    assert result[0].classification == "maintenance_announced"
+    assert result[0].classified_by == "manual"
+
+
 def test_cross_symbol_pass_classifies_an_identical_window_as_exchange_wide_outage(
     tmp_path: Path,
 ) -> None:
@@ -749,6 +831,70 @@ def test_parse_kline_csv_still_tolerates_the_early_side_up_to_one_second() -> No
 
     assert len(parsed.records) == 1
     assert parsed.anomalies == ()
+
+
+# --- NIT (sixth fix round): exact integer arithmetic at the one-unit epsilon boundary -----------
+
+
+def test_parse_kline_csv_ms_row_exactly_at_the_late_epsilon_boundary_is_normal_not_long() -> None:
+    """Repro of the round-3 reviewer's float-rounding finding: a close_time landing exactly one
+    unit (1ms) after the documented "open + delta - 1ms" convention -- i.e. exactly at
+    "open + delta" -- sits exactly on the late-side tolerance boundary and must be ``normal``.
+    The old ``float`` comparison (``timedelta.total_seconds()``) rounded this exact case to a
+    hair on the wrong side (measured: ``0.0010000000002 > 0.001``) and misclassified it ``long``.
+    """
+    open_ms = 1_717_200_000_000
+    delta_ms = 3_600_000  # Timeframe.H1
+    close_time_ms = open_ms + delta_ms  # exactly "open + delta" -- the late boundary itself
+    row = f"{open_ms},100,101,99,100,5,{close_time_ms},500,10,2,250,0\n"
+
+    parsed = bl.parse_kline_csv_bytes(row.encode(), timeframe=Timeframe.H1)
+
+    assert parsed.anomalies == ()
+    assert len(parsed.records) == 1
+    assert parsed.records[0].ts == datetime(2024, 6, 1, 1, 0, 0, tzinfo=UTC)
+
+
+def test_parse_kline_csv_ms_row_one_unit_past_the_late_epsilon_boundary_is_still_long() -> None:
+    """One more unit past the boundary above must still be ``long`` and dropped -- the fix only
+    corrects the exact-boundary case, it does not loosen the tolerance itself."""
+    open_ms = 1_717_200_000_000
+    delta_ms = 3_600_000
+    close_time_ms = open_ms + delta_ms + 1  # one ms past the boundary
+    row = f"{open_ms},100,101,99,100,5,{close_time_ms},500,10,2,250,0\n"
+
+    parsed = bl.parse_kline_csv_bytes(row.encode(), timeframe=Timeframe.H1)
+
+    assert parsed.records == ()
+    assert len(parsed.anomalies) == 1
+    assert parsed.anomalies[0].classification == "long"
+
+
+def test_parse_kline_csv_us_row_exactly_at_the_late_epsilon_boundary_is_normal_not_long() -> None:
+    """Same boundary, microsecond era (post 2025-01-01, decision D-017) -- the fix is unit-aware,
+    not just hardcoded for milliseconds."""
+    open_us = 1_735_689_600_000_000  # 2025-06-01T00:00:00Z in microseconds -- within the us range
+    delta_us = 3_600_000_000  # Timeframe.H1, in microseconds
+    close_time_us = open_us + delta_us  # exactly "open + delta" -- the late boundary itself
+    row = f"{open_us},100,101,99,100,5,{close_time_us},500,10,2,250,0\n"
+
+    parsed = bl.parse_kline_csv_bytes(row.encode(), timeframe=Timeframe.H1)
+
+    assert parsed.anomalies == ()
+    assert len(parsed.records) == 1
+
+
+def test_parse_kline_csv_us_row_one_unit_past_the_late_epsilon_boundary_is_still_long() -> None:
+    open_us = 1_735_689_600_000_000
+    delta_us = 3_600_000_000
+    close_time_us = open_us + delta_us + 1  # one microsecond past the boundary
+    row = f"{open_us},100,101,99,100,5,{close_time_us},500,10,2,250,0\n"
+
+    parsed = bl.parse_kline_csv_bytes(row.encode(), timeframe=Timeframe.H1)
+
+    assert parsed.records == ()
+    assert len(parsed.anomalies) == 1
+    assert parsed.anomalies[0].classification == "long"
 
 
 # --- load_bars / load_frame ------------------------------------------------------------------

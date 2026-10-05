@@ -77,6 +77,68 @@ def test_fresh_heartbeat_with_no_errors_is_healthy() -> None:
     assert reason == "ok"
 
 
+def test_last_cycle_error_appended_to_an_otherwise_healthy_reason() -> None:
+    """MINOR-3 (sixth fix round): healthy/unhealthy is unaffected by ``last_cycle_error`` on its
+    own -- a cycle can fail once and recover before the next heartbeat write -- but it IS
+    appended to the diagnostic ``reason`` string whenever present and non-empty, so
+    ``docker inspect`` shows roughly WHY a recent cycle failed even on an otherwise-healthy
+    heartbeat."""
+    now = datetime(2026, 1, 1, 0, 0, 30, tzinfo=UTC)
+    payload = _payload(
+        last_poll_ts="2026-01-01T00:00:00+00:00",
+        consecutive_errors=0,
+        last_cycle_error="RuntimeError: sweep bug",
+    )
+
+    healthy, reason = healthcheck.evaluate_heartbeat(
+        payload, now=now, max_age_seconds=180, max_consecutive_errors=10
+    )
+
+    assert healthy is True
+    assert "RuntimeError: sweep bug" in reason
+
+
+def test_last_cycle_error_appended_to_an_unhealthy_reason_too() -> None:
+    now = datetime(2026, 1, 1, 1, 0, 0, tzinfo=UTC)  # stale -> unhealthy regardless
+    payload = _payload(
+        last_poll_ts="2026-01-01T00:00:00+00:00",
+        consecutive_errors=0,
+        last_cycle_error="RuntimeError: sweep bug",
+    )
+
+    healthy, reason = healthcheck.evaluate_heartbeat(
+        payload, now=now, max_age_seconds=180, max_consecutive_errors=10
+    )
+
+    assert healthy is False
+    assert "old" in reason
+    assert "RuntimeError: sweep bug" in reason
+
+
+def test_absent_last_cycle_error_does_not_change_the_ok_reason() -> None:
+    """Backward compatible: an older heartbeat payload with no ``last_cycle_error`` key at all
+    (or a null one -- a cycle that completed normally) must not change ``reason`` from the
+    plain ``"ok"``."""
+    now = datetime(2026, 1, 1, 0, 0, 30, tzinfo=UTC)
+    payload = _payload(last_poll_ts="2026-01-01T00:00:00+00:00", consecutive_errors=0)
+
+    healthy, reason = healthcheck.evaluate_heartbeat(
+        payload, now=now, max_age_seconds=180, max_consecutive_errors=10
+    )
+
+    assert healthy is True
+    assert reason == "ok"
+
+    payload_with_null = _payload(
+        last_poll_ts="2026-01-01T00:00:00+00:00", consecutive_errors=0, last_cycle_error=None
+    )
+    healthy2, reason2 = healthcheck.evaluate_heartbeat(
+        payload_with_null, now=now, max_age_seconds=180, max_consecutive_errors=10
+    )
+    assert healthy2 is True
+    assert reason2 == "ok"
+
+
 def test_stale_last_poll_ts_is_unhealthy() -> None:
     """A heartbeat file that stopped being rewritten (process dead/wedged)."""
     now = datetime(2026, 1, 1, 1, 0, 0, tzinfo=UTC)  # 1 hour after last_poll_ts

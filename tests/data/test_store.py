@@ -151,17 +151,36 @@ def test_gap_record_classified_by_round_trips_when_set() -> None:
     assert restored.classified_by == "anomaly_overlap"
 
 
-def test_gap_record_classified_by_defaults_to_manual_when_absent_from_disk() -> None:
-    """Decision D-036 amendment (finding m-J): a sidecar written by a human (or by code before
+def test_gap_record_classified_by_defaults_to_legacy_when_absent_from_disk() -> None:
+    """MINOR-4 (sixth fix round, amends m-J): a sidecar written by a human (or by code before
     this field existed) has a non-"unknown" classification but no ``classified_by`` key at all.
-    That silence is itself the signal that no automated rule produced it -- loading it must stamp
-    ``classified_by="manual"`` rather than leave it ``None`` (which is reserved for "unknown")."""
+    That silence only proves no CURRENT rule's name was recorded -- it is loaded as ``"legacy"``,
+    not ``"manual"``, so ``_classify_fresh_gaps`` can re-check it against the current rules
+    instead of trusting a possibly stale/over-broad old label forever. A human's own
+    classification must now set ``classified_by: "manual"`` explicitly to be exempt from that
+    re-check (see ``test_gap_record_classified_by_manual_round_trips_when_set_explicitly``)."""
     data = {
         "from": "2024-06-01T01:00:00Z",
         "to": "2024-06-01T03:00:00Z",
         "missing_bars": 1,
         "classification": "maintenance_announced",
         # no "classified_by" key -- as a hand-written or pre-D-036-amendment sidecar would have.
+    }
+    restored = store_mod.GapRecord.from_dict(data)
+    assert restored.classification == "maintenance_announced"
+    assert restored.classified_by == "legacy"
+
+
+def test_gap_record_classified_by_manual_round_trips_when_set_explicitly() -> None:
+    """MINOR-4: a human's own classification, written with ``classified_by: "manual"`` present
+    explicitly in the sidecar, round-trips as ``"manual"`` -- never reinterpreted as
+    ``"legacy"`` (the key is present, so the ``from_dict`` fallback never fires)."""
+    data = {
+        "from": "2024-06-01T01:00:00Z",
+        "to": "2024-06-01T03:00:00Z",
+        "missing_bars": 1,
+        "classification": "maintenance_announced",
+        "classified_by": "manual",
     }
     restored = store_mod.GapRecord.from_dict(data)
     assert restored.classification == "maintenance_announced"
