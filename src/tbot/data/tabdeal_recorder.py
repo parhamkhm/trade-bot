@@ -114,6 +114,69 @@ Fifth fix round (this task -- second-round review, ahead of G1b deployment):
   hole, not a quiet market); the heartbeat/healthcheck now also fail when no trade has *ever* been
   recorded (``last_new_trade_ts_ms`` stays ``null`` forever) well past ``first_poll_ts_ms`` --
   previously a recorder that only ever received ``[]`` looked healthy indefinitely.
+
+Sixth fix round (this task -- round-3 review, MINOR/NIT fixes ahead of the G1b 7-day window):
+
+* MINOR-1: a feed that keeps answering HTTP 200 but is actually frozen/stale for longer than
+  ``quiet_hour_timeout_seconds`` could let the quiet-timeout path in ``_hour_feed_has_moved_past``
+  seal an hour ``complete=True`` (or skip it as ``no_trades_in_hour``) with real trades for it
+  still outstanding -- the feed's own ``verified_poll_ts_ms`` keeps advancing on the wall clock
+  even though the *data* it returns has not moved on at all. ``_persist_poll`` now detects, inside
+  the same transaction as the insert, any newly-inserted trade (by this poll's own
+  ``recorded_ts_ms``) whose ``ts_ms`` falls at or before the sweep's resumption cursor (see
+  ``_resumption_cursor_ms``, shared with ``build_due_candles``) -- i.e. a trade for an hour already
+  sealed one way or another. Each such hour gets a ``late_trades`` gap row and, once the poll's own
+  transaction has committed, a correction: ``_rewrite_hour_for_late_trades`` either rewrites an
+  already-written candle ``complete=False`` (delegating to ``_rewrite_candle_incomplete_if_written``)
+  or, for an hour that was swept as empty/poisoned with no candle at all, writes a fresh
+  ``complete=False`` candle for it now that it demonstrably has trades. Uses the same
+  schema-v4 ``rewritten`` self-healing path as the ``window_no_overlap`` gap rewrite (m-G) --
+  ``_recover_unrewritten_gaps`` also retries any ``late_trades`` gap left ``rewritten=0`` by a
+  crash between the poll's commit and the Parquet correction.
+* MINOR-2: ``_record_partial_unparsable`` used to anchor a dropped-item gap to the hours of the
+  trades that DID parse in that same poll -- which, on a poll whose response spans the full
+  ~29h/1000-trade window, could mark roughly 29 consecutive hours incomplete (and re-record a gap
+  for every one of them, every poll) because of a single unrelated bad item. It now parses each
+  dropped item's own ``time`` field leniently (even though the item failed real parsing) and
+  anchors that item's gap to its own hour, falling back to the poll's own hour only when no time
+  can be read at all. ``RecorderStore.record_gap_once`` also dedupes by ``(reason, hour_close_ms)``
+  (``INSERT ... WHERE NOT EXISTS``) so rediscovering the same affected hour on a later poll no
+  longer re-records a duplicate row. Schema v5 adds ``idx_gaps_hour_close_ms`` and
+  ``idx_gaps_reason_rewritten`` (both pure index additions -- migrated the same way every other
+  schema bump is, via ``_migrate_schema`` re-running ``_SCHEMA_SQL``'s ``CREATE INDEX IF NOT
+  EXISTS`` statements against an already-existing table).
+* MINOR-3: a sweep-only exception (e.g. a corrupt Parquet part hit by ``build_due_candles``, not
+  an ordinary poll failure) used to make ``run_forever`` exit every ~95s with *no* backoff at all,
+  because the poll itself kept succeeding and reset ``_consecutive_errors`` to 0 every cycle right
+  before the sweep raised -- only ``_consecutive_cycle_exceptions`` (which ``_next_wait_seconds``
+  never looked at) actually climbed toward the fatal-exit threshold. ``_next_wait_seconds`` now
+  keys its backoff off ``max(_consecutive_errors, _consecutive_cycle_exceptions)``. ``process_once``
+  also now writes the heartbeat from a ``finally`` block (so it is written even when the cycle
+  raises) with a new ``last_cycle_error`` field -- the failing cycle's own error text, passed
+  through the existing ``tbot.monitoring.logging.redact_secrets`` pipeline before it ever reaches
+  the heartbeat file -- so the container's state is diagnosable from `docker inspect`/the
+  healthcheck output, not just from the already-redacted structlog line.
+* NIT: ``RecorderStore.transaction()`` could not tell a dangling leftover transaction from a prior
+  crash (``conn.in_transaction`` already ``True`` on entry) apart from a *nested* call -- e.g. a bug
+  calling a transaction-wrapped method from inside another one -- which shows the exact same state.
+  The old code silently ``ROLLBACK``-ed either way, which for a genuine nesting bug would silently
+  discard the outer, legitimate, in-progress transaction's work with no error at all. An explicit
+  ``_in_transaction_block`` flag (set only by this method, never derived from sqlite3's own state)
+  now makes a nested call raise ``RuntimeError`` immediately instead.
+* NIT: the future-skew plausibility check's ``now_ms`` used to be sampled *before* the ``/trades``
+  HTTP call -- with ``TabdealClient``'s own retry/backoff budget (up to ~360s worst case for a
+  slow/retried round-trip), a genuinely fresh trade could arrive stamped further in the future than
+  that stale, pre-call ``now_ms`` plus the 5-minute skew tolerance, and get wrongly dropped as
+  ``partial_unparsable``. ``_fetch_and_parse`` now samples ``now_ms`` immediately after the HTTP
+  call returns (including any retries), not before it starts.
+* NIT: a transient forward clock jump (e.g. an NTP step) recorded as ``verified_poll_ts_ms`` (which
+  only ever advances, MAX-based) stayed stuck at that too-high value forever once the real clock
+  corrected back down -- permanently satisfying ``_hour_feed_has_moved_past``'s quiet-timeout check
+  for every hour regardless of how little real time had actually passed since. That function now
+  takes the sweep's already clock/verified-capped ``now_ms`` (``_resumption_cursor_ms``'s sibling,
+  ``_sweep_now_ms``'s own ``min(real_clock_now_ms, verified_poll_ts_ms)``) instead of re-querying
+  the raw, uncapped ``verified_poll_ts_ms`` itself -- it self-corrects the instant the real clock
+  reading drops back below the stale verified value, with no separate write-side clamp needed.
 """
 
 from __future__ import annotations
@@ -143,6 +206,7 @@ from tbot.data.depth import (
     to_decimal,
 )
 from tbot.execution.tabdeal_client import ProbeResult, TabdealClient
+from tbot.monitoring.logging import redact_secrets
 
 __all__ = [
     "HeartbeatState",
@@ -270,21 +334,49 @@ CREATE TABLE IF NOT EXISTS orderbook (
 );
 """
 
+# MINOR-2 (sixth fix round, schema v5): kept separate from _SCHEMA_SQL and run only AFTER
+# _migrate_schema's ALTER TABLE column-backfill loop below -- idx_gaps_hour_close_ms and
+# idx_gaps_reason_rewritten both index a column (hour_close_ms, rewritten) that a pre-v4 database
+# does not have yet at the point _SCHEMA_SQL's own executescript runs (CREATE TABLE IF NOT EXISTS
+# is a no-op against an already-existing table, so those columns are only added by the loop that
+# runs after it); creating an index on them any earlier raises "no such column". Both statements
+# are plain `CREATE INDEX IF NOT EXISTS`, so running this script again on an already-migrated
+# database (the common case) is a cheap no-op. idx_gaps_hour_close_ms speeds up
+# has_hour_gap/unrewritten_hour_gaps/record_gap_once, all keyed by hour_close_ms;
+# idx_gaps_reason_rewritten speeds up unrewritten_overlap_gaps/unrewritten_hour_gaps, both
+# filtered by (reason, rewritten).
+_GAPS_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_gaps_hour_close_ms ON gaps(hour_close_ms);
+CREATE INDEX IF NOT EXISTS idx_gaps_reason_rewritten ON gaps(reason, rewritten);
+"""
+
 
 def _dt_to_ms(dt: datetime) -> int:
     return int((dt - _EPOCH).total_seconds() * 1000)
+
+
+def _redact_cycle_error(raw: str) -> str:
+    """Scrub a cycle-failure message through the existing secret-redaction pipeline
+    (``tbot.monitoring.logging.redact_secrets``) before it is ever written to the heartbeat file
+    (MINOR-3, sixth fix round) -- the heartbeat is operational state read by
+    ``deploy/healthcheck.py`` and potentially surfaced to an operator, so it must go through the
+    same scrubbing as every structlog line rather than writing a raw exception message straight
+    to disk."""
+    return str(redact_secrets(None, "process_once", {"error": raw})["error"])
 
 
 # ---------------------------------------------------------------------------------
 # schema migration (MAJOR-2, second fix round)
 # ---------------------------------------------------------------------------------
 
-# Current schema version. Bumped whenever a column/table is added below -- ``PRAGMA user_version``
-# is set to this after every successful migration, purely as a readable marker for operators
-# inspecting the file; the actual repair logic is presence-based (see ``_migrate_schema``) so it
-# is correct even against a database several fix-rounds old. v3 (fourth fix round) added the
-# ``recorder_state`` and ``meta`` tables. v4 (fifth fix round, m-G) added ``gaps.rewritten``.
-_SCHEMA_VERSION = 4
+# Current schema version. Bumped whenever a column/table/index is added below -- ``PRAGMA
+# user_version`` is set to this after every successful migration, purely as a readable marker for
+# operators inspecting the file; the actual repair logic is presence-based (see
+# ``_migrate_schema``) so it is correct even against a database several fix-rounds old. v3 (fourth
+# fix round) added the ``recorder_state`` and ``meta`` tables. v4 (fifth fix round, m-G) added
+# ``gaps.rewritten``. v5 (sixth fix round, MINOR-2) added ``idx_gaps_hour_close_ms`` and
+# ``idx_gaps_reason_rewritten``.
+_SCHEMA_VERSION = 5
 
 
 class RecorderSchemaVersionError(RuntimeError):
@@ -397,6 +489,10 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         for name, column_type in expected_columns.items():
             if name not in existing:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {column_type}")
+    # MINOR-2 (sixth fix round): must run after the column-backfill loop above -- see
+    # _GAPS_INDEX_SQL's own comment for why creating these any earlier can fail against a
+    # database that predates the columns they index.
+    conn.executescript(_GAPS_INDEX_SQL)
     conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
 
@@ -496,6 +592,9 @@ class RecorderStore:
             conn.close()
             raise
         self._conn = conn
+        # NIT (sixth fix round): set only by transaction() itself, never derived from sqlite3's
+        # own `in_transaction` -- see that method for why the distinction matters.
+        self._in_transaction_block = False
 
     def close(self) -> None:
         self._conn.close()
@@ -530,23 +629,44 @@ class RecorderStore:
           ``BEGIN`` is issued.
         * a ``COMMIT`` that itself raises (disk full, I/O error, ...) is followed by a ``ROLLBACK``
           when the connection is still inside a transaction, instead of leaving it there.
+
+        NIT (sixth fix round): a *nested* call -- ``transaction()`` invoked again from inside an
+        already-open ``with store.transaction():`` block, e.g. by a bug that calls a
+        transaction-wrapped method from inside another one -- used to be indistinguishable from a
+        dangling leftover transaction from a prior crash (both show ``self._conn.in_transaction ==
+        True``), so the inner call's own dangling-transaction recovery above would silently
+        ``ROLLBACK`` the outer, legitimate, in-progress transaction's work with no error raised at
+        all. ``self._in_transaction_block`` is set only by this method (never derived from
+        sqlite3's own transaction state, which cannot tell the two cases apart) and makes a nested
+        call raise ``RuntimeError`` immediately instead -- the outer transaction then rolls back
+        too, correctly, because an exception now propagates through its own body, not because
+        anything here guessed it was stale.
         """
+        if self._in_transaction_block:
+            raise RuntimeError(
+                "RecorderStore.transaction() does not support nesting -- a transaction is "
+                "already open on this connection"
+            )
         if self._conn.in_transaction:
             logger.warning("tabdeal_recorder.dangling_transaction_rolled_back")
             self._conn.execute("ROLLBACK")
-        self._conn.execute("BEGIN IMMEDIATE")
+        self._in_transaction_block = True
         try:
-            yield
-        except BaseException:
-            self._conn.execute("ROLLBACK")
-            raise
-        else:
+            self._conn.execute("BEGIN IMMEDIATE")
             try:
-                self._conn.execute("COMMIT")
-            except sqlite3.Error:
-                if self._conn.in_transaction:
-                    self._conn.execute("ROLLBACK")
+                yield
+            except BaseException:
+                self._conn.execute("ROLLBACK")
                 raise
+            else:
+                try:
+                    self._conn.execute("COMMIT")
+                except sqlite3.Error:
+                    if self._conn.in_transaction:
+                        self._conn.execute("ROLLBACK")
+                    raise
+        finally:
+            self._in_transaction_block = False
 
     # -- symbol identity (m6, fourth fix round) ------------------------------------
 
@@ -621,6 +741,22 @@ class RecorderStore:
         """
         row = self._conn.execute("SELECT MAX(recorded_ts_ms) FROM trades").fetchone()
         return row[0] if row is not None and row[0] is not None else None
+
+    def late_trade_ts_ms(self, *, recorded_ts_ms: int, max_ts_ms: int) -> list[int]:
+        """``ts_ms`` for every trade this exact poll newly inserted (``recorded_ts_ms`` set by
+        ``insert_trades`` at insert time, never touched again by a later duplicate ``INSERT OR
+        IGNORE``) whose own timestamp is at or before ``max_ts_ms``.
+
+        MINOR-1 (sixth fix round): used by ``_detect_late_trades`` to find trades that arrived
+        for an hour the sweep has already passed (``max_ts_ms`` is the resumption cursor, see
+        ``_resumption_cursor_ms``) -- i.e. late arrivals that a prior seal (complete=True, or an
+        empty/poisoned-hour gap) did not have yet.
+        """
+        rows = self._conn.execute(
+            "SELECT ts_ms FROM trades WHERE recorded_ts_ms = ? AND ts_ms <= ?",
+            (recorded_ts_ms, max_ts_ms),
+        ).fetchall()
+        return [r[0] for r in rows]
 
     def trades_in_range(self, open_ms: int, close_ms: int) -> list[candles_mod.Trade]:
         """Trades with ``open_ms < ts_ms <= close_ms`` (``closed='right'``)."""
@@ -708,6 +844,31 @@ class RecorderStore:
         assert rowid is not None  # always set after a successful single-row INSERT
         return rowid
 
+    def record_gap_once(
+        self, *, detected_ts_ms: int, reason: str, hour_close_ms: int
+    ) -> int | None:
+        """Like ``record_gap``, but a no-op (returns ``None``, nothing inserted) if a row with
+        this exact ``(reason, hour_close_ms)`` already exists.
+
+        MINOR-2 (sixth fix round): used by ``_record_partial_unparsable`` so re-discovering the
+        same affected hour on a later poll (e.g. a feed that keeps dropping the same malformed
+        item) does not pile up a duplicate row every single poll -- ``INSERT ... SELECT ... WHERE
+        NOT EXISTS`` makes the check-then-insert atomic within the caller's own transaction
+        (no separate SELECT-then-INSERT race is possible, since SQLite transactions are already
+        serialized on one connection).
+        """
+        cursor = self._conn.execute(
+            "INSERT INTO gaps (detected_ts_ms, from_id, to_id, reason, hour_close_ms) "
+            "SELECT ?, NULL, NULL, ?, ? WHERE NOT EXISTS ("
+            "SELECT 1 FROM gaps WHERE reason = ? AND hour_close_ms = ?)",
+            (detected_ts_ms, reason, hour_close_ms, reason, hour_close_ms),
+        )
+        if cursor.rowcount == 0:
+            return None
+        rowid = cursor.lastrowid
+        assert rowid is not None
+        return rowid
+
     def unrewritten_overlap_gaps(self) -> list[tuple[int, int, int]]:
         """``(rowid, from_id, to_id)`` for every ``window_no_overlap`` gap row not yet confirmed
         rewritten onto any already-written candle it touches -- m-G (fifth fix round), consumed by
@@ -718,6 +879,22 @@ class RecorderStore:
             "AND from_id IS NOT NULL AND to_id IS NOT NULL"
         ).fetchall()
         return [(r[0], r[1], r[2]) for r in rows]
+
+    def unrewritten_hour_gaps(self, reason: str) -> list[tuple[int, int]]:
+        """``(rowid, hour_close_ms)`` for every ``reason`` gap row not yet confirmed rewritten --
+        generalizes ``unrewritten_overlap_gaps`` (keyed by an id range) to any gap reason keyed by
+        ``hour_close_ms`` instead.
+
+        MINOR-1 (sixth fix round): consumed by ``_recover_unrewritten_gaps`` for the
+        ``late_trades`` reason, the same self-healing role ``unrewritten_overlap_gaps`` plays for
+        ``window_no_overlap``.
+        """
+        rows = self._conn.execute(
+            "SELECT rowid, hour_close_ms FROM gaps "
+            "WHERE reason = ? AND rewritten = 0 AND hour_close_ms IS NOT NULL",
+            (reason,),
+        ).fetchall()
+        return [(r[0], r[1]) for r in rows]
 
     def mark_gap_rewritten(self, rowid: int) -> None:
         """m-G (fifth fix round): mark one ``gaps`` row (by ``rowid``, from ``record_gap``'s
@@ -962,26 +1139,50 @@ class _ParsedResponse:
     trades: list[candles_mod.Trade]
     n_items_received: int
     unexpected_body_type: bool
+    # MINOR-2 (sixth fix round): the raw response items that failed parse_trade_item, kept
+    # separately from `trades` so _record_partial_unparsable can anchor each one's own gap to its
+    # own (leniently-read) time instead of to whatever hours the trades that DID parse happen to
+    # span.
+    dropped_items: list[Any]
+    # NIT (sixth fix round): sampled AFTER client.trades() returns (including any retries it took
+    # internally) -- see that function's docstring for why sampling it beforehand was wrong.
+    now_ms: int
 
 
-def _fetch_and_parse(client: TabdealClient, symbol: str, limit: int, *, now_ms: int) -> _ParsedResponse:
+def _fetch_and_parse(client: TabdealClient, symbol: str, limit: int, *, clock: Clock) -> _ParsedResponse:
     """Call ``/trades`` and parse its body. Never raises -- a malformed body or item degrades to
-    an empty/partial ``trades`` list, which the caller turns into the right warnings/gap rows."""
+    an empty/partial ``trades`` list, which the caller turns into the right warnings/gap rows.
+
+    NIT (sixth fix round): the future-skew plausibility check inside ``parse_trade_item`` used to
+    receive a ``now_ms`` sampled *before* this call -- with ``TabdealClient``'s own retry/backoff
+    budget (up to ~360s worst case for a slow/retried round-trip), a genuinely fresh trade could
+    arrive stamped further in the future than that stale, pre-call ``now_ms`` plus the 5-minute
+    skew tolerance, and get wrongly rejected. ``clock.now()`` is now read once the response has
+    actually arrived, and that same ``now_ms`` is returned for the caller to reuse for every other
+    purpose this poll needs "now" for (``recorded_ts_ms``, ``detected_ts_ms``, ``poll_ts_ms``) --
+    one poll, one "now".
+    """
     result = client.trades(symbol, limit=limit)
+    now_ms = _dt_to_ms(clock.now())
     body_is_list = isinstance(result.body, list)
     unexpected_body_type = result.ok and not body_is_list
     n_items_received = len(result.body) if result.ok and body_is_list else 0
     trades: list[candles_mod.Trade] = []
+    dropped_items: list[Any] = []
     if result.ok and body_is_list:
         for item in result.body:
             trade = parse_trade_item(item, now_ms=now_ms)
             if trade is not None:
                 trades.append(trade)
+            else:
+                dropped_items.append(item)
     return _ParsedResponse(
         result=result,
         trades=trades,
         n_items_received=n_items_received,
         unexpected_body_type=unexpected_body_type,
+        dropped_items=dropped_items,
+        now_ms=now_ms,
     )
 
 
@@ -1049,31 +1250,41 @@ def _detect_window_gap(first_id: int | None, prev_max: int | None) -> tuple[int,
     return None
 
 
+def _lenient_item_time_ms(item: Any) -> int | None:
+    """Best-effort ``time`` field extraction for a response item that already failed
+    ``parse_trade_item`` -- used only to anchor its ``partial_unparsable`` gap to roughly the
+    right hour (MINOR-2, sixth fix round), never to validate or store the item itself. Returns
+    ``None`` (never raises) for anything not even readable as an integer-ish value.
+    """
+    if not isinstance(item, dict):
+        return None
+    try:
+        return int(item["time"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def _record_partial_unparsable(
-    store: RecorderStore,
-    trades: Sequence[candles_mod.Trade],
-    n_trades: int,
-    n_items_received: int,
-    now_ms: int,
+    store: RecorderStore, dropped_items: Sequence[Any], now_ms: int
 ) -> None:
-    """MAJOR M-B: mark every hour touched by this poll's surviving trades as having a known
-    shortfall, so the candle sweep builds it ``complete=False`` rather than treating a partial
-    drop as full coverage. If nothing at all parsed, there is no trade timestamp to anchor on --
-    fall back to the hour containing the poll itself (a recent-trades endpoint's response is
-    always close to "now")."""
-    if n_trades >= n_items_received:
-        return
-    affected_close_ms = {candles_mod.hour_bounds_ms(t.ts_ms)[1] for t in trades}
-    if not affected_close_ms:
-        affected_close_ms = {candles_mod.hour_bounds_ms(now_ms)[1]}
-    for close_ms in sorted(affected_close_ms):
-        store.record_gap(
-            detected_ts_ms=now_ms,
-            from_id=None,
-            to_id=None,
-            reason="partial_unparsable",
-            hour_close_ms=close_ms,
-        )
+    """MAJOR M-B, amended MINOR-2 (sixth fix round): mark each hour a dropped item actually
+    belongs to as having a known shortfall, so the candle sweep builds it ``complete=False``
+    rather than treating a partial drop as full coverage.
+
+    MINOR-2: previously this anchored every affected hour to the hours of the trades that DID
+    parse in the same poll -- on a poll whose response spans the full ~29h/1000-trade window,
+    one unrelated bad item could mark roughly 29 consecutive hours incomplete, and re-record a
+    gap for every one of them on every single poll (the old anchor had nothing to do with the bad
+    item's own time). Each dropped item's own ``time`` field is now read leniently (even though
+    the rest of the item failed real parsing) and used as that item's own anchor; only an item
+    with no readable time at all falls back to the hour containing the poll itself.
+    ``record_gap_once`` dedupes by ``(reason, hour_close_ms)`` so rediscovering the same affected
+    hour on a later poll is a no-op, not another row.
+    """
+    for item in dropped_items:
+        item_time_ms = _lenient_item_time_ms(item)
+        close_ms = candles_mod.hour_bounds_ms(item_time_ms if item_time_ms is not None else now_ms)[1]
+        store.record_gap_once(detected_ts_ms=now_ms, reason="partial_unparsable", hour_close_ms=close_ms)
 
 
 def _gap_touched_hour_closes(lo_ts_ms: int, hi_ts_ms: int) -> list[int]:
@@ -1113,6 +1324,55 @@ def _rewrite_candle_incomplete_if_written(
         logger.warning("tabdeal_recorder.candle_rewritten_incomplete", symbol=symbol, hour_close_ms=close_ms)
 
 
+def _resumption_cursor_ms(store: RecorderStore, parquet_root: Path, symbol: str) -> int | None:
+    """The hour-close cursor the sweep has already passed -- the max of "last candle actually
+    written" and "last hour swept as an empty/poisoned/etc. gap" (MAJOR M3) -- or ``None`` if
+    nothing has been swept at all yet.
+
+    Shared by ``build_due_candles`` (to know where to resume) and ``_detect_late_trades`` (MINOR-1,
+    sixth fix round: a trade landing in an hour at or before this cursor arrived after that hour
+    was already sealed one way or another).
+    """
+    last_written_ms = candles_mod.last_written_close_ms(parquet_root, symbol)
+    last_swept_ms = store.last_swept_close_ms(symbol)
+    candidates = [v for v in (last_written_ms, last_swept_ms) if v is not None]
+    return max(candidates) if candidates else None
+
+
+def _rewrite_hour_for_late_trades(
+    store: RecorderStore, parquet_root: Path, symbol: str, close_ms: int
+) -> None:
+    """Correct hour ``close_ms`` after a trade arrives for it *after* that hour was already swept
+    past (MINOR-1, sixth fix round) -- either because its candle is already written (rewrite it
+    ``complete=False`` with the now-fuller trade set, delegating to
+    ``_rewrite_candle_incomplete_if_written``) or because it was swept as an empty/poisoned gap
+    with no candle at all (the sweep cursor already passed it via ``record_hour_gap`` -- write a
+    fresh ``complete=False`` candle for it now that it demonstrably has trades, rather than leaving
+    the hour candle-less forever with a now-provably-wrong ``no_trades_in_hour``/``poisoned_trades``
+    gap).
+
+    A no-op if the hour has not been swept at all yet -- the ordinary sweep will build it
+    correctly (``complete=False``, via ``is_candle_complete``'s ``has_hour_gap`` check, since the
+    ``late_trades`` gap row this function's caller already recorded is itself enough) once it
+    becomes due.
+    """
+    last_written_ms = candles_mod.last_written_close_ms(parquet_root, symbol)
+    if last_written_ms is not None and close_ms <= last_written_ms:
+        _rewrite_candle_incomplete_if_written(store, parquet_root, symbol, close_ms)
+        return
+    last_swept_ms = store.last_swept_close_ms(symbol)
+    if last_swept_ms is None or close_ms > last_swept_ms:
+        return  # not yet swept at all -- the ordinary sweep will build it correctly when due
+    open_ms = close_ms - candles_mod.HOUR_MS
+    trades = store.trades_in_range(open_ms, close_ms)
+    record = candles_mod.build_candle(trades, open_ms, close_ms, complete=False)
+    if record is not None:
+        candles_mod.write_candle(parquet_root, symbol, record)
+        logger.warning(
+            "tabdeal_recorder.late_trades_candle_written", symbol=symbol, hour_close_ms=close_ms
+        )
+
+
 def _handle_detected_gap(
     store: RecorderStore,
     parquet_root: Path | None,
@@ -1142,25 +1402,77 @@ def _handle_detected_gap(
     store.mark_gap_rewritten(gap_rowid)
 
 
+def _detect_late_trades(
+    store: RecorderStore, *, now_ms: int, symbol: str, parquet_root: Path | None
+) -> list[int]:
+    """Hour-close buckets (deduped, ascending) of this poll's newly-inserted trades (identified
+    by ``recorded_ts_ms == now_ms``) whose own ``ts_ms`` falls at or before the sweep's
+    resumption cursor -- i.e. trades that arrived for an hour already sealed one way or another
+    (MINOR-1, sixth fix round: a feed that answers HTTP 200 but is actually frozen/stale can let
+    the quiet-hour timeout seal an hour, or an empty/poisoned hour, before all of that hour's real
+    trades have actually arrived).
+
+    ``[]`` when ``parquet_root`` is ``None`` (most tests; nothing to check the written-candle half
+    of the cursor against -- ``TabdealRecorderService`` always passes it in production) or nothing
+    has been swept yet.
+    """
+    if parquet_root is None:
+        return []
+    cursor_ms = _resumption_cursor_ms(store, parquet_root, symbol)
+    if cursor_ms is None:
+        return []
+    late_ts_ms = store.late_trade_ts_ms(recorded_ts_ms=now_ms, max_ts_ms=cursor_ms)
+    return sorted({candles_mod.hour_bounds_ms(ts)[1] for ts in late_ts_ms})
+
+
+@dataclass(frozen=True, slots=True)
+class _PersistResult:
+    """Everything ``_persist_poll`` hands back for ``poll_trades_once`` to act on once the
+    transaction has committed."""
+
+    inserted: int
+    overlap_gap_rowid: int | None
+    # MINOR-1 (sixth fix round): (rowid, hour_close_ms) per late-trades gap row just recorded, for
+    # the post-commit Parquet correction (_rewrite_hour_for_late_trades) + mark_gap_rewritten.
+    late_trade_gaps: tuple[tuple[int, int], ...]
+
+
 def _persist_poll(
-    store: RecorderStore, *, now_ms: int, symbol: str, parsed: _ParsedResponse, m: _PollMetrics
-) -> tuple[int, int | None]:
+    store: RecorderStore,
+    *,
+    now_ms: int,
+    symbol: str,
+    parsed: _ParsedResponse,
+    m: _PollMetrics,
+    parquet_root: Path | None,
+) -> _PersistResult:
     """The single atomic transaction (MAJOR-3) for one poll: the trades, any window-overlap gap
-    row, any partial-unparsable gap rows, the ``poll_log`` row, and -- only when ``m.ok`` -- the
-    verified-poll marker ``build_due_candles`` caps the sweep against. Returns
-    ``(inserted, gap_rowid)`` -- the number of genuinely new trades inserted, and the just-inserted
-    ``window_no_overlap`` gap row's ``rowid`` (``None`` if ``m.gap`` is ``None``), for
-    ``_handle_detected_gap`` (m-G) to mark rewritten after a successful inline rewrite.
+    row, any partial-unparsable gap rows, any late-trades gap rows (MINOR-1), the ``poll_log``
+    row, and -- only when ``m.ok`` -- the verified-poll marker ``build_due_candles`` caps the
+    sweep against.
     """
     result = parsed.result
     gap_rowid: int | None = None
+    late_trade_gaps: list[tuple[int, int]] = []
     with store.transaction():
         inserted = store.insert_trades(parsed.trades, recorded_ts_ms=now_ms) if parsed.trades else 0
         if m.gap is not None:
             gap_rowid = store.record_gap(
                 detected_ts_ms=now_ms, from_id=m.gap[0], to_id=m.gap[1], reason="window_no_overlap"
             )
-        _record_partial_unparsable(store, parsed.trades, m.n_trades, parsed.n_items_received, now_ms)
+        _record_partial_unparsable(store, parsed.dropped_items, now_ms)
+        if inserted > 0:
+            for close_ms in _detect_late_trades(
+                store, now_ms=now_ms, symbol=symbol, parquet_root=parquet_root
+            ):
+                rowid = store.record_gap(
+                    detected_ts_ms=now_ms,
+                    from_id=None,
+                    to_id=None,
+                    reason="late_trades",
+                    hour_close_ms=close_ms,
+                )
+                late_trade_gaps.append((rowid, close_ms))
         store.record_poll(
             poll_ts_ms=now_ms,
             first_id=m.first_id,
@@ -1175,7 +1487,9 @@ def _persist_poll(
         )
         if m.ok:
             store.record_verified_poll(symbol=symbol, poll_ts_ms=now_ms)
-    return inserted, gap_rowid
+    return _PersistResult(
+        inserted=inserted, overlap_gap_rowid=gap_rowid, late_trade_gaps=tuple(late_trade_gaps)
+    )
 
 
 def _log_poll_outcome(
@@ -1219,6 +1533,24 @@ def _log_poll_outcome(
         )
 
 
+def _apply_late_trade_corrections(
+    store: RecorderStore,
+    parquet_root: Path | None,
+    symbol: str,
+    late_trade_gaps: tuple[tuple[int, int], ...],
+) -> None:
+    """Correct every hour MINOR-1's late-trade detection flagged this poll
+    (``_rewrite_hour_for_late_trades``) and mark each gap row rewritten. Pulled out of
+    ``poll_trades_once`` purely to keep that function's own flow easy to see at a glance (m12),
+    the same reason ``_handle_detected_gap`` was split out for the ``window_no_overlap`` case.
+    """
+    if parquet_root is None:
+        return
+    for rowid, close_ms in late_trade_gaps:
+        _rewrite_hour_for_late_trades(store, parquet_root, symbol, close_ms)
+        store.mark_gap_rewritten(rowid)
+
+
 def poll_trades_once(
     client: TabdealClient,
     store: RecorderStore,
@@ -1231,23 +1563,27 @@ def poll_trades_once(
 ) -> PollOutcome:
     """One ``/trades`` poll: fetch, parse, detect a window-overlap gap against the
     previously-stored max id, and persist all of it in one transaction (``_persist_poll``,
-    MAJOR-3).
-
-    Resumption is cursor-free: ``prev_max`` is read from the store itself, so a restarted process
-    resumes exactly where the previous one left off. ``ok`` (MAJOR-2') is ``True`` only when the
-    HTTP call succeeded, the body was a list, and items did not arrive with none of them parsing.
-    ``parquet_root``, when given, lets a newly-discovered gap immediately correct an
-    already-written candle (``_rewrite_candle_incomplete_if_written``); most tests omit it.
+    MAJOR-3). Resumption is cursor-free: ``prev_max`` is read from the store itself, so a
+    restarted process resumes exactly where the previous one left off. ``ok`` (MAJOR-2') is
+    ``True`` only when the HTTP call succeeded, the body was a list, and items did not arrive
+    with none of them parsing. ``parquet_root``, when given, lets a newly-discovered gap
+    immediately correct an already-written candle (``_rewrite_candle_incomplete_if_written``)
+    and lets a late-arriving trade correct an hour already sealed one way or another
+    (``_apply_late_trade_corrections``, MINOR-1); most tests omit it.
     """
     prev_max = store.max_trade_id()
-    now_ms = _dt_to_ms(clock.now())
-    parsed = _fetch_and_parse(client, symbol, limit, now_ms=now_ms)
+    parsed = _fetch_and_parse(client, symbol, limit, clock=clock)
+    now_ms = parsed.now_ms  # NIT: sampled inside _fetch_and_parse, after the HTTP round-trip
     result = parsed.result
     m = _derive_poll_metrics(parsed, prev_max, limit, poll_interval_seconds)
-    inserted, gap_rowid = _persist_poll(store, now_ms=now_ms, symbol=symbol, parsed=parsed, m=m)
+    persisted = _persist_poll(
+        store, now_ms=now_ms, symbol=symbol, parsed=parsed, m=m, parquet_root=parquet_root
+    )
+    inserted, gap_rowid = persisted.inserted, persisted.overlap_gap_rowid
 
     if m.gap is not None and gap_rowid is not None:
         _handle_detected_gap(store, parquet_root, symbol, m.gap, gap_rowid)
+    _apply_late_trade_corrections(store, parquet_root, symbol, persisted.late_trade_gaps)
 
     _log_poll_outcome(
         symbol=symbol,
@@ -1413,25 +1749,31 @@ def _sweep_now_ms(store: RecorderStore, symbol: str, clock_now_ms: int) -> int |
 
 
 def _hour_feed_has_moved_past(
-    store: RecorderStore, symbol: str, close_ms: int, quiet_hour_timeout_seconds: float
+    store: RecorderStore, close_ms: int, quiet_hour_timeout_seconds: float, *, now_ms: int
 ) -> bool:
     """m-C (fifth fix round): whether there is actual evidence the trade feed has moved past the
     hour closing at ``close_ms``, independent of what the (verified-poll-capped) wall clock says.
 
     Either a stored trade exists after ``close_ms`` (direct proof -- some later poll already saw
-    data beyond this hour), or the last verified poll is at least ``quiet_hour_timeout_seconds``
-    past ``close_ms`` (a quiet-market timeout: the feed may simply have nothing new to say, and
+    data beyond this hour), or ``now_ms`` is at least ``quiet_hour_timeout_seconds`` past
+    ``close_ms`` (a quiet-market timeout: the feed may simply have nothing new to say, and
     waiting forever for a trade that may not come for a while would starve the sweep on a
     genuinely dead-quiet market). Without this, ``build_due_candles`` could seal an hour the
     instant the wall clock (or a stale/cached response) said it was due, with no actual evidence
     the feed had moved on -- exactly the stale/cached-response and clock-skew risk this closes.
+
+    NIT (sixth fix round): ``now_ms`` must be the caller's already clock/verified-capped value
+    (``_sweep_now_ms``'s ``min(real_clock_now_ms, verified_poll_ts_ms)``), not a fresh,
+    independent re-query of the raw ``verified_poll_ts_ms``. ``record_verified_poll`` only ever
+    advances (``MAX``-based), so a transient forward clock jump (e.g. an NTP step) recorded once
+    stays stuck at that too-high value forever even after the real clock corrects back down --
+    re-querying it directly here would then permanently satisfy this check for every hour
+    regardless of how little real time had actually passed since. Reusing the capped value
+    self-corrects the instant the real clock reading drops back below the stale verified one.
     """
     if store.has_trade_after(close_ms):
         return True
-    verified_ms = store.verified_poll_ts_ms(symbol)
-    if verified_ms is None:
-        return False
-    return verified_ms >= close_ms + int(quiet_hour_timeout_seconds * 1000)
+    return now_ms >= close_ms + int(quiet_hour_timeout_seconds * 1000)
 
 
 def _recover_unrewritten_gaps(store: RecorderStore, parquet_root: Path, symbol: str) -> None:
@@ -1441,12 +1783,20 @@ def _recover_unrewritten_gaps(store: RecorderStore, parquet_root: Path, symbol: 
     cheap when there is nothing to recover (the common case): called at the very start of every
     sweep so a crash at that exact point self-heals on the next sweep rather than leaving an
     already-written candle ``complete=True`` forever.
+
+    MINOR-1 (sixth fix round): also re-attempts any ``late_trades`` gap left ``rewritten=0`` by a
+    crash between a poll's own transaction committing and its inline correction in
+    ``poll_trades_once`` (``_rewrite_hour_for_late_trades``), the same self-healing role for that
+    gap reason.
     """
     for rowid, from_id, to_id in store.unrewritten_overlap_gaps():
         lo_ts, hi_ts = store.trade_ts_ms(from_id), store.trade_ts_ms(to_id)
         if lo_ts is not None and hi_ts is not None:
             for close_ms in _gap_touched_hour_closes(lo_ts, hi_ts):
                 _rewrite_candle_incomplete_if_written(store, parquet_root, symbol, close_ms)
+        store.mark_gap_rewritten(rowid)
+    for rowid, close_ms in store.unrewritten_hour_gaps("late_trades"):
+        _rewrite_hour_for_late_trades(store, parquet_root, symbol, close_ms)
         store.mark_gap_rewritten(rowid)
 
 
@@ -1525,13 +1875,11 @@ def build_due_candles(
     now_ms = _sweep_now_ms(store, symbol, _dt_to_ms(clock.now()))
     if now_ms is None:  # m-D: no poll has ever been verified -- nothing is due yet.
         return []
-    last_written_ms = candles_mod.last_written_close_ms(parquet_root, symbol)
-    last_swept_ms = store.last_swept_close_ms(symbol)
-    # MAJOR M3: the resumption cursor is the max of "last candle actually written" and "last
-    # empty hour already swept" -- using only the former re-walks every trailing empty hour on
-    # every single poll forever, since an empty hour never writes a candle to advance it.
-    candidates = [v for v in (last_written_ms, last_swept_ms) if v is not None]
-    last_close_ms = max(candidates) if candidates else None
+    # MAJOR M3 (via _resumption_cursor_ms): the resumption cursor is the max of "last candle
+    # actually written" and "last empty hour already swept" -- using only the former re-walks
+    # every trailing empty hour on every single poll forever, since an empty hour never writes a
+    # candle to advance it.
+    last_close_ms = _resumption_cursor_ms(store, parquet_root, symbol)
     earliest_ms = store.earliest_trade_ts_ms()
     written: list[candles_mod.TabdealCandleRecord] = []
     for open_ms, close_ms in candles_mod.pending_hour_bounds(
@@ -1540,7 +1888,7 @@ def build_due_candles(
         now_ms=now_ms,
         grace_period_seconds=grace_period_seconds,
     ):
-        if not _hour_feed_has_moved_past(store, symbol, close_ms, quiet_hour_timeout_seconds):
+        if not _hour_feed_has_moved_past(store, close_ms, quiet_hour_timeout_seconds, now_ms=now_ms):
             break  # m-C: no evidence yet the feed has moved past this hour -- stop, don't skip.
         record = _process_due_hour(store, parquet_root, symbol, open_ms, close_ms, now_ms)
         if record is not None:
@@ -1567,6 +1915,11 @@ class HeartbeatState:
     # recorder that has never recorded a single trade (last_new_trade_ts_ms stays null forever)
     # once it has had long enough to see one, instead of looking healthy indefinitely.
     first_poll_ts_ms: int | None = None
+    # MINOR-3 (sixth fix round): the most recent process_once() cycle's own error text (``None``
+    # on a cycle that completed normally -- this is not sticky), scrubbed through
+    # tbot.monitoring.logging.redact_secrets before it ever reaches this file. See
+    # TabdealRecorderService.process_once and deploy/healthcheck.py.
+    last_cycle_error: str | None = None
 
 
 def write_heartbeat(path: Path, state: HeartbeatState) -> None:
@@ -1580,6 +1933,7 @@ def write_heartbeat(path: Path, state: HeartbeatState) -> None:
         "consecutive_errors": state.consecutive_errors,
         "last_new_trade_ts_ms": state.last_new_trade_ts_ms,
         "first_poll_ts_ms": state.first_poll_ts_ms,
+        "last_cycle_error": state.last_cycle_error,
     }
     tmp_path = path.with_name(path.name + ".tmp")
     tmp_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -1668,49 +2022,73 @@ class TabdealRecorderService:
         self.store.close()
 
     def process_once(self) -> PollOutcome:
-        outcome = poll_trades_once(
-            self.client,
-            self.store,
-            symbol=self.settings.symbol,
-            limit=self.settings.trades_limit,
-            poll_interval_seconds=self.settings.poll_interval_seconds,
-            clock=self.clock,
-            parquet_root=self.parquet_root,
-        )
-        self._consecutive_errors = 0 if outcome.ok else self._consecutive_errors + 1
+        """One poll/sweep/orderbook cycle.
 
-        build_due_candles(
-            self.store,
-            symbol=self.settings.symbol,
-            parquet_root=self.parquet_root,
-            grace_period_seconds=self.settings.grace_period_seconds,
-            clock=self.clock,
-            quiet_hour_timeout_seconds=self.settings.quiet_hour_timeout_seconds,
-        )
-
-        now_ms = _dt_to_ms(self.clock.now())
-        if self._next_orderbook_due_ms is None or now_ms >= self._next_orderbook_due_ms:
-            poll_orderbook_once(
+        MINOR-3 (sixth fix round): the heartbeat is now written from a ``finally`` block, so it
+        is rewritten even when this cycle raises (e.g. a bug inside ``build_due_candles``) --
+        previously an exception anywhere after the poll itself left the heartbeat file stale from
+        before the failure started, with nothing in it to say a cycle had failed at all between
+        ``run_forever``'s own (redacted) log line and the next successful cycle, which could be a
+        long time away given MINOR-3's backoff fix below. ``last_cycle_error`` carries that
+        cycle's own error text (scrubbed through the existing redaction pipeline), ``None`` on a
+        cycle that completed normally -- it is not sticky.
+        """
+        last_cycle_error: str | None = None
+        try:
+            outcome = poll_trades_once(
                 self.client,
                 self.store,
                 symbol=self.settings.symbol,
-                depth_limit=self.settings.depth_limit,
+                limit=self.settings.trades_limit,
+                poll_interval_seconds=self.settings.poll_interval_seconds,
                 clock=self.clock,
+                parquet_root=self.parquet_root,
             )
-            self._next_orderbook_due_ms = now_ms + int(self.settings.orderbook_interval_seconds * 1000)
+            self._consecutive_errors = 0 if outcome.ok else self._consecutive_errors + 1
 
-        write_heartbeat(
-            self.heartbeat_file,
-            HeartbeatState(
-                last_poll_ts=self.clock.now(),
-                last_trade_id=self.store.max_trade_id(),
-                n_trades_total=self.store.total_trade_count(),
-                consecutive_errors=self._consecutive_errors,
-                last_new_trade_ts_ms=self.store.last_recorded_ts_ms(),
-                first_poll_ts_ms=self.store.first_poll_ts_ms(),
-            ),
-        )
+            build_due_candles(
+                self.store,
+                symbol=self.settings.symbol,
+                parquet_root=self.parquet_root,
+                grace_period_seconds=self.settings.grace_period_seconds,
+                clock=self.clock,
+                quiet_hour_timeout_seconds=self.settings.quiet_hour_timeout_seconds,
+            )
+
+            self._maybe_poll_orderbook()
+        except Exception as exc:
+            last_cycle_error = _redact_cycle_error(str(exc))
+            raise
+        finally:
+            write_heartbeat(
+                self.heartbeat_file,
+                HeartbeatState(
+                    last_poll_ts=self.clock.now(),
+                    last_trade_id=self.store.max_trade_id(),
+                    n_trades_total=self.store.total_trade_count(),
+                    consecutive_errors=self._consecutive_errors,
+                    last_new_trade_ts_ms=self.store.last_recorded_ts_ms(),
+                    first_poll_ts_ms=self.store.first_poll_ts_ms(),
+                    last_cycle_error=last_cycle_error,
+                ),
+            )
         return outcome
+
+    def _maybe_poll_orderbook(self) -> None:
+        """Poll ``/depth`` if ``orderbook_interval_seconds`` has elapsed since the last poll.
+        Pulled out of ``process_once`` purely to keep that function's own flow (poll, sweep,
+        heartbeat) easy to see at a glance."""
+        now_ms = _dt_to_ms(self.clock.now())
+        if self._next_orderbook_due_ms is not None and now_ms < self._next_orderbook_due_ms:
+            return
+        poll_orderbook_once(
+            self.client,
+            self.store,
+            symbol=self.settings.symbol,
+            depth_limit=self.settings.depth_limit,
+            clock=self.clock,
+        )
+        self._next_orderbook_due_ms = now_ms + int(self.settings.orderbook_interval_seconds * 1000)
 
     def _next_wait_seconds(self, elapsed_seconds: float) -> float:
         """Seconds to wait before the next cycle, given how long this one took.
@@ -1725,9 +2103,19 @@ class TabdealRecorderService:
         ``poll_interval_seconds`` with no relief. The wait is still a ``threading.Event.wait()``
         (see ``run_forever``), so it remains interruptible by ``request_stop()`` regardless of
         length -- a long backoff never delays shutdown.
+
+        MINOR-3 (sixth fix round): the backoff now keys off ``max(_consecutive_errors,
+        _consecutive_cycle_exceptions)``, not ``_consecutive_errors`` alone. A sweep-only
+        exception (e.g. a corrupt Parquet part hit by ``build_due_candles``, not an ordinary poll
+        failure) kept the *poll* itself succeeding every cycle, which reset ``_consecutive_errors``
+        to 0 right before the sweep raised -- only ``_consecutive_cycle_exceptions`` (which this
+        method never looked at) actually climbed toward ``run_forever``'s fatal-exit threshold,
+        so the process retried at the full, un-backed-off nominal poll interval the entire way
+        there (measured: exits every ~95s with zero backoff).
         """
         base = self.settings.poll_interval_seconds
-        if self._consecutive_errors > _BACKOFF_THRESHOLD_ERRORS:
+        effective_errors = max(self._consecutive_errors, self._consecutive_cycle_exceptions)
+        if effective_errors > _BACKOFF_THRESHOLD_ERRORS:
             # m-F (fifth fix round): the exponent is capped *before* ``2 ** exponent`` is ever
             # computed -- ``5.0 * 2 ** (n - 5)`` previously overflowed (``OverflowError: int too
             # large to convert to float``) once ``n`` grew large enough (around 1029), outside any
@@ -1735,7 +2123,7 @@ class TabdealRecorderService:
             # exponent at ``_BACKOFF_MAX_EXPONENT`` (65536x the base interval) already exceeds
             # ``_BACKOFF_CAP_SECONDS`` for any sane ``poll_interval_seconds``, so the subsequent
             # ``min(..., _BACKOFF_CAP_SECONDS)`` is still what actually bounds the result.
-            exponent = min(self._consecutive_errors - _BACKOFF_THRESHOLD_ERRORS, _BACKOFF_MAX_EXPONENT)
+            exponent = min(effective_errors - _BACKOFF_THRESHOLD_ERRORS, _BACKOFF_MAX_EXPONENT)
             base = min(base * (2**exponent), _BACKOFF_CAP_SECONDS)
         return max(0.0, base - elapsed_seconds)
 
