@@ -226,7 +226,15 @@ Tabdeal has no kline endpoint, so 1h candles are built from polled public `/trad
   empty-hour gap overlapping the bar — never by the uninformative `saturated` flag (D-024).
   Resampling uses `label='right', closed='right'`; an hour with no trades produces **no bar** and a gap row —
   never a forward-filled bar.
-- A candle for hour H is written only after `H_end + grace` (grace default 60 s) has passed.
+- A candle for hour H is written only when **all** hold (D-041): `H_end + grace` (grace default 60 s) has passed
+  on the clock capped at the last verified poll; and either a stored trade exists with `ts > H_end` (the feed
+  has moved past the hour) or the last verified poll is ≥ `H_end + quiet_hour_timeout` (default 7200 s). The
+  sweep stops at the first hour that fails, and never runs before any poll has been verified. An HTTP-200
+  empty list after data exists is not a verified poll. Trades are rejected only as implausible
+  (`ts < 1.5e12` ms or more than 5 min in the future), never for being old.
+- Schema v4: `gaps.rewritten` — a `window_no_overlap` gap's rewrite of already-written candles is retried by
+  every sweep until it succeeds (D-041). The process exits non-zero after 20 consecutive failed cycles so
+  Docker restarts it.
 
 ---
 
@@ -334,6 +342,8 @@ drawdown exceeds the 95th percentile of the bootstrap distribution. Capital scal
 | D-038 | Recorder hardening after review: one SQLite transaction per poll; the candle sweep never passes the last verified poll (`recorder_state`); a `meta` table pins the database to one symbol; recorder-level exponential backoff (cap 300 s) after 5 consecutive errors; the heartbeat carries `last_new_trade_ts_ms` and the healthcheck fails after 7200 s without a new trade | review MAJOR-1..3 and m3/m4/m6. 7200 s because the measured max gap between BTCUSDT trades on Tabdeal was 2120 s |
 | D-039 | **Proposed, pending Parham:** G1b's Binance-vs-Tabdeal basis needs Binance bars after `holdout_start`, which D-032 forbids downloading. Proposal: a separate live-comparison fetch (Binance REST, only the G1b window) into `data/live_compare/`, unreadable by the research loader and never used for strategy evaluation | the seal and G1b otherwise contradict each other (review m10) |
 | D-040 | **Open, pending Parham:** G1a reconciliation fails on exactly 3 timestamps (2021-01-21, 2021-04-23, 2022-04-13), volume only, identical in BTC and ETH and in both 4h and 1d — Binance's own files disagree; OHLC reconciles everywhere outside outages | §7 says criteria may never be relaxed after seeing data, so this is Parham's call, not the orchestrator's |
+| D-041 | Recorder review round 2: the candle sweep needs evidence the feed has passed the hour (a later trade, or a 2 h quiet timeout after a verified poll); `[]` after data is not verified; the 24 h age filter is replaced by a plausibility check; schema v4 self-healing rewrites; fatal exit after 20 failed cycles | round-2 MAJOR-A (age filter rejected ~17 % of every 29 h window), MAJOR-B (`[]` sealed hours with missing trades) and m-C (stale/cached responses, clock skew). Cost: a genuinely silent hour seals up to 2 h late |
+| D-042 | Amends D-036: gap auto-classification is evidence-scoped — `exchange_outage` only when a *dropped* anomaly overlaps the missing-bar window `(from, to − Δ]`; `exchange_outage_after_short_bar` when a stored short bar's label equals the gap start; `exchange_wide_outage` when the identical window is missing in the other symbol from the same source. Every gap records `classified_by` (anomaly_overlap / after_short_bar / cross_symbol / manual); no rule overwrites a non-`unknown` classification. A raw close later than its label (beyond the 1-unit epsilon) is `long` and dropped | round-2 m-J: the first rule was broad enough to explain away unrelated gaps. Cross-symbol corroboration is evidence, not a guess: an exchange-wide stop hits every market at once |
 
 ---
 
