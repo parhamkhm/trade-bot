@@ -31,6 +31,7 @@ from scripts.tabdeal_probe import (
     detect_id_space,
     detect_time_unit,
     discover_max_trades_limit,
+    exchange_info_symbols,
     find_base_asset_markets,
     find_symbol_entry,
     ids_contiguous_in_window,
@@ -1359,3 +1360,15 @@ def test_trade_activity_stats_counts_full_hours_only_and_max_gap() -> None:
     assert stats["trades_per_hour_min"] == 0
     assert stats["trades_per_hour_max"] == 2
     assert stats["max_inter_trade_gap_seconds"] == (13 * hour + 7 - (11 * hour + 2)) / 1000.0
+
+
+def test_exchange_info_as_bare_list_is_supported() -> None:
+    """Tabdeal's real exchangeInfo body is a bare list of markets, not {"symbols": [...]}."""
+    as_list = EXCHANGE_INFO_BODY["symbols"]
+    assert exchange_info_symbols(as_list) is as_list
+    assert exchange_info_symbols(EXCHANGE_INFO_BODY) is as_list
+    assert exchange_info_symbols("garbage") is None
+    entry = find_symbol_entry(as_list, "BTC", "USDT")
+    assert entry is not None
+    assert entry["symbol"] == "BTCUSDT"
+    assert find_base_asset_markets(as_list, "BTC")

@@ -91,6 +91,7 @@ __all__ = [
     "detect_id_space",
     "detect_time_unit",
     "discover_max_trades_limit",
+    "exchange_info_symbols",
     "extract_nonzero_balances",
     "find_base_asset_markets",
     "find_symbol_entry",
@@ -502,11 +503,25 @@ def _normalize_symbol_code(value: str) -> str:
     return value.upper().replace("_", "").replace("-", "")
 
 
+def exchange_info_symbols(exchange_info_body: Any) -> list[Any] | None:
+    """The list of market entries in an ``exchangeInfo`` body.
+
+    Tabdeal returns a bare JSON list of markets (measured from the Turkey server, 2026-10-05:
+    1047 entries), not Binance's ``{"symbols": [...]}`` object; both shapes are accepted.
+    """
+    if isinstance(exchange_info_body, list):
+        return exchange_info_body
+    if isinstance(exchange_info_body, dict):
+        symbols = exchange_info_body.get("symbols")
+        return symbols if isinstance(symbols, list) else None
+    return None
+
+
 def find_symbol_entry(exchange_info_body: Any, base: str, quote: str) -> dict[str, Any] | None:
     """Find the ``exchangeInfo`` entry for ``base+quote``, checking both ``symbol`` and
     ``tabdealSymbol`` fields (docs/SPEC.md open question 4)."""
-    symbols = exchange_info_body.get("symbols") if isinstance(exchange_info_body, dict) else None
-    if not isinstance(symbols, list):
+    symbols = exchange_info_symbols(exchange_info_body)
+    if symbols is None:
         return None
     target = _normalize_symbol_code(f"{base}{quote}")
     for entry in symbols:
@@ -522,8 +537,8 @@ def find_symbol_entry(exchange_info_body: Any, base: str, quote: str) -> dict[st
 def find_base_asset_markets(exchange_info_body: Any, base: str) -> list[dict[str, Any]]:
     """Every market involving ``base`` -- used to report what *does* exist when the expected
     symbol is missing."""
-    symbols = exchange_info_body.get("symbols") if isinstance(exchange_info_body, dict) else None
-    if not isinstance(symbols, list):
+    symbols = exchange_info_symbols(exchange_info_body)
+    if symbols is None:
         return []
     out: list[dict[str, Any]] = []
     for entry in symbols:
