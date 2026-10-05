@@ -232,3 +232,89 @@ def test_is_saturated_docstring_matches_implementation_ge_semantics() -> None:
     the actual comparison operator must agree regardless."""
     assert "greater than or equal to" in (depth.is_saturated.__doc__ or "")
     assert depth.is_saturated(500, 501) is True
+
+
+# ---------------------------------------------------------------------------------
+# IRT cross-rate maths: convert_irt_to_usdt / implied_price_from_legs / price_basis_bps
+# ---------------------------------------------------------------------------------
+
+
+def test_convert_irt_to_usdt_hand_computed() -> None:
+    # 26,800,000 IRT / 268,000 (USDTIRT mid) = 100 USDT exactly.
+    assert depth.convert_irt_to_usdt(Decimal("26800000"), Decimal("268000")) == Decimal("100")
+
+
+def test_convert_irt_to_usdt_none_on_non_positive_mid() -> None:
+    assert depth.convert_irt_to_usdt(Decimal("100"), Decimal("0")) is None
+    assert depth.convert_irt_to_usdt(Decimal("100"), Decimal("-1")) is None
+
+
+def test_implied_price_from_legs_hand_computed() -> None:
+    # BTCIRT mid 2,300,000,000,000 / USDTIRT mid 268,000 = 8,582,089.55223880597... USDT.
+    implied = depth.implied_price_from_legs(Decimal("2300000000000"), Decimal("268000"))
+    assert implied == Decimal("2300000000000") / Decimal("268000")
+
+
+def test_implied_price_from_legs_none_on_non_positive_mid() -> None:
+    assert depth.implied_price_from_legs(Decimal("100"), Decimal("0")) is None
+
+
+def test_price_basis_bps_hand_computed() -> None:
+    # (101 - 100) / 100 * 10000 = 100 bps.
+    assert depth.price_basis_bps(Decimal("101"), Decimal("100")) == pytest.approx(100.0)
+
+
+def test_price_basis_bps_negative_when_observed_below_reference() -> None:
+    assert depth.price_basis_bps(Decimal("99"), Decimal("100")) == pytest.approx(-100.0)
+
+
+def test_price_basis_bps_none_on_non_positive_reference() -> None:
+    assert depth.price_basis_bps(Decimal("100"), Decimal("0")) is None
+    assert depth.price_basis_bps(Decimal("100"), Decimal("-5")) is None
+
+
+# ---------------------------------------------------------------------------------
+# median_decimal / percentile_decimal -- exact Decimal, never routed through float
+# ---------------------------------------------------------------------------------
+
+
+def test_median_decimal_odd_length_returns_middle_element_exactly() -> None:
+    values = [Decimal("3"), Decimal("1"), Decimal("2")]
+    assert depth.median_decimal(values) == Decimal("2")
+
+
+def test_median_decimal_even_length_averages_the_two_middle_elements() -> None:
+    values = [Decimal("1"), Decimal("2"), Decimal("3"), Decimal("4")]
+    assert depth.median_decimal(values) == Decimal("2.5")
+
+
+def test_median_decimal_empty_is_none() -> None:
+    assert depth.median_decimal([]) is None
+
+
+def test_median_decimal_preserves_exact_precision_no_float_detour() -> None:
+    values = [Decimal("0.1"), Decimal("0.2"), Decimal("0.3")]
+    median = depth.median_decimal(values)
+    assert median == Decimal("0.2")
+    assert str(median) == "0.2"  # exact, not 0.19999999999999998 or similar
+
+
+def test_percentile_decimal_p10_of_thirty_ordered_values_is_nearest_rank() -> None:
+    # Nearest-rank p10 of 30 values: rank = ceil(0.10 * 30) = 3 -> the 3rd-smallest value.
+    values = [Decimal(str(i)) for i in range(1, 31)]
+    assert depth.percentile_decimal(values, Decimal("0.10")) == Decimal("3")
+
+
+def test_percentile_decimal_returns_an_actual_input_value_never_an_interpolation() -> None:
+    values = [Decimal("1.111111"), Decimal("2.222222"), Decimal("3.333333")]
+    result = depth.percentile_decimal(values, Decimal("0.5"))
+    assert result in values
+
+
+def test_percentile_decimal_empty_is_none() -> None:
+    assert depth.percentile_decimal([], Decimal("0.10")) is None
+
+
+def test_percentile_decimal_clamps_fraction_at_or_below_zero_to_the_first_rank() -> None:
+    values = [Decimal("5"), Decimal("1"), Decimal("3")]
+    assert depth.percentile_decimal(values, Decimal("0")) == Decimal("1")
