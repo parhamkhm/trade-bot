@@ -1,6 +1,6 @@
 {
   "source": "binance",
-  "symbol": "ETHUSDT",
+  "symbol": "BTCUSDT",
   "timeframe": "4h",
   "rows": 16963,
   "first_ts": "2018-01-01T04:00:00Z",
@@ -479,259 +479,263 @@
       "from": "2018-02-08T04:00:00Z",
       "to": "2018-02-09T12:00:00Z",
       "missing_bars": 7,
-      "classification": "unknown"
+      "classification": "exchange_wide_outage",
+      "classified_by": "cross_symbol"
     },
     {
       "from": "2018-06-26T04:00:00Z",
       "to": "2018-06-26T16:00:00Z",
       "missing_bars": 2,
-      "classification": "unknown"
+      "classification": "exchange_outage_after_short_bar",
+      "classified_by": "after_short_bar"
     },
     {
       "from": "2018-07-04T04:00:00Z",
       "to": "2018-07-04T12:00:00Z",
       "missing_bars": 1,
-      "classification": "unknown"
+      "classification": "exchange_outage_after_short_bar",
+      "classified_by": "after_short_bar"
     },
     {
       "from": "2018-11-14T04:00:00Z",
       "to": "2018-11-14T12:00:00Z",
       "missing_bars": 1,
-      "classification": "unknown"
+      "classification": "exchange_outage_after_short_bar",
+      "classified_by": "after_short_bar"
     },
     {
       "from": "2019-03-12T04:00:00Z",
       "to": "2019-03-12T12:00:00Z",
       "missing_bars": 1,
-      "classification": "unknown"
+      "classification": "exchange_outage_after_short_bar",
+      "classified_by": "after_short_bar"
     },
     {
       "from": "2019-05-15T04:00:00Z",
       "to": "2019-05-15T16:00:00Z",
       "missing_bars": 2,
-      "classification": "unknown"
+      "classification": "exchange_outage_after_short_bar",
+      "classified_by": "after_short_bar"
     },
     {
       "from": "2019-08-15T04:00:00Z",
       "to": "2019-08-15T12:00:00Z",
       "missing_bars": 1,
-      "classification": "unknown"
+      "classification": "exchange_outage_after_short_bar",
+      "classified_by": "after_short_bar"
     },
     {
       "from": "2020-02-19T12:00:00Z",
       "to": "2020-02-19T20:00:00Z",
       "missing_bars": 1,
-      "classification": "unknown"
+      "classification": "exchange_outage_after_short_bar",
+      "classified_by": "after_short_bar"
     }
   ],
   "zero_volume_bars": [],
   "high_eq_low_bars": [],
   "return_outliers": [
     {
-      "ts": "2020-03-12T12:00:00Z",
-      "pct_return": -0.20406736204183906
-    },
-    {
       "ts": "2020-03-13T00:00:00Z",
-      "pct_return": -0.2207848522078486
+      "pct_return": -0.20496235993672818
     }
   ],
   "source_anomalies": [
     {
-      "symbol": "ETHUSDT",
+      "symbol": "BTCUSDT",
       "timeframe": "4h",
       "raw_open": "2018-01-04T00:00:00Z",
-      "raw_close": "2018-01-04T03:00:14.849000Z",
-      "duration_seconds": 10814.849,
-      "n_trades": 18649,
-      "volume": "13290.75778000",
+      "raw_close": "2018-01-04T03:00:14.838000Z",
+      "duration_seconds": 10814.838,
+      "n_trades": 25901,
+      "volume": "3062.53564600",
       "classification": "short",
       "action": "stored_flagged"
     },
     {
-      "symbol": "ETHUSDT",
+      "symbol": "BTCUSDT",
       "timeframe": "4h",
       "raw_open": "2018-06-26T00:00:00Z",
       "raw_close": "2018-06-26T01:59:59.999000Z",
       "duration_seconds": 7199.999,
-      "n_trades": 9407,
-      "volume": "9200.14356000",
+      "n_trades": 18655,
+      "volume": "2669.96485300",
       "classification": "short",
       "action": "stored_flagged"
     },
     {
-      "symbol": "ETHUSDT",
+      "symbol": "BTCUSDT",
       "timeframe": "4h",
       "raw_open": "2018-07-04T00:00:00Z",
-      "raw_close": "2018-07-04T00:22:25.562000Z",
-      "duration_seconds": 1345.562,
-      "n_trades": 2362,
-      "volume": "2287.10440000",
+      "raw_close": "2018-07-04T00:22:25.551000Z",
+      "duration_seconds": 1345.551,
+      "n_trades": 5307,
+      "volume": "1543.48440200",
       "classification": "short",
       "action": "stored_flagged"
     },
     {
-      "symbol": "ETHUSDT",
+      "symbol": "BTCUSDT",
       "timeframe": "4h",
       "raw_open": "2018-10-19T04:00:00Z",
       "raw_close": "2018-10-19T05:59:59.999000Z",
       "duration_seconds": 7199.999,
-      "n_trades": 10023,
-      "volume": "21405.69848000",
+      "n_trades": 8245,
+      "volume": "935.84567000",
       "classification": "short",
       "action": "stored_flagged"
     },
     {
-      "symbol": "ETHUSDT",
+      "symbol": "BTCUSDT",
       "timeframe": "4h",
       "raw_open": "2018-11-14T00:00:00Z",
       "raw_close": "2018-11-14T01:59:59.999000Z",
       "duration_seconds": 7199.999,
-      "n_trades": 3861,
-      "volume": "9896.16004000",
+      "n_trades": 11062,
+      "volume": "750.08455200",
       "classification": "short",
       "action": "stored_flagged"
     },
     {
-      "symbol": "ETHUSDT",
+      "symbol": "BTCUSDT",
       "timeframe": "4h",
       "raw_open": "2019-03-12T00:00:00Z",
       "raw_close": "2019-03-12T01:59:59.999000Z",
       "duration_seconds": 7199.999,
-      "n_trades": 8985,
-      "volume": "26092.49140000",
+      "n_trades": 26767,
+      "volume": "5590.76175000",
       "classification": "short",
       "action": "stored_flagged"
     },
     {
-      "symbol": "ETHUSDT",
+      "symbol": "BTCUSDT",
       "timeframe": "4h",
       "raw_open": "2019-05-15T00:00:00Z",
       "raw_close": "2019-05-15T02:59:59.999000Z",
       "duration_seconds": 10799.999,
-      "n_trades": 34884,
-      "volume": "124534.23021000",
+      "n_trades": 73627,
+      "volume": "7684.29632300",
       "classification": "short",
       "action": "stored_flagged"
     },
     {
-      "symbol": "ETHUSDT",
+      "symbol": "BTCUSDT",
       "timeframe": "4h",
       "raw_open": "2019-08-15T00:00:00Z",
       "raw_close": "2019-08-15T01:59:59.999000Z",
       "duration_seconds": 7199.999,
-      "n_trades": 13384,
-      "volume": "27285.50284000",
+      "n_trades": 44639,
+      "volume": "4803.61528700",
       "classification": "short",
       "action": "stored_flagged"
     },
     {
-      "symbol": "ETHUSDT",
+      "symbol": "BTCUSDT",
       "timeframe": "4h",
       "raw_open": "2019-11-13T00:00:00Z",
       "raw_close": "2019-11-13T01:59:59.999000Z",
       "duration_seconds": 7199.999,
-      "n_trades": 7616,
-      "volume": "13976.29838000",
+      "n_trades": 27685,
+      "volume": "2686.10116900",
       "classification": "short",
       "action": "stored_flagged"
     },
     {
-      "symbol": "ETHUSDT",
+      "symbol": "BTCUSDT",
       "timeframe": "4h",
       "raw_open": "2020-02-19T08:00:00Z",
-      "raw_close": "2020-02-19T11:35:32.298000Z",
-      "duration_seconds": 12932.298,
-      "n_trades": 42208,
-      "volume": "100503.93617000",
+      "raw_close": "2020-02-19T11:35:32.286000Z",
+      "duration_seconds": 12932.286,
+      "n_trades": 78408,
+      "volume": "7160.08723600",
       "classification": "short",
       "action": "stored_flagged"
     },
     {
-      "symbol": "ETHUSDT",
+      "symbol": "BTCUSDT",
       "timeframe": "4h",
       "raw_open": "2020-04-25T00:00:00Z",
       "raw_close": "2020-04-25T01:59:59.999000Z",
       "duration_seconds": 7199.999,
-      "n_trades": 12590,
-      "volume": "44191.29534000",
+      "n_trades": 33965,
+      "volume": "2938.77791600",
       "classification": "short",
       "action": "stored_flagged"
     },
     {
-      "symbol": "ETHUSDT",
+      "symbol": "BTCUSDT",
       "timeframe": "4h",
       "raw_open": "2020-06-28T00:00:00Z",
       "raw_close": "2020-06-28T01:59:59.999000Z",
       "duration_seconds": 7199.999,
-      "n_trades": 13464,
-      "volume": "42088.08093000",
+      "n_trades": 32908,
+      "volume": "2746.15341900",
       "classification": "short",
       "action": "stored_flagged"
     },
     {
-      "symbol": "ETHUSDT",
+      "symbol": "BTCUSDT",
       "timeframe": "4h",
       "raw_open": "2020-12-21T12:00:00Z",
-      "raw_close": "2020-12-21T13:47:20.528000Z",
-      "duration_seconds": 6440.528,
-      "n_trades": 80391,
-      "volume": "144433.84092000",
+      "raw_close": "2020-12-21T13:47:20.521000Z",
+      "duration_seconds": 6440.521,
+      "n_trades": 225242,
+      "volume": "14924.65632700",
       "classification": "short",
       "action": "stored_flagged"
     },
     {
-      "symbol": "ETHUSDT",
+      "symbol": "BTCUSDT",
       "timeframe": "4h",
       "raw_open": "2021-02-11T00:00:00Z",
-      "raw_close": "2021-02-11T03:40:55.829000Z",
-      "duration_seconds": 13255.829,
-      "n_trades": 86673,
-      "volume": "78669.51899000",
+      "raw_close": "2021-02-11T03:40:54.773000Z",
+      "duration_seconds": 13254.773,
+      "n_trades": 222965,
+      "volume": "7762.67679600",
       "classification": "short",
       "action": "stored_flagged"
     },
     {
-      "symbol": "ETHUSDT",
+      "symbol": "BTCUSDT",
       "timeframe": "4h",
       "raw_open": "2021-04-20T00:00:00Z",
       "raw_close": "2021-04-20T01:59:59.999000Z",
       "duration_seconds": 7199.999,
-      "n_trades": 144549,
-      "volume": "125491.90313000",
+      "n_trades": 251368,
+      "volume": "9222.58505700",
       "classification": "short",
       "action": "stored_flagged"
     },
     {
-      "symbol": "ETHUSDT",
+      "symbol": "BTCUSDT",
       "timeframe": "4h",
       "raw_open": "2021-04-25T04:00:00Z",
-      "raw_close": "2021-04-25T04:00:59.271000Z",
-      "duration_seconds": 59.271,
-      "n_trades": 412,
-      "volume": "161.74877000",
+      "raw_close": "2021-04-25T04:00:58.146000Z",
+      "duration_seconds": 58.146,
+      "n_trades": 224,
+      "volume": "5.88703400",
       "classification": "short",
       "action": "stored_flagged"
     },
     {
-      "symbol": "ETHUSDT",
+      "symbol": "BTCUSDT",
       "timeframe": "4h",
       "raw_open": "2021-08-13T00:00:00Z",
       "raw_close": "2021-08-13T01:59:59Z",
       "duration_seconds": 7199.0,
-      "n_trades": 92871,
-      "volume": "50008.14934000",
+      "n_trades": 266447,
+      "volume": "4783.84453200",
       "classification": "short",
       "action": "stored_flagged"
     },
     {
-      "symbol": "ETHUSDT",
+      "symbol": "BTCUSDT",
       "timeframe": "4h",
       "raw_open": "2021-09-29T04:00:00Z",
       "raw_close": "2021-09-29T06:59:59.999000Z",
       "duration_seconds": 10799.999,
-      "n_trades": 87529,
-      "volume": "55910.93030000",
+      "n_trades": 95445,
+      "volume": "3870.25890000",
       "classification": "short",
       "action": "stored_flagged"
     }
@@ -741,7 +745,7 @@
       "ts": "2018-02-09T12:00:00Z",
       "column": "open",
       "resampled": NaN,
-      "stored": 781.66,
+      "stored": 7789.9,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -749,7 +753,7 @@
       "ts": "2018-02-09T12:00:00Z",
       "column": "high",
       "resampled": NaN,
-      "stored": 843.0,
+      "stored": 8395.0,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -757,7 +761,7 @@
       "ts": "2018-02-09T12:00:00Z",
       "column": "low",
       "resampled": NaN,
-      "stored": 781.66,
+      "stored": 7789.9,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -765,7 +769,7 @@
       "ts": "2018-02-09T12:00:00Z",
       "column": "close",
       "resampled": NaN,
-      "stored": 834.0,
+      "stored": 8280.11,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -773,15 +777,15 @@
       "ts": "2018-02-09T12:00:00Z",
       "column": "volume",
       "resampled": 0.0,
-      "stored": 17579.47185,
-      "diff": 17579.47185,
+      "stored": 3483.805239,
+      "diff": 3483.805239,
       "in_outage_window": true
     },
     {
       "ts": "2018-02-09T16:00:00Z",
       "column": "open",
       "resampled": NaN,
-      "stored": 833.15,
+      "stored": 8288.03,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -789,7 +793,7 @@
       "ts": "2018-02-09T16:00:00Z",
       "column": "high",
       "resampled": NaN,
-      "stored": 862.0,
+      "stored": 8540.0,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -797,7 +801,7 @@
       "ts": "2018-02-09T16:00:00Z",
       "column": "low",
       "resampled": NaN,
-      "stored": 823.99,
+      "stored": 8201.95,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -805,7 +809,7 @@
       "ts": "2018-02-09T16:00:00Z",
       "column": "close",
       "resampled": NaN,
-      "stored": 845.38,
+      "stored": 8333.91,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -813,15 +817,15 @@
       "ts": "2018-02-09T16:00:00Z",
       "column": "volume",
       "resampled": 0.0,
-      "stored": 30018.10659,
-      "diff": 30018.10659,
+      "stored": 6043.02653,
+      "diff": 6043.02653,
       "in_outage_window": true
     },
     {
       "ts": "2018-02-09T20:00:00Z",
       "column": "open",
       "resampled": NaN,
-      "stored": 845.02,
+      "stored": 8333.98,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -829,7 +833,7 @@
       "ts": "2018-02-09T20:00:00Z",
       "column": "high",
       "resampled": NaN,
-      "stored": 882.2,
+      "stored": 8738.0,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -837,7 +841,7 @@
       "ts": "2018-02-09T20:00:00Z",
       "column": "low",
       "resampled": NaN,
-      "stored": 843.29,
+      "stored": 8312.0,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -845,7 +849,7 @@
       "ts": "2018-02-09T20:00:00Z",
       "column": "close",
       "resampled": NaN,
-      "stored": 872.44,
+      "stored": 8633.15,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -853,15 +857,15 @@
       "ts": "2018-02-09T20:00:00Z",
       "column": "volume",
       "resampled": 0.0,
-      "stored": 25462.94565,
-      "diff": 25462.94565,
+      "stored": 5944.072439,
+      "diff": 5944.072439,
       "in_outage_window": true
     },
     {
       "ts": "2018-02-10T00:00:00Z",
       "column": "open",
       "resampled": NaN,
-      "stored": 872.21,
+      "stored": 8638.05,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -869,7 +873,7 @@
       "ts": "2018-02-10T00:00:00Z",
       "column": "high",
       "resampled": NaN,
-      "stored": 882.0,
+      "stored": 8720.04,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -877,7 +881,7 @@
       "ts": "2018-02-10T00:00:00Z",
       "column": "low",
       "resampled": NaN,
-      "stored": 850.12,
+      "stored": 8403.0,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -885,7 +889,7 @@
       "ts": "2018-02-10T00:00:00Z",
       "column": "close",
       "resampled": NaN,
-      "stored": 877.0,
+      "stored": 8683.92,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -893,15 +897,15 @@
       "ts": "2018-02-10T00:00:00Z",
       "column": "volume",
       "resampled": 0.0,
-      "stored": 22387.1488,
-      "diff": 22387.1488,
+      "stored": 5012.006617,
+      "diff": 5012.006617,
       "in_outage_window": true
     },
     {
       "ts": "2018-02-10T04:00:00Z",
       "column": "open",
       "resampled": NaN,
-      "stored": 876.3,
+      "stored": 8683.93,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -909,7 +913,7 @@
       "ts": "2018-02-10T04:00:00Z",
       "column": "high",
       "resampled": NaN,
-      "stored": 900.0,
+      "stored": 8997.0,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -917,7 +921,7 @@
       "ts": "2018-02-10T04:00:00Z",
       "column": "low",
       "resampled": NaN,
-      "stored": 867.55,
+      "stored": 8601.0,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -925,7 +929,7 @@
       "ts": "2018-02-10T04:00:00Z",
       "column": "close",
       "resampled": NaN,
-      "stored": 891.22,
+      "stored": 8905.84,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -933,15 +937,15 @@
       "ts": "2018-02-10T04:00:00Z",
       "column": "volume",
       "resampled": 0.0,
-      "stored": 33024.91285,
-      "diff": 33024.91285,
+      "stored": 7993.502755,
+      "diff": 7993.502755,
       "in_outage_window": true
     },
     {
       "ts": "2018-02-10T08:00:00Z",
       "column": "open",
       "resampled": NaN,
-      "stored": 891.87,
+      "stored": 8905.84,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -949,7 +953,7 @@
       "ts": "2018-02-10T08:00:00Z",
       "column": "high",
       "resampled": NaN,
-      "stored": 911.2,
+      "stored": 9065.78,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -957,7 +961,7 @@
       "ts": "2018-02-10T08:00:00Z",
       "column": "low",
       "resampled": NaN,
-      "stored": 878.19,
+      "stored": 8760.0,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -965,7 +969,7 @@
       "ts": "2018-02-10T08:00:00Z",
       "column": "close",
       "resampled": NaN,
-      "stored": 897.02,
+      "stored": 8915.15,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -973,15 +977,15 @@
       "ts": "2018-02-10T08:00:00Z",
       "column": "volume",
       "resampled": 0.0,
-      "stored": 27666.93678,
-      "diff": 27666.93678,
+      "stored": 5592.523995,
+      "diff": 5592.523995,
       "in_outage_window": true
     },
     {
       "ts": "2018-02-10T12:00:00Z",
       "column": "open",
       "resampled": NaN,
-      "stored": 897.26,
+      "stored": 8915.15,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -989,7 +993,7 @@
       "ts": "2018-02-10T12:00:00Z",
       "column": "high",
       "resampled": NaN,
-      "stored": 897.26,
+      "stored": 8920.17,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -997,7 +1001,7 @@
       "ts": "2018-02-10T12:00:00Z",
       "column": "low",
       "resampled": NaN,
-      "stored": 851.03,
+      "stored": 8470.0,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -1005,7 +1009,7 @@
       "ts": "2018-02-10T12:00:00Z",
       "column": "close",
       "resampled": NaN,
-      "stored": 869.73,
+      "stored": 8635.99,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -1013,15 +1017,15 @@
       "ts": "2018-02-10T12:00:00Z",
       "column": "volume",
       "resampled": 0.0,
-      "stored": 47103.55384,
-      "diff": 47103.55384,
+      "stored": 9309.608361,
+      "diff": 9309.608361,
       "in_outage_window": true
     },
     {
       "ts": "2018-02-10T16:00:00Z",
       "column": "open",
       "resampled": NaN,
-      "stored": 870.0,
+      "stored": 8626.12,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -1029,7 +1033,7 @@
       "ts": "2018-02-10T16:00:00Z",
       "column": "high",
       "resampled": NaN,
-      "stored": 884.98,
+      "stored": 8800.0,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -1037,7 +1041,7 @@
       "ts": "2018-02-10T16:00:00Z",
       "column": "low",
       "resampled": NaN,
-      "stored": 825.0,
+      "stored": 8231.0,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -1045,7 +1049,7 @@
       "ts": "2018-02-10T16:00:00Z",
       "column": "close",
       "resampled": NaN,
-      "stored": 829.21,
+      "stored": 8263.51,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -1053,15 +1057,15 @@
       "ts": "2018-02-10T16:00:00Z",
       "column": "volume",
       "resampled": 0.0,
-      "stored": 36958.12125,
-      "diff": 36958.12125,
+      "stored": 9669.496264,
+      "diff": 9669.496264,
       "in_outage_window": true
     },
     {
       "ts": "2018-02-10T20:00:00Z",
       "column": "open",
       "resampled": NaN,
-      "stored": 829.97,
+      "stored": 8271.0,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -1069,7 +1073,7 @@
       "ts": "2018-02-10T20:00:00Z",
       "column": "high",
       "resampled": NaN,
-      "stored": 848.0,
+      "stored": 8448.0,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -1077,7 +1081,7 @@
       "ts": "2018-02-10T20:00:00Z",
       "column": "low",
       "resampled": NaN,
-      "stored": 800.0,
+      "stored": 8120.0,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -1085,7 +1089,7 @@
       "ts": "2018-02-10T20:00:00Z",
       "column": "close",
       "resampled": NaN,
-      "stored": 840.67,
+      "stored": 8419.0,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -1093,15 +1097,15 @@
       "ts": "2018-02-10T20:00:00Z",
       "column": "volume",
       "resampled": 0.0,
-      "stored": 42202.58759,
-      "diff": 42202.58759,
+      "stored": 8887.712905,
+      "diff": 8887.712905,
       "in_outage_window": true
     },
     {
       "ts": "2018-02-11T00:00:00Z",
       "column": "open",
       "resampled": NaN,
-      "stored": 840.72,
+      "stored": 8420.0,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -1109,7 +1113,7 @@
       "ts": "2018-02-11T00:00:00Z",
       "column": "high",
       "resampled": NaN,
-      "stored": 854.99,
+      "stored": 8572.0,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -1117,7 +1121,7 @@
       "ts": "2018-02-11T00:00:00Z",
       "column": "low",
       "resampled": NaN,
-      "stored": 810.02,
+      "stored": 8125.0,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -1125,7 +1129,7 @@
       "ts": "2018-02-11T00:00:00Z",
       "column": "close",
       "resampled": NaN,
-      "stored": 851.15,
+      "stored": 8533.98,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -1133,15 +1137,15 @@
       "ts": "2018-02-11T00:00:00Z",
       "column": "volume",
       "resampled": 0.0,
-      "stored": 27861.95537,
-      "diff": 27861.95537,
+      "stored": 7928.668373,
+      "diff": 7928.668373,
       "in_outage_window": true
     },
     {
       "ts": "2018-02-11T04:00:00Z",
       "column": "open",
       "resampled": NaN,
-      "stored": 851.15,
+      "stored": 8533.99,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -1149,7 +1153,7 @@
       "ts": "2018-02-11T04:00:00Z",
       "column": "high",
       "resampled": NaN,
-      "stored": 851.93,
+      "stored": 8549.0,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -1157,7 +1161,7 @@
       "ts": "2018-02-11T04:00:00Z",
       "column": "low",
       "resampled": NaN,
-      "stored": 794.01,
+      "stored": 7956.0,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -1165,7 +1169,7 @@
       "ts": "2018-02-11T04:00:00Z",
       "column": "close",
       "resampled": NaN,
-      "stored": 796.58,
+      "stored": 7969.05,
       "diff": NaN,
       "in_outage_window": true
     },
@@ -1173,76 +1177,84 @@
       "ts": "2018-02-11T04:00:00Z",
       "column": "volume",
       "resampled": 0.0,
-      "stored": 33965.00941,
-      "diff": 33965.00941,
+      "stored": 8046.326184,
+      "diff": 8046.326184,
       "in_outage_window": true
     },
     {
       "ts": "2018-02-11T08:00:00Z",
       "column": "open",
-      "resampled": 796.98,
-      "stored": 796.97,
-      "diff": 0.009999999999990905,
+      "resampled": 7976.74,
+      "stored": 7976.73,
+      "diff": 0.010000000000218279,
       "in_outage_window": true
     },
     {
       "ts": "2018-02-11T08:00:00Z",
       "column": "volume",
-      "resampled": 33351.29115,
-      "stored": 33355.17166,
-      "diff": 3.880510000002687,
+      "resampled": 7743.896207,
+      "stored": 7751.617967,
+      "diff": 7.721760000000359,
       "in_outage_window": true
     },
     {
       "ts": "2020-12-21T16:00:00Z",
       "column": "high",
-      "resampled": 608.82,
-      "stored": 613.29,
-      "diff": 4.469999999999914,
+      "resampled": 22665.35,
+      "stored": 22774.0,
+      "diff": 108.65000000000146,
       "in_outage_window": true
     },
     {
       "ts": "2020-12-21T16:00:00Z",
       "column": "close",
-      "resampled": 608.31,
-      "stored": 610.45,
-      "diff": 2.1400000000001,
+      "resampled": 22646.53,
+      "stored": 22681.32,
+      "diff": 34.79000000000087,
       "in_outage_window": true
     },
     {
       "ts": "2020-12-21T16:00:00Z",
       "column": "volume",
-      "resampled": 135653.05758,
-      "stored": 144433.84092,
-      "diff": 8780.783339999994,
+      "resampled": 14069.547509,
+      "stored": 14924.656327,
+      "diff": 855.1088180000006,
       "in_outage_window": true
     },
     {
       "ts": "2021-01-21T12:00:00Z",
       "column": "volume",
-      "resampled": 541006.14541,
-      "stored": 484962.37608,
-      "diff": 56043.76932999998,
+      "resampled": 32172.086072,
+      "stored": 28971.19234,
+      "diff": 3200.893731999997,
       "in_outage_window": false
     },
     {
       "ts": "2021-04-23T04:00:00Z",
       "column": "volume",
-      "resampled": 733833.47508,
-      "stored": 735231.27455,
-      "diff": 1397.799469999969,
+      "resampled": 39348.134589,
+      "stored": 39495.750509,
+      "diff": 147.61591999999655,
       "in_outage_window": false
+    },
+    {
+      "ts": "2021-12-24T08:00:00Z",
+      "column": "volume",
+      "resampled": 3195.55152,
+      "stored": 3195.58213,
+      "diff": 0.030609999999796855,
+      "in_outage_window": true
     },
     {
       "ts": "2022-04-13T08:00:00Z",
       "column": "volume",
-      "resampled": 44627.98,
-      "stored": 44629.0454,
-      "diff": 1.0653999999994994,
+      "resampled": 3713.55379,
+      "stored": 3714.43456,
+      "diff": 0.8807700000002114,
       "in_outage_window": false
     }
   ],
-  "reconciliation_total_mismatches": 63,
+  "reconciliation_total_mismatches": 64,
   "reconciliation_mismatches_outside_outages": 3,
-  "unclassified_gap_count": 8
+  "unclassified_gap_count": 0
 }

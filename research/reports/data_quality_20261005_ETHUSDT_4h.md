@@ -5,7 +5,7 @@
 - last_ts: 2025-09-30T20:00:00Z
 - duplicate timestamps: 0
 - out-of-order timestamps: 0
-- gaps: 8 (8 unclassified)
+- gaps: 8 (0 unclassified)
 - zero-volume bars: 0
 - high==low bars: 0
 - |return| outliers: 2
@@ -110,16 +110,16 @@
 
 ## Gaps
 
-| from | to | missing_bars | classification |
-|---|---|---|---|
-| 2018-02-08T04:00:00Z | 2018-02-09T12:00:00Z | 7 | unknown |
-| 2018-06-26T04:00:00Z | 2018-06-26T16:00:00Z | 2 | unknown |
-| 2018-07-04T04:00:00Z | 2018-07-04T12:00:00Z | 1 | unknown |
-| 2018-11-14T04:00:00Z | 2018-11-14T12:00:00Z | 1 | unknown |
-| 2019-03-12T04:00:00Z | 2019-03-12T12:00:00Z | 1 | unknown |
-| 2019-05-15T04:00:00Z | 2019-05-15T16:00:00Z | 2 | unknown |
-| 2019-08-15T04:00:00Z | 2019-08-15T12:00:00Z | 1 | unknown |
-| 2020-02-19T12:00:00Z | 2020-02-19T20:00:00Z | 1 | unknown |
+| from | to | missing_bars | classification | classified_by |
+|---|---|---|---|---|
+| 2018-02-08T04:00:00Z | 2018-02-09T12:00:00Z | 7 | exchange_wide_outage | cross_symbol |
+| 2018-06-26T04:00:00Z | 2018-06-26T16:00:00Z | 2 | exchange_outage_after_short_bar | after_short_bar |
+| 2018-07-04T04:00:00Z | 2018-07-04T12:00:00Z | 1 | exchange_outage_after_short_bar | after_short_bar |
+| 2018-11-14T04:00:00Z | 2018-11-14T12:00:00Z | 1 | exchange_outage_after_short_bar | after_short_bar |
+| 2019-03-12T04:00:00Z | 2019-03-12T12:00:00Z | 1 | exchange_outage_after_short_bar | after_short_bar |
+| 2019-05-15T04:00:00Z | 2019-05-15T16:00:00Z | 2 | exchange_outage_after_short_bar | after_short_bar |
+| 2019-08-15T04:00:00Z | 2019-08-15T12:00:00Z | 1 | exchange_outage_after_short_bar | after_short_bar |
+| 2020-02-19T12:00:00Z | 2020-02-19T20:00:00Z | 1 | exchange_outage_after_short_bar | after_short_bar |
 
 ## |return| outliers
 

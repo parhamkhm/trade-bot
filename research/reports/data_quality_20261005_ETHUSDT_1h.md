@@ -5,7 +5,7 @@
 - last_ts: 2025-09-30T23:00:00Z
 - duplicate timestamps: 0
 - out-of-order timestamps: 0
-- gaps: 28 (23 unclassified)
+- gaps: 28 (0 unclassified)
 - zero-volume bars: 0
 - high==low bars: 0
 - |return| outliers: 1
@@ -110,36 +110,36 @@
 
 ## Gaps
 
-| from | to | missing_bars | classification |
-|---|---|---|---|
-| 2018-01-04T04:00:00Z | 2018-01-04T06:00:00Z | 1 | unknown |
-| 2018-02-08T01:00:00Z | 2018-02-11T05:00:00Z | 75 | exchange_outage |
-| 2018-06-26T02:00:00Z | 2018-06-26T13:00:00Z | 10 | unknown |
-| 2018-06-27T13:00:00Z | 2018-06-27T15:00:00Z | 1 | unknown |
-| 2018-07-04T01:00:00Z | 2018-07-04T09:00:00Z | 7 | unknown |
-| 2018-10-19T06:00:00Z | 2018-10-19T10:00:00Z | 3 | unknown |
-| 2018-11-14T02:00:00Z | 2018-11-14T10:00:00Z | 7 | unknown |
-| 2019-03-12T02:00:00Z | 2019-03-12T09:00:00Z | 6 | unknown |
-| 2019-05-15T03:00:00Z | 2019-05-15T14:00:00Z | 10 | unknown |
-| 2019-06-07T21:00:00Z | 2019-06-07T23:00:00Z | 1 | exchange_outage |
-| 2019-08-15T02:00:00Z | 2019-08-15T11:00:00Z | 8 | unknown |
-| 2019-11-13T02:00:00Z | 2019-11-13T05:00:00Z | 2 | unknown |
-| 2019-11-25T02:00:00Z | 2019-11-25T05:00:00Z | 2 | unknown |
-| 2020-02-09T02:00:00Z | 2020-02-09T04:00:00Z | 1 | unknown |
-| 2020-02-19T12:00:00Z | 2020-02-19T18:00:00Z | 5 | unknown |
-| 2020-03-04T10:00:00Z | 2020-03-04T12:00:00Z | 1 | unknown |
-| 2020-04-25T02:00:00Z | 2020-04-25T05:00:00Z | 2 | unknown |
-| 2020-06-28T02:00:00Z | 2020-06-28T06:00:00Z | 3 | unknown |
-| 2020-11-30T06:00:00Z | 2020-11-30T08:00:00Z | 1 | unknown |
-| 2020-12-21T14:00:00Z | 2020-12-21T19:00:00Z | 4 | exchange_outage |
-| 2020-12-25T02:00:00Z | 2020-12-25T04:00:00Z | 1 | unknown |
-| 2021-02-11T03:00:00Z | 2021-02-11T06:00:00Z | 2 | exchange_outage |
-| 2021-03-06T02:00:00Z | 2021-03-06T04:00:00Z | 1 | unknown |
-| 2021-04-20T02:00:00Z | 2021-04-20T05:00:00Z | 2 | unknown |
-| 2021-04-25T05:00:00Z | 2021-04-25T09:00:00Z | 3 | unknown |
-| 2021-08-13T02:00:00Z | 2021-08-13T07:00:00Z | 4 | unknown |
-| 2021-09-29T07:00:00Z | 2021-09-29T10:00:00Z | 2 | unknown |
-| 2023-03-24T12:00:00Z | 2023-03-24T15:00:00Z | 2 | exchange_outage |
+| from | to | missing_bars | classification | classified_by |
+|---|---|---|---|---|
+| 2018-01-04T04:00:00Z | 2018-01-04T06:00:00Z | 1 | exchange_outage_after_short_bar | after_short_bar |
+| 2018-02-08T01:00:00Z | 2018-02-11T05:00:00Z | 75 | exchange_outage | anomaly_overlap |
+| 2018-06-26T02:00:00Z | 2018-06-26T13:00:00Z | 10 | exchange_wide_outage | cross_symbol |
+| 2018-06-27T13:00:00Z | 2018-06-27T15:00:00Z | 1 | exchange_wide_outage | cross_symbol |
+| 2018-07-04T01:00:00Z | 2018-07-04T09:00:00Z | 7 | exchange_outage_after_short_bar | after_short_bar |
+| 2018-10-19T06:00:00Z | 2018-10-19T10:00:00Z | 3 | exchange_wide_outage | cross_symbol |
+| 2018-11-14T02:00:00Z | 2018-11-14T10:00:00Z | 7 | exchange_wide_outage | cross_symbol |
+| 2019-03-12T02:00:00Z | 2019-03-12T09:00:00Z | 6 | exchange_wide_outage | cross_symbol |
+| 2019-05-15T03:00:00Z | 2019-05-15T14:00:00Z | 10 | exchange_wide_outage | cross_symbol |
+| 2019-06-07T21:00:00Z | 2019-06-07T23:00:00Z | 1 | exchange_outage | anomaly_overlap |
+| 2019-08-15T02:00:00Z | 2019-08-15T11:00:00Z | 8 | exchange_wide_outage | cross_symbol |
+| 2019-11-13T02:00:00Z | 2019-11-13T05:00:00Z | 2 | exchange_wide_outage | cross_symbol |
+| 2019-11-25T02:00:00Z | 2019-11-25T05:00:00Z | 2 | exchange_wide_outage | cross_symbol |
+| 2020-02-09T02:00:00Z | 2020-02-09T04:00:00Z | 1 | exchange_wide_outage | cross_symbol |
+| 2020-02-19T12:00:00Z | 2020-02-19T18:00:00Z | 5 | exchange_outage_after_short_bar | after_short_bar |
+| 2020-03-04T10:00:00Z | 2020-03-04T12:00:00Z | 1 | exchange_outage_after_short_bar | after_short_bar |
+| 2020-04-25T02:00:00Z | 2020-04-25T05:00:00Z | 2 | exchange_wide_outage | cross_symbol |
+| 2020-06-28T02:00:00Z | 2020-06-28T06:00:00Z | 3 | exchange_wide_outage | cross_symbol |
+| 2020-11-30T06:00:00Z | 2020-11-30T08:00:00Z | 1 | exchange_wide_outage | cross_symbol |
+| 2020-12-21T14:00:00Z | 2020-12-21T19:00:00Z | 4 | exchange_wide_outage | cross_symbol |
+| 2020-12-25T02:00:00Z | 2020-12-25T04:00:00Z | 1 | exchange_wide_outage | cross_symbol |
+| 2021-02-11T03:00:00Z | 2021-02-11T06:00:00Z | 2 | exchange_outage | anomaly_overlap |
+| 2021-03-06T02:00:00Z | 2021-03-06T04:00:00Z | 1 | exchange_wide_outage | cross_symbol |
+| 2021-04-20T02:00:00Z | 2021-04-20T05:00:00Z | 2 | exchange_wide_outage | cross_symbol |
+| 2021-04-25T05:00:00Z | 2021-04-25T09:00:00Z | 3 | exchange_outage_after_short_bar | after_short_bar |
+| 2021-08-13T02:00:00Z | 2021-08-13T07:00:00Z | 4 | exchange_wide_outage | cross_symbol |
+| 2021-09-29T07:00:00Z | 2021-09-29T10:00:00Z | 2 | exchange_wide_outage | cross_symbol |
+| 2023-03-24T12:00:00Z | 2023-03-24T15:00:00Z | 2 | exchange_outage | anomaly_overlap |
 
 ## |return| outliers
 
