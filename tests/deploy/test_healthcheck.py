@@ -310,6 +310,97 @@ def test_bool_last_new_trade_ts_ms_is_unhealthy_not_a_crash() -> None:
     assert "last_new_trade_ts_ms" in reason
 
 
+# --- evaluate_heartbeat: first_poll_ts_ms / "no trade ever recorded" (NIT, fifth fix round) ----
+
+
+def test_null_last_new_trade_ts_ms_with_stale_first_poll_ts_ms_is_unhealthy() -> None:
+    """NIT: a fresh database whose every poll succeeds but that has NEVER recorded a single
+    trade (symbol/market mismatch, or an endpoint that always returns []) must not look healthy
+    forever -- last_poll_ts alone cannot catch this, since it keeps being rewritten."""
+    now = datetime(2026, 1, 1, 3, 0, 0, tzinfo=UTC)
+    first_poll_ms = int(datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC).timestamp() * 1000)  # 3h ago
+    payload = _payload(
+        last_poll_ts=now.isoformat(),
+        consecutive_errors=0,
+        last_new_trade_ts_ms=None,
+        first_poll_ts_ms=first_poll_ms,
+    )
+
+    healthy, reason = healthcheck.evaluate_heartbeat(
+        payload, now=now, max_age_seconds=180, max_consecutive_errors=10, max_trade_staleness_seconds=3600
+    )
+
+    assert healthy is False
+    assert "no trade has ever been recorded" in reason
+
+
+def test_null_last_new_trade_ts_ms_with_fresh_first_poll_ts_ms_is_healthy() -> None:
+    """A recorder that only just started, with no trade yet, is not unhealthy -- it simply has
+    not had time to see one."""
+    now = datetime(2026, 1, 1, 0, 0, 30, tzinfo=UTC)
+    first_poll_ms = int(datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC).timestamp() * 1000)  # 30s ago
+    payload = _payload(
+        last_poll_ts=now.isoformat(),
+        consecutive_errors=0,
+        last_new_trade_ts_ms=None,
+        first_poll_ts_ms=first_poll_ms,
+    )
+
+    healthy, _ = healthcheck.evaluate_heartbeat(
+        payload, now=now, max_age_seconds=180, max_consecutive_errors=10, max_trade_staleness_seconds=3600
+    )
+
+    assert healthy is True
+
+
+def test_null_last_new_trade_ts_ms_with_no_first_poll_ts_ms_field_is_healthy_treated_as_unknown() -> None:
+    """An older heartbeat payload (predating this fix round) that omits first_poll_ts_ms
+    entirely must not be penalised for a field it never had."""
+    now = datetime(2026, 1, 1, 3, 0, 0, tzinfo=UTC)
+    payload = _payload(last_poll_ts=now.isoformat(), consecutive_errors=0, last_new_trade_ts_ms=None)
+    assert "first_poll_ts_ms" not in payload
+
+    healthy, _ = healthcheck.evaluate_heartbeat(
+        payload, now=now, max_age_seconds=180, max_consecutive_errors=10, max_trade_staleness_seconds=3600
+    )
+
+    assert healthy is True
+
+
+def test_malformed_first_poll_ts_ms_is_unhealthy_not_a_crash() -> None:
+    now = datetime(2026, 1, 1, 0, 0, 30, tzinfo=UTC)
+    payload = _payload(
+        last_poll_ts=now.isoformat(),
+        consecutive_errors=0,
+        last_new_trade_ts_ms=None,
+        first_poll_ts_ms="not-an-int",
+    )
+
+    healthy, reason = healthcheck.evaluate_heartbeat(
+        payload, now=now, max_age_seconds=180, max_consecutive_errors=10
+    )
+
+    assert healthy is False
+    assert "first_poll_ts_ms" in reason
+
+
+def test_bool_first_poll_ts_ms_is_unhealthy_not_a_crash() -> None:
+    now = datetime(2026, 1, 1, 0, 0, 30, tzinfo=UTC)
+    payload = _payload(
+        last_poll_ts=now.isoformat(),
+        consecutive_errors=0,
+        last_new_trade_ts_ms=None,
+        first_poll_ts_ms=True,
+    )
+
+    healthy, reason = healthcheck.evaluate_heartbeat(
+        payload, now=now, max_age_seconds=180, max_consecutive_errors=10
+    )
+
+    assert healthy is False
+    assert "first_poll_ts_ms" in reason
+
+
 # --- main(): file I/O + env var parsing, robust to a missing/malformed file --------
 
 
@@ -461,6 +552,26 @@ def test_main_uses_default_trade_staleness_when_env_var_is_unset(
     path.write_text(json.dumps(payload), encoding="utf-8")
     monkeypatch.setenv("TBOT_HEARTBEAT_FILE", str(path))
     assert healthcheck.main([]) == 0
+
+
+def test_main_is_unhealthy_when_no_trade_ever_recorded_past_staleness_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_env: None
+) -> None:
+    """NIT end to end: a database that has never recorded a single trade must fail once
+    first_poll_ts_ms is older than the (possibly env-overridden) trade-staleness threshold."""
+    path = tmp_path / "heartbeat.json"
+    now = datetime.now(UTC)
+    first_poll_ms = int((now - timedelta(seconds=120)).timestamp() * 1000)
+    payload = _payload(
+        last_poll_ts=now.isoformat(),
+        consecutive_errors=0,
+        last_new_trade_ts_ms=None,
+        first_poll_ts_ms=first_poll_ms,
+    )
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setenv("TBOT_HEARTBEAT_FILE", str(path))
+    monkeypatch.setenv("TBOT_HEARTBEAT_MAX_TRADE_STALENESS_SECONDS", "60")
+    assert healthcheck.main([]) == 1
 
 
 def test_main_falls_back_to_default_trade_staleness_on_malformed_env_var(

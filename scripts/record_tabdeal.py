@@ -49,7 +49,12 @@ import yaml
 
 from tbot.core.config import Config, Secrets, load_config
 from tbot.core.types import Clock
-from tbot.data.tabdeal_recorder import RecorderSettings, RecorderStore, TabdealRecorderService
+from tbot.data.tabdeal_recorder import (
+    RecorderFatalError,
+    RecorderSettings,
+    RecorderStore,
+    TabdealRecorderService,
+)
 from tbot.execution.tabdeal_client import TabdealClient
 from tbot.monitoring.logging import configure_logging, register_secrets_for_logging
 
@@ -140,6 +145,42 @@ def build_settings(args: argparse.Namespace, config: Config) -> RecorderSettings
     )
 
 
+def _build_client(config: Config, clock: Clock) -> TabdealClient:
+    """Minor fix 5 (fix round): this recorder only ever calls public endpoints (/trades, /depth)
+    -- it has no business holding Tabdeal API credentials at all. Passing them explicitly as
+    ``None`` (rather than ``secrets.tabdeal_api_key``/``secret``, even though they would just sit
+    unused) keeps them out of this process's memory entirely, which matters because they would
+    otherwise show up in the container env and in `docker inspect`."""
+    return TabdealClient(
+        base_url=config.exchange.base_url,
+        read_prefix=config.exchange.read_prefix,
+        write_prefix=config.exchange.write_prefix,
+        clock=clock,
+        api_key=None,
+        api_secret=None,
+        recv_window_ms=config.exchange.recv_window_ms,
+        requests_per_second=config.exchange.requests_per_second,
+        timeout_seconds=config.exchange.timeout_seconds,
+        max_retries=config.exchange.max_retries,
+    )
+
+
+def _run_service(service: TabdealRecorderService, *, once: bool, symbol: str) -> int:
+    """Run the one-shot or long-lived service loop, turning a ``RecorderFatalError`` (m-E, fifth
+    fix round) into a clean, logged non-zero exit code instead of an uncaught traceback -- the
+    exit code itself (not the traceback) is what lets Docker's `restart: unless-stopped` policy
+    (deploy/docker-compose.yml) recover a permanently broken process."""
+    try:
+        if once:
+            service.process_once()
+        else:
+            service.run_forever()
+    except RecorderFatalError as exc:
+        logger.error("tabdeal_recorder.fatal_exit", symbol=symbol, reason=str(exc))
+        return 1
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
     secrets = Secrets()
@@ -147,8 +188,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     # logging module's value registry *before* anything can log a line -- otherwise a bare
     # Tabdeal API key/secret leaking into free text (no recognizable prefix, no sensitive key
     # name) would be emitted verbatim even though this process never uses them for requests
-    # (see the `api_key=None, api_secret=None` note below; they can still sit in `Secrets()`
-    # because the same `.env` is shared with other services, e.g. the bot).
+    # (see _build_client's own note; they can still sit in `Secrets()` because the same `.env`
+    # is shared with other services, e.g. the bot).
     register_secrets_for_logging(secrets)
     # Minor fix 7 (fix round): TBOT_CONFIG is documented in deploy/docker-compose as the way to
     # select a config file in the container, but this script only ever read --config, silently
@@ -167,23 +208,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     clock: Clock = SystemClock()
-    # Minor fix 5 (fix round): this recorder only ever calls public endpoints (/trades, /depth)
-    # -- it has no business holding Tabdeal API credentials at all. Passing them explicitly as
-    # None (rather than secrets.tabdeal_api_key/secret, even though they would just sit unused)
-    # keeps them out of this process's memory entirely, which matters because they would
-    # otherwise show up in the container env and in `docker inspect`.
-    client = TabdealClient(
-        base_url=config.exchange.base_url,
-        read_prefix=config.exchange.read_prefix,
-        write_prefix=config.exchange.write_prefix,
-        clock=clock,
-        api_key=None,
-        api_secret=None,
-        recv_window_ms=config.exchange.recv_window_ms,
-        requests_per_second=config.exchange.requests_per_second,
-        timeout_seconds=config.exchange.timeout_seconds,
-        max_retries=config.exchange.max_retries,
-    )
+    client = _build_client(config, clock)
     store = RecorderStore(db_path)
     service = TabdealRecorderService(
         client=client,
@@ -212,14 +237,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         heartbeat_file=str(heartbeat_file),
     )
     try:
-        if args.once:
-            service.process_once()
-        else:
-            service.run_forever()
+        return _run_service(service, once=args.once, symbol=settings.symbol)
     finally:
         service.close()
         client.close()
-    return 0
 
 
 if __name__ == "__main__":
