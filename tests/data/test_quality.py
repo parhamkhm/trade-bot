@@ -303,6 +303,36 @@ def test_reconcile_resample_tags_mismatches_outside_any_outage_as_not_outage_win
     assert mismatches[0].in_outage_window is False
 
 
+def test_reconcile_resample_does_not_tag_a_gap_that_merely_touches_the_bin_edge() -> None:
+    """Finding m-J: a gap's ``from_ts``/``to_ts`` are themselves PRESENT, known-good bars -- a
+    higher-timeframe bin that only touches one of those edges (here, ``bin_end == gap.from_ts``)
+    shares no missing bar with the gap and must not be tagged ``in_outage_window``. The old
+    closed-closed overlap check would have wrongly tagged this (touching counted as overlap)."""
+    hourly = _hourly_fixture()
+    bin1 = hourly.iloc[1:5]  # bin_start=_ts(0), bin_end=_ts(4)
+    higher = _ohlcv_df(
+        [
+            (
+                _ts(4),
+                bin1["open"].iloc[0],
+                bin1["high"].max() + 1.0,  # deliberately wrong
+                bin1["low"].min(),
+                bin1["close"].iloc[-1],
+                bin1["volume"].sum(),
+            )
+        ]
+    )
+    # Touches bin1's own close edge (_ts(4)) exactly but shares no missing bar with it.
+    touching_gap = q.GapFinding(from_ts=_ts(4), to_ts=_ts(6), missing_bars=1)
+
+    mismatches = q.reconcile_resample(
+        hourly, higher, higher_timeframe=Timeframe.H4, gaps_1h=(touching_gap,)
+    )
+
+    assert len(mismatches) == 1
+    assert mismatches[0].in_outage_window is False
+
+
 def test_reconcile_resample_tags_mismatches_overlapping_an_anomaly_as_outage_window() -> None:
     hourly = _hourly_fixture()
     bin1 = hourly.iloc[1:5]
@@ -388,6 +418,34 @@ def test_build_quality_report_applies_gap_classifications() -> None:
     assert len(report.gaps) == 1
     assert report.gaps[0].classification == "exchange_outage"
     assert report.unclassified_gap_count == 0
+
+
+def test_build_quality_report_applies_gap_classified_by() -> None:
+    """D-036 amendment (finding m-J): ``classified_by`` travels alongside ``classification`` so
+    the report shows which rule produced it, and shows up in both the JSON and Markdown output."""
+    df = _ohlcv_df(
+        [
+            (_ts(0), 100, 101, 99, 100, 10.0),
+            (_ts(3), 100, 100, 100, 100, 5.0),
+        ]
+    )
+    classifications = {(_ts(0), _ts(3)): "exchange_outage"}
+    classified_by = {(_ts(0), _ts(3)): "anomaly_overlap"}
+
+    report = q.build_quality_report(
+        source="binance",
+        symbol="BTCUSDT",
+        timeframe=Timeframe.H1,
+        df=df,
+        gap_classifications=classifications,
+        gap_classified_by=classified_by,
+    )
+
+    assert report.gaps[0].classified_by == "anomaly_overlap"
+    data = report.to_dict()
+    assert data["gaps"][0]["classified_by"] == "anomaly_overlap"
+    markdown = report.render_markdown()
+    assert "anomaly_overlap" in markdown
 
 
 def test_build_quality_report_without_classifications_stays_unknown() -> None:

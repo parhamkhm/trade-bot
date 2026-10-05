@@ -488,6 +488,269 @@ def test_ingest_rerun_skip_still_reports_persisted_anomalies_report_only_style(
     assert all(a.classification == "misaligned" for a in outcome.anomalies)
 
 
+# --- finding m-J: tightened gap auto-classification (rules (a) and (b), plus negatives) ---------
+
+
+def test_classify_gap_rule_a_dropped_anomaly_overlapping_missing_window() -> None:
+    """Rule (a): a *dropped* anomaly whose raw window overlaps the missing-bar window
+    ``(from_ts, to_ts - delta]`` -> ``exchange_outage`` / ``anomaly_overlap``."""
+    from_ts = datetime(2024, 6, 1, 0, tzinfo=UTC)
+    to_ts = from_ts + 2 * Timeframe.H1.delta  # one bar missing, at 01:00
+    anomaly = store_mod.AnomalyRecord(
+        raw_open_ts=from_ts + timedelta(minutes=20),
+        raw_close_ts=from_ts + timedelta(minutes=40),
+        duration_seconds=1200.0,
+        n_trades=5,
+        volume=Decimal("1"),
+        classification="misaligned",
+        action="dropped",
+    )
+    result = bl._classify_gap_from_anomalies(
+        from_ts=from_ts, to_ts=to_ts, timeframe=Timeframe.H1, anomalies=(anomaly,)
+    )
+    assert result == ("exchange_outage", "anomaly_overlap")
+
+
+def test_classify_gap_rule_a_ignores_a_stored_short_bar_not_a_dropped_row() -> None:
+    """A ``short`` anomaly is ``action == "stored_flagged"``, not ``"dropped"`` -- it must never
+    satisfy rule (a) even if its raw window happens to sit inside the missing-bar window."""
+    from_ts = datetime(2024, 6, 1, 0, tzinfo=UTC)
+    to_ts = from_ts + 2 * Timeframe.H1.delta
+    short_anomaly = store_mod.AnomalyRecord(
+        raw_open_ts=from_ts + timedelta(minutes=20),
+        raw_close_ts=from_ts + timedelta(minutes=21),
+        duration_seconds=60.0,
+        n_trades=3,
+        volume=Decimal("1"),
+        classification="short",
+        action="stored_flagged",
+    )
+    result = bl._classify_gap_from_anomalies(
+        from_ts=from_ts, to_ts=to_ts, timeframe=Timeframe.H1, anomalies=(short_anomaly,)
+    )
+    assert result is None
+
+
+def test_classify_gap_rule_b_short_bar_ends_right_before_gap() -> None:
+    """Rule (b): a stored ``short`` bar whose close label (``raw_open_ts + delta``) is exactly
+    the gap's ``from_ts`` -> ``exchange_outage_after_short_bar`` / ``after_short_bar``."""
+    from_ts = datetime(2024, 6, 1, 1, tzinfo=UTC)
+    to_ts = from_ts + 3 * Timeframe.H1.delta
+    short_anomaly = store_mod.AnomalyRecord(
+        raw_open_ts=from_ts - Timeframe.H1.delta,  # 00:00 -- its stored label is from_ts (01:00)
+        raw_close_ts=from_ts - timedelta(minutes=55),
+        duration_seconds=300.0,
+        n_trades=7,
+        volume=Decimal("0.5"),
+        classification="short",
+        action="stored_flagged",
+    )
+    result = bl._classify_gap_from_anomalies(
+        from_ts=from_ts, to_ts=to_ts, timeframe=Timeframe.H1, anomalies=(short_anomaly,)
+    )
+    assert result == ("exchange_outage_after_short_bar", "after_short_bar")
+
+
+def test_classify_gap_negative_unrelated_gap_followed_by_a_short_bar_stays_unknown() -> None:
+    """Finding m-J's named bug: a gap whose cause is unrelated to any recorded anomaly, but is
+    immediately FOLLOWED by a stored short bar (the short bar's label == gap.to_ts, not
+    gap.from_ts), must stay unclassified. Also covers the related old bug where a dropped
+    anomaly sitting inside the next PRESENT bar's own window (not the missing-bar window) wrongly
+    "explained" an unrelated gap under the old closed-interval ``[from_ts, to_ts]`` check.
+    """
+    from_ts = datetime(2024, 6, 1, 0, tzinfo=UTC)
+    to_ts = from_ts + 2 * Timeframe.H1.delta  # one bar missing, at 01:00
+
+    # A dropped row sitting inside the PRESENT bar's own window [to_ts, to_ts+delta) -- NOT the
+    # missing-bar window (from_ts, to_ts - delta] == (00:00, 01:00] -- so it must not count.
+    unrelated_dropped = store_mod.AnomalyRecord(
+        raw_open_ts=to_ts + timedelta(minutes=10),
+        raw_close_ts=to_ts + timedelta(minutes=20),
+        duration_seconds=600.0,
+        n_trades=2,
+        volume=Decimal("1"),
+        classification="misaligned",
+        action="dropped",
+    )
+    # A short bar stored exactly AT to_ts (i.e. it is the present bar right after the gap, not
+    # right before it) -- its label is gap.to_ts, so it must not satisfy rule (b) either.
+    short_bar_after_gap = store_mod.AnomalyRecord(
+        raw_open_ts=to_ts - Timeframe.H1.delta,
+        raw_close_ts=to_ts - timedelta(seconds=5),
+        duration_seconds=3595.0,
+        n_trades=4,
+        volume=Decimal("0.2"),
+        classification="short",
+        action="stored_flagged",
+    )
+
+    result = bl._classify_gap_from_anomalies(
+        from_ts=from_ts,
+        to_ts=to_ts,
+        timeframe=Timeframe.H1,
+        anomalies=(unrelated_dropped, short_bar_after_gap),
+    )
+    assert result is None
+
+
+@respx.mock
+def test_ingest_classifies_a_gap_after_a_short_bar_as_exchange_outage_after_short_bar(
+    tmp_path: Path,
+) -> None:
+    """End-to-end (rule (b)): the short-then-outage fixture has a short bar immediately followed
+    by a real multi-bar gap. The gap must come out ``exchange_outage_after_short_bar``, evidenced
+    by ``classified_by == "after_short_bar"`` -- not the generic ``exchange_outage`` rule (a),
+    since there is no *dropped* anomaly here at all, only a stored short bar."""
+    config = make_data_config(tmp_path)
+    zip_bytes = _zip_bytes("klines_1h_anomalies_short_then_outage.txt", "BTCUSDT-1h-2024-06.csv")
+    checksum_hex = bl.sha256_hex(zip_bytes)
+    zip_url = bl.monthly_zip_url(config.binance_base_url, "BTCUSDT", Timeframe.H1, 2024, 6)
+    respx.get(bl.checksum_url(zip_url)).mock(
+        return_value=httpx.Response(200, text=f"{checksum_hex}  BTCUSDT-1h-2024-06.zip\n")
+    )
+    respx.get(zip_url).mock(return_value=httpx.Response(200, content=zip_bytes))
+
+    with httpx.Client() as client:
+        outcome = bl.ingest_symbol_timeframe(
+            client,
+            symbol="BTCUSDT",
+            timeframe=Timeframe.H1,
+            data_config=config,
+            now=datetime(2024, 7, 15, tzinfo=UTC),
+        )
+
+    assert len(outcome.anomalies) == 1
+    assert outcome.anomalies[0].classification == "short"
+    assert len(outcome.gaps) == 1
+    assert outcome.gaps[0].classification == "exchange_outage_after_short_bar"
+    assert outcome.gaps[0].classified_by == "after_short_bar"
+
+
+# --- decision D-036 amendment: cross-symbol corroboration (exchange_wide_outage) ----------------
+
+
+def _seed_gap(
+    config: DataConfig,
+    *,
+    symbol: str,
+    timeframe: Timeframe,
+    from_ts: datetime,
+    to_ts: datetime,
+    **kwargs: object,
+) -> None:
+    sidecar_file = store_mod.sidecar_path(
+        config.parquet_root, source="binance", symbol=symbol, timeframe=timeframe
+    )
+    sidecar = store_mod.load_sidecar(sidecar_file, source="binance", symbol=symbol, timeframe=timeframe)
+    sidecar.gaps.append(
+        store_mod.GapRecord(from_ts=from_ts, to_ts=to_ts, missing_bars=1, **kwargs)  # type: ignore[arg-type]
+    )
+    store_mod.save_sidecar(sidecar_file, sidecar)
+
+
+def test_cross_symbol_pass_classifies_an_identical_window_as_exchange_wide_outage(
+    tmp_path: Path,
+) -> None:
+    config = make_data_config(tmp_path, symbols=("BTCUSDT", "ETHUSDT"))
+    from_ts = datetime(2024, 6, 1, 0, tzinfo=UTC)
+    to_ts = datetime(2024, 6, 1, 2, tzinfo=UTC)
+    _seed_gap(config, symbol="BTCUSDT", timeframe=Timeframe.H1, from_ts=from_ts, to_ts=to_ts)
+    _seed_gap(config, symbol="ETHUSDT", timeframe=Timeframe.H1, from_ts=from_ts, to_ts=to_ts)
+
+    reclassified = bl.apply_cross_symbol_gap_classification(
+        config, symbols=("BTCUSDT", "ETHUSDT"), timeframe=Timeframe.H1
+    )
+
+    assert reclassified == {"BTCUSDT": 1, "ETHUSDT": 1}
+    for symbol in ("BTCUSDT", "ETHUSDT"):
+        sidecar = _load_sidecar(config, symbol, Timeframe.H1)
+        assert sidecar.gaps[0].classification == "exchange_wide_outage"
+        assert sidecar.gaps[0].classified_by == "cross_symbol"
+
+
+def test_cross_symbol_pass_leaves_a_one_symbol_only_gap_unknown(tmp_path: Path) -> None:
+    config = make_data_config(tmp_path, symbols=("BTCUSDT", "ETHUSDT"))
+    from_ts = datetime(2024, 6, 1, 0, tzinfo=UTC)
+    to_ts = datetime(2024, 6, 1, 2, tzinfo=UTC)
+    _seed_gap(config, symbol="BTCUSDT", timeframe=Timeframe.H1, from_ts=from_ts, to_ts=to_ts)
+    # ETHUSDT has no matching gap at all.
+
+    reclassified = bl.apply_cross_symbol_gap_classification(
+        config, symbols=("BTCUSDT", "ETHUSDT"), timeframe=Timeframe.H1
+    )
+
+    assert reclassified == {"BTCUSDT": 0, "ETHUSDT": 0}
+    sidecar = _load_sidecar(config, "BTCUSDT", Timeframe.H1)
+    assert sidecar.gaps[0].classification == "unknown"
+    assert sidecar.gaps[0].classified_by is None
+
+
+def test_cross_symbol_pass_never_overwrites_a_manual_classification(tmp_path: Path) -> None:
+    """A classification a human already recorded (``classified_by`` absent/"manual", i.e. not
+    one of the auto rules) must never be revisited by the cross-symbol pass, even when the exact
+    same window is also a gap in the other symbol's series."""
+    config = make_data_config(tmp_path, symbols=("BTCUSDT", "ETHUSDT"))
+    from_ts = datetime(2024, 6, 1, 0, tzinfo=UTC)
+    to_ts = datetime(2024, 6, 1, 2, tzinfo=UTC)
+    _seed_gap(
+        config,
+        symbol="BTCUSDT",
+        timeframe=Timeframe.H1,
+        from_ts=from_ts,
+        to_ts=to_ts,
+        classification="maintenance_announced",
+        classified_by="manual",
+    )
+    _seed_gap(config, symbol="ETHUSDT", timeframe=Timeframe.H1, from_ts=from_ts, to_ts=to_ts)
+
+    reclassified = bl.apply_cross_symbol_gap_classification(
+        config, symbols=("BTCUSDT", "ETHUSDT"), timeframe=Timeframe.H1
+    )
+
+    assert reclassified["BTCUSDT"] == 0  # untouched -- already non-"unknown"
+    assert reclassified["ETHUSDT"] == 1  # still gets the cross-symbol evidence
+    btc_sidecar = _load_sidecar(config, "BTCUSDT", Timeframe.H1)
+    assert btc_sidecar.gaps[0].classification == "maintenance_announced"
+    assert btc_sidecar.gaps[0].classified_by == "manual"
+    eth_sidecar = _load_sidecar(config, "ETHUSDT", Timeframe.H1)
+    assert eth_sidecar.gaps[0].classification == "exchange_wide_outage"
+    assert eth_sidecar.gaps[0].classified_by == "cross_symbol"
+
+
+# --- NIT: asymmetric close-time tolerance (late side only tolerates the one-unit epsilon) -------
+
+
+def test_parse_kline_csv_classifies_a_small_late_overshoot_as_long_not_normal() -> None:
+    """NIT (fix round): the old symmetric +/-1s tolerance would have accepted a raw close_time
+    landing ~0.3s after its nominal close as "normal" -- storing a row whose own raw data runs
+    past its label, a (small) causality violation. The late side now only tolerates the one-unit
+    (1ms) epsilon baked into the close-time convention itself, so this must be ``long`` and
+    dropped even though ``abs(diff_seconds) <= 1.0`` still holds.
+    """
+    # open=2024-06-01T00:00:00Z (ms, on-grid); close_time = open + delta + 300ms (0.301s late
+    # vs. the documented "open + delta - 1ms" convention).
+    bad_row = "1717200000000,100,101,99,100,5,1717203600300,500,10,2,250,0\n"
+    parsed = bl.parse_kline_csv_bytes(bad_row.encode(), timeframe=Timeframe.H1)
+
+    assert parsed.records == ()
+    assert len(parsed.anomalies) == 1
+    anomaly = parsed.anomalies[0]
+    assert anomaly.classification == "long"
+    assert anomaly.action == "dropped"
+    assert anomaly.duration_seconds == pytest.approx(3600.3)
+
+
+def test_parse_kline_csv_still_tolerates_the_early_side_up_to_one_second() -> None:
+    """The early-side tolerance is unchanged by the NIT fix: a close_time landing up to 1s
+    *before* nominal is still just "normal", not an anomaly."""
+    # close_time = open + delta - 1ms - 900ms = 0.9s early, still within the +/-1s early band.
+    normal_row = "1717200000000,100,101,99,100,5,1717203599100,500,10,2,250,0\n"
+    parsed = bl.parse_kline_csv_bytes(normal_row.encode(), timeframe=Timeframe.H1)
+
+    assert len(parsed.records) == 1
+    assert parsed.anomalies == ()
+
+
 # --- load_bars / load_frame ------------------------------------------------------------------
 
 

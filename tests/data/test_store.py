@@ -139,6 +139,46 @@ def test_sidecar_round_trip(tmp_path: Path) -> None:
     assert loaded.first_ts == datetime(2024, 6, 1, tzinfo=UTC)
 
 
+def test_gap_record_classified_by_round_trips_when_set() -> None:
+    gap = store_mod.GapRecord(
+        from_ts=datetime(2024, 6, 1, 1, tzinfo=UTC),
+        to_ts=datetime(2024, 6, 1, 3, tzinfo=UTC),
+        missing_bars=1,
+        classification="exchange_outage",
+        classified_by="anomaly_overlap",
+    )
+    restored = store_mod.GapRecord.from_dict(gap.to_dict())
+    assert restored.classified_by == "anomaly_overlap"
+
+
+def test_gap_record_classified_by_defaults_to_manual_when_absent_from_disk() -> None:
+    """Decision D-036 amendment (finding m-J): a sidecar written by a human (or by code before
+    this field existed) has a non-"unknown" classification but no ``classified_by`` key at all.
+    That silence is itself the signal that no automated rule produced it -- loading it must stamp
+    ``classified_by="manual"`` rather than leave it ``None`` (which is reserved for "unknown")."""
+    data = {
+        "from": "2024-06-01T01:00:00Z",
+        "to": "2024-06-01T03:00:00Z",
+        "missing_bars": 1,
+        "classification": "maintenance_announced",
+        # no "classified_by" key -- as a hand-written or pre-D-036-amendment sidecar would have.
+    }
+    restored = store_mod.GapRecord.from_dict(data)
+    assert restored.classification == "maintenance_announced"
+    assert restored.classified_by == "manual"
+
+
+def test_gap_record_unknown_classification_keeps_classified_by_none() -> None:
+    data = {
+        "from": "2024-06-01T01:00:00Z",
+        "to": "2024-06-01T03:00:00Z",
+        "missing_bars": 1,
+        "classification": "unknown",
+    }
+    restored = store_mod.GapRecord.from_dict(data)
+    assert restored.classified_by is None
+
+
 def test_load_sidecar_missing_file_returns_fresh_sidecar(tmp_path: Path) -> None:
     path = store_mod.sidecar_path(
         tmp_path / "parquet", source="binance", symbol="BTCUSDT", timeframe=Timeframe.H1
