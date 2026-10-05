@@ -136,6 +136,46 @@ def test_sanity_default_config_loads() -> None:
 
 
 # ---------------------------------------------------------------------------------
+# m-E (fifth fix round): a RecorderFatalError from run_forever exits non-zero, cleanly
+# ---------------------------------------------------------------------------------
+
+
+@respx.mock
+def test_main_exits_non_zero_on_recorder_fatal_error(tmp_path: Path, monkeypatch: Any) -> None:
+    """``run_forever`` raises ``RecorderFatalError`` after too many consecutive
+    ``process_once()`` exceptions (m-E) -- ``main()`` must turn that into exit code 1 (so
+    Docker's ``restart: unless-stopped`` policy can recover the container) rather than letting
+    an uncaught exception, or a silent exit 0, escape."""
+    monkeypatch.delenv("TBOT_TABDEAL_API_KEY", raising=False)
+    monkeypatch.delenv("TBOT_TABDEAL_API_SECRET", raising=False)
+    _mock_public_endpoints()
+
+    from tbot.data.tabdeal_recorder import RecorderFatalError, TabdealRecorderService
+
+    def fake_run_forever(self: TabdealRecorderService) -> None:
+        raise RecorderFatalError("simulated: too many consecutive cycle exceptions")
+
+    monkeypatch.setattr(TabdealRecorderService, "run_forever", fake_run_forever)
+
+    argv = [
+        "--config",
+        "default",
+        "--config-dir",
+        str(CONFIG_DIR),
+        "--db-path",
+        str(tmp_path / "trades.sqlite"),
+        "--parquet-root",
+        str(tmp_path / "parquet"),
+        "--heartbeat-file",
+        str(tmp_path / "heartbeat.json"),
+        # deliberately NOT --once: this exercises the run_forever path
+    ]
+    exit_code = record_tabdeal.main(argv)
+
+    assert exit_code == 1
+
+
+# ---------------------------------------------------------------------------------
 # MAJOR M-C (third fix round, infra-ops half): the recorder shares a `.env` with other
 # services (e.g. the bot), so `Secrets()` can carry real Tabdeal/Telegram credentials here
 # even though this script itself never uses them for requests (minor fix 5 above). Before
