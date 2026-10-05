@@ -104,12 +104,22 @@ class FileRecord:
 
 @dataclass(frozen=True, slots=True)
 class GapRecord:
-    """A run of missing bars between two known timestamps. Defaults to ``classification='unknown'``."""
+    """A run of missing bars between two known timestamps. Defaults to ``classification='unknown'``.
+
+    ``classified_by`` (decision D-036 amendment, finding m-J) records which rule produced
+    ``classification``, so a report can show the evidence instead of an unexplained label:
+    ``"anomaly_overlap"`` (a dropped source row's raw window overlaps the missing-bar window),
+    ``"after_short_bar"`` (the gap starts right at a stored ``short`` bar's close label),
+    ``"cross_symbol"`` (the exact same window is also a gap in another configured symbol's
+    series), or ``"manual"`` (a human recorded this directly, e.g. by editing the sidecar).
+    ``None`` whenever ``classification == "unknown"`` -- the two travel together.
+    """
 
     from_ts: datetime
     to_ts: datetime
     missing_bars: int
     classification: str = "unknown"
+    classified_by: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "from_ts", ensure_utc(self.from_ts, "GapRecord.from_ts"))
@@ -121,15 +131,26 @@ class GapRecord:
             "to": self.to_ts.isoformat().replace("+00:00", "Z"),
             "missing_bars": self.missing_bars,
             "classification": self.classification,
+            "classified_by": self.classified_by,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> GapRecord:
+        classification = str(data.get("classification", "unknown"))
+        # A sidecar hand-edited by a human (or written before this field existed) carries a
+        # non-"unknown" classification with no "classified_by" key at all -- that silence is
+        # itself the signal that no automated rule produced it, so it is stamped "manual" on
+        # load rather than left `None` (which this module reserves for "classification is
+        # unknown", see the class docstring).
+        classified_by = data.get("classified_by")
+        if classified_by is None and classification != "unknown":
+            classified_by = "manual"
         return cls(
             from_ts=datetime.fromisoformat(str(data["from"]).replace("Z", "+00:00")),
             to_ts=datetime.fromisoformat(str(data["to"]).replace("Z", "+00:00")),
             missing_bars=int(data["missing_bars"]),
-            classification=str(data.get("classification", "unknown")),
+            classification=classification,
+            classified_by=classified_by,
         )
 
 

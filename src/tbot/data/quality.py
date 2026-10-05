@@ -68,12 +68,19 @@ _RESAMPLE_RULE: dict[Timeframe, str] = {Timeframe.H4: "4h", Timeframe.D1: "1D"}
 
 @dataclass(frozen=True, slots=True)
 class GapFinding:
-    """A run of missing bars between two known, present timestamps."""
+    """A run of missing bars between two known, present timestamps.
+
+    ``classified_by`` mirrors ``tbot.data.store.GapRecord.classified_by`` (decision D-036
+    amendment, finding m-J) -- it is only ever non-``None`` when ``classification`` was
+    overlaid from the Binance sidecar via ``_apply_gap_classifications``/``gap_classified_by``,
+    since ``find_gaps`` itself has no memory of anything and always returns ``"unknown"``.
+    """
 
     from_ts: datetime
     to_ts: datetime
     missing_bars: int
     classification: str = "unknown"
+    classified_by: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -81,6 +88,7 @@ class GapFinding:
             "to": _iso(self.to_ts),
             "missing_bars": self.missing_bars,
             "classification": self.classification,
+            "classified_by": self.classified_by,
         }
 
 
@@ -220,8 +228,22 @@ def coverage_by_month(ts: pd.Series, timeframe: Timeframe) -> dict[str, dict[str
 
 
 def _windows_overlap(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> bool:
-    """True when the half-open-ish windows ``[a_start, a_end]`` and ``[b_start, b_end]`` overlap."""
+    """True when the closed windows ``[a_start, a_end]`` and ``[b_start, b_end]`` overlap,
+    touching at a single shared instant counting as overlap. Used for anomalies, whose raw
+    windows are themselves the flagged bad data -- touching them at all is real overlap.
+    """
     return a_start <= b_end and b_start <= a_end
+
+
+def _bin_overlaps_gap(bin_start: datetime, bin_end: datetime, gap: GapFinding) -> bool:
+    """True when the higher-timeframe bin ``[bin_start, bin_end]`` shares a MISSING bar with
+    ``gap``. A gap's ``from_ts``/``to_ts`` are themselves PRESENT, known-good bars -- only the
+    bars strictly between them are missing -- so a bin that merely touches one of those edges
+    (``bin_end == gap.from_ts`` or ``bin_start == gap.to_ts``) shares no missing bar with it and
+    must not be tagged ``in_outage_window`` (finding m-J). Strict inequalities on both sides, as
+    opposed to ``_windows_overlap``'s closed-closed check used for anomalies.
+    """
+    return bin_start < gap.to_ts and gap.from_ts < bin_end
 
 
 def _bin_is_outage_window(
@@ -234,7 +256,7 @@ def _bin_is_outage_window(
     anomalies_higher: Sequence[store_mod.AnomalyRecord],
 ) -> bool:
     for gap in (*gaps_1h, *gaps_higher):
-        if _windows_overlap(bin_start, bin_end, gap.from_ts, gap.to_ts):
+        if _bin_overlaps_gap(bin_start, bin_end, gap):
             return True
     for anomaly in (*anomalies_1h, *anomalies_higher):
         lo = min(anomaly.raw_open_ts, anomaly.raw_close_ts)
@@ -378,95 +400,140 @@ class QualityReport:
         }
 
     def render_markdown(self) -> str:
+        """Assemble the full Markdown report. Each section is rendered by its own module-level
+        helper (below the class) so this stays a plain concatenation -- m-K (fix round): this
+        method alone used to be ~86 lines doing all the rendering inline."""
         lines = [
-            f"# Data quality — {self.source} {self.symbol} {self.timeframe.value}",
-            "",
-            f"- rows: {self.rows}",
-            f"- first_ts: {_iso(self.first_ts) if self.first_ts else 'n/a'}",
-            f"- last_ts: {_iso(self.last_ts) if self.last_ts else 'n/a'}",
-            f"- duplicate timestamps: {len(self.duplicate_timestamps)}",
-            f"- out-of-order timestamps: {len(self.out_of_order)}",
-            f"- gaps: {len(self.gaps)} ({self.unclassified_gap_count} unclassified)",
-            f"- zero-volume bars: {len(self.zero_volume_bars)}",
-            f"- high==low bars: {len(self.high_eq_low_bars)}",
-            f"- |return| outliers: {len(self.return_outliers)}",
-            "",
-            "## Coverage by month",
-            "",
-            "| month | expected | actual | coverage |",
-            "|---|---|---|---|",
+            *_render_header_lines(self),
+            *_render_coverage_lines(self),
+            *_render_gaps_lines(self),
+            *_render_duplicates_lines(self),
+            *_render_out_of_order_lines(self),
+            *_render_outliers_lines(self),
+            *_render_anomalies_lines(self),
+            *_render_reconciliation_lines(self),
         ]
-        for month, row in sorted(self.coverage.items()):
-            lines.append(f"| {month} | {row['expected']} | {row['actual']} | {row['coverage']:.4f} |")
-
-        if self.gaps:
-            lines += ["", "## Gaps", "", "| from | to | missing_bars | classification |", "|---|---|---|---|"]
-            for gap in self.gaps:
-                lines.append(
-                    f"| {_iso(gap.from_ts)} | {_iso(gap.to_ts)} | {gap.missing_bars} | {gap.classification} |"
-                )
-
-        if self.duplicate_timestamps:
-            lines += ["", "## Duplicate timestamps", ""]
-            lines += [f"- {_iso(t)}" for t in self.duplicate_timestamps]
-
-        if self.out_of_order:
-            lines += ["", "## Out-of-order timestamps", ""]
-            lines += [
-                f"- index {o['index']}: {_iso(o['ts'])} after {_iso(o['previous_ts'])}"
-                for o in self.out_of_order
-            ]
-
-        if self.return_outliers:
-            lines += ["", "## |return| outliers", ""]
-            lines += [f"- {_iso(o.ts)}: {o.pct_return:+.2%}" for o in self.return_outliers]
-
-        if self.anomalies:
-            lines += [
-                "",
-                "## Source anomalies",
-                "",
-                "| symbol | timeframe | raw open | raw close | duration (s) | n_trades | volume "
-                "| class | action |",
-                "|---|---|---|---|---|---|---|---|---|",
-            ]
-            for a in self.anomalies:
-                lines.append(
-                    f"| {self.symbol} | {self.timeframe.value} | {_iso(a.raw_open_ts)} | "
-                    f"{_iso(a.raw_close_ts)} | {a.duration_seconds:.3f} | {a.n_trades} | {a.volume} | "
-                    f"{a.classification} | {a.action} |"
-                )
-
-        if self.reconciliation is not None:
-            outside = self.reconciliation_mismatches_outside_outages or []
-            lines += [
-                "",
-                "## Resampling reconciliation",
-                "",
-                f"- total mismatches: {len(self.reconciliation)}",
-                f"- mismatches outside outage windows: {len(outside)}",
-            ]
-            if self.reconciliation:
-                lines += ["", "### All mismatches", ""]
-                lines += [
-                    f"- {_iso(m.ts)} {m.column}: resampled={m.resampled} stored={m.stored}"
-                    f"{' (outage window)' if m.in_outage_window else ''}"
-                    for m in self.reconciliation
-                ]
-            else:
-                lines.append("- OK: resampled values match stored values within tolerance")
-            if outside:
-                lines += ["", "### Mismatches outside outage windows", ""]
-                lines += [
-                    f"- {_iso(m.ts)} {m.column}: resampled={m.resampled} stored={m.stored}"
-                    for m in outside
-                ]
-
         return "\n".join(lines) + "\n"
 
 
+# ---------------------------------------------------------------------------------
+# render_markdown section helpers (m-K, fix round: split out of one long method)
+# ---------------------------------------------------------------------------------
+
+
+def _render_header_lines(report: QualityReport) -> list[str]:
+    return [
+        f"# Data quality — {report.source} {report.symbol} {report.timeframe.value}",
+        "",
+        f"- rows: {report.rows}",
+        f"- first_ts: {_iso(report.first_ts) if report.first_ts else 'n/a'}",
+        f"- last_ts: {_iso(report.last_ts) if report.last_ts else 'n/a'}",
+        f"- duplicate timestamps: {len(report.duplicate_timestamps)}",
+        f"- out-of-order timestamps: {len(report.out_of_order)}",
+        f"- gaps: {len(report.gaps)} ({report.unclassified_gap_count} unclassified)",
+        f"- zero-volume bars: {len(report.zero_volume_bars)}",
+        f"- high==low bars: {len(report.high_eq_low_bars)}",
+        f"- |return| outliers: {len(report.return_outliers)}",
+    ]
+
+
+def _render_coverage_lines(report: QualityReport) -> list[str]:
+    lines = ["", "## Coverage by month", "", "| month | expected | actual | coverage |", "|---|---|---|---|"]
+    for month, row in sorted(report.coverage.items()):
+        lines.append(f"| {month} | {row['expected']} | {row['actual']} | {row['coverage']:.4f} |")
+    return lines
+
+
+def _render_gaps_lines(report: QualityReport) -> list[str]:
+    if not report.gaps:
+        return []
+    lines = [
+        "",
+        "## Gaps",
+        "",
+        "| from | to | missing_bars | classification | classified_by |",
+        "|---|---|---|---|---|",
+    ]
+    for gap in report.gaps:
+        lines.append(
+            f"| {_iso(gap.from_ts)} | {_iso(gap.to_ts)} | {gap.missing_bars} | {gap.classification} | "
+            f"{gap.classified_by or ''} |"
+        )
+    return lines
+
+
+def _render_duplicates_lines(report: QualityReport) -> list[str]:
+    if not report.duplicate_timestamps:
+        return []
+    return ["", "## Duplicate timestamps", ""] + [f"- {_iso(t)}" for t in report.duplicate_timestamps]
+
+
+def _render_out_of_order_lines(report: QualityReport) -> list[str]:
+    if not report.out_of_order:
+        return []
+    return ["", "## Out-of-order timestamps", ""] + [
+        f"- index {o['index']}: {_iso(o['ts'])} after {_iso(o['previous_ts'])}" for o in report.out_of_order
+    ]
+
+
+def _render_outliers_lines(report: QualityReport) -> list[str]:
+    if not report.return_outliers:
+        return []
+    return ["", "## |return| outliers", ""] + [
+        f"- {_iso(o.ts)}: {o.pct_return:+.2%}" for o in report.return_outliers
+    ]
+
+
+def _render_anomalies_lines(report: QualityReport) -> list[str]:
+    if not report.anomalies:
+        return []
+    lines = [
+        "",
+        "## Source anomalies",
+        "",
+        "| symbol | timeframe | raw open | raw close | duration (s) | n_trades | volume "
+        "| class | action |",
+        "|---|---|---|---|---|---|---|---|---|",
+    ]
+    for a in report.anomalies:
+        lines.append(
+            f"| {report.symbol} | {report.timeframe.value} | {_iso(a.raw_open_ts)} | "
+            f"{_iso(a.raw_close_ts)} | {a.duration_seconds:.3f} | {a.n_trades} | {a.volume} | "
+            f"{a.classification} | {a.action} |"
+        )
+    return lines
+
+
+def _render_reconciliation_lines(report: QualityReport) -> list[str]:
+    if report.reconciliation is None:
+        return []
+    outside = report.reconciliation_mismatches_outside_outages or []
+    lines = [
+        "",
+        "## Resampling reconciliation",
+        "",
+        f"- total mismatches: {len(report.reconciliation)}",
+        f"- mismatches outside outage windows: {len(outside)}",
+    ]
+    if report.reconciliation:
+        lines += ["", "### All mismatches", ""]
+        lines += [
+            f"- {_iso(m.ts)} {m.column}: resampled={m.resampled} stored={m.stored}"
+            f"{' (outage window)' if m.in_outage_window else ''}"
+            for m in report.reconciliation
+        ]
+    else:
+        lines.append("- OK: resampled values match stored values within tolerance")
+    if outside:
+        lines += ["", "### Mismatches outside outage windows", ""]
+        lines += [f"- {_iso(m.ts)} {m.column}: resampled={m.resampled} stored={m.stored}" for m in outside]
+    return lines
+
+
 def _apply_gap_classifications(
-    gaps: list[GapFinding], gap_classifications: Mapping[tuple[datetime, datetime], str] | None
+    gaps: list[GapFinding],
+    gap_classifications: Mapping[tuple[datetime, datetime], str] | None,
+    gap_classified_by: Mapping[tuple[datetime, datetime], str | None] | None = None,
 ) -> list[GapFinding]:
     """Overlay previously-investigated classifications (persisted in the Binance sidecar's
     ``gaps`` list, keyed by ``(from_ts, to_ts)``) onto freshly-found gaps.
@@ -475,18 +542,48 @@ def _apply_gap_classifications(
     memory of anything -- so without this, ``unclassified_gap_count`` could never drop below the
     total gap count and gate G1a ("every missing bar classified, no 'unknown' left") could never
     be satisfied no matter how many gaps got investigated and recorded on disk.
+
+    ``gap_classified_by`` (decision D-036 amendment, finding m-J) is the matching overlay for
+    ``GapRecord.classified_by``, so the report can show which rule produced each classification.
     """
     if not gap_classifications:
         return gaps
+    classified_by = gap_classified_by or {}
     return [
         GapFinding(
             from_ts=g.from_ts,
             to_ts=g.to_ts,
             missing_bars=g.missing_bars,
             classification=gap_classifications.get((g.from_ts, g.to_ts), g.classification),
+            classified_by=classified_by.get((g.from_ts, g.to_ts), g.classified_by),
         )
         for g in gaps
     ]
+
+
+def _build_reconciliation(
+    *,
+    timeframe: Timeframe,
+    ordered: pd.DataFrame,
+    df_1h_for_reconciliation: pd.DataFrame | None,
+    gaps: Sequence[GapFinding],
+    anomalies: Sequence[store_mod.AnomalyRecord],
+    anomalies_1h_for_reconciliation: Sequence[store_mod.AnomalyRecord],
+) -> list[ReconciliationMismatch] | None:
+    """The reconciliation half of ``build_quality_report`` (m-K, fix round): ``None`` unless
+    ``timeframe`` resamples from 1h and a 1h frame was actually supplied."""
+    if timeframe not in _RESAMPLE_RULE or df_1h_for_reconciliation is None:
+        return None
+    gaps_1h = find_gaps(df_1h_for_reconciliation["ts"], Timeframe.H1)
+    return reconcile_resample(
+        df_1h_for_reconciliation,
+        ordered,
+        higher_timeframe=timeframe,
+        gaps_1h=gaps_1h,
+        gaps_higher=gaps,
+        anomalies_1h=anomalies_1h_for_reconciliation,
+        anomalies_higher=anomalies,
+    )
 
 
 def build_quality_report(
@@ -497,24 +594,24 @@ def build_quality_report(
     df: pd.DataFrame,
     df_1h_for_reconciliation: pd.DataFrame | None = None,
     gap_classifications: Mapping[tuple[datetime, datetime], str] | None = None,
+    gap_classified_by: Mapping[tuple[datetime, datetime], str | None] | None = None,
     anomalies: Sequence[store_mod.AnomalyRecord] = (),
     anomalies_1h_for_reconciliation: Sequence[store_mod.AnomalyRecord] = (),
 ) -> QualityReport:
     """Run every check in this module over ``df`` and assemble one report.
 
-    ``df_1h_for_reconciliation`` is required (and used) only when ``timeframe`` is 4h or 1d —
-    the 1h series it resamples from, used to validate the stored higher-timeframe bars.
+    ``df_1h_for_reconciliation`` is required (and used) only when ``timeframe`` is 4h or 1d — the
+    1h series it resamples from (see ``_build_reconciliation``).
 
-    ``gap_classifications`` (decision M6) maps ``(from_ts, to_ts) -> classification`` for gaps
-    already investigated and recorded (typically read back from the Binance ``_dataset.json``
-    sidecar by the caller) -- without it every gap is reported ``"unknown"`` forever, even one
-    that was classified yesterday, because this function (like every function in this module) is
-    pure and has no memory of its own.
+    ``gap_classifications``/``gap_classified_by`` (decision M6; D-036 amendment for the latter)
+    overlay a previously-investigated ``(from_ts, to_ts) -> classification``/``classified_by``,
+    typically read back from the Binance sidecar by the caller -- this function, like every
+    function in this module, is pure and has no memory of its own, so without them every gap is
+    reported ``"unknown"`` forever.
 
     ``anomalies`` (decision D-036) are this series' own source-row anomalies, for the "Source
-    anomalies" report section. ``anomalies_1h_for_reconciliation`` are the 1h series' anomalies,
-    used (together with ``anomalies``) only to tag reconciliation mismatches as inside/outside an
-    outage window -- both are typically read back from the Binance sidecar(s) by the caller.
+    anomalies" section. ``anomalies_1h_for_reconciliation`` are the 1h series' anomalies, used
+    with ``anomalies`` only to tag reconciliation mismatches as inside/outside an outage window.
     """
     if df.empty:
         return QualityReport(
@@ -523,37 +620,27 @@ def build_quality_report(
         )
 
     ordered = df.sort_values("ts").reset_index(drop=True)
-    gaps = _apply_gap_classifications(find_gaps(ordered["ts"], timeframe), gap_classifications)
-
-    reconciliation: list[ReconciliationMismatch] | None = None
-    if timeframe in _RESAMPLE_RULE and df_1h_for_reconciliation is not None:
-        gaps_1h = find_gaps(df_1h_for_reconciliation["ts"], Timeframe.H1)
-        reconciliation = reconcile_resample(
-            df_1h_for_reconciliation,
-            ordered,
-            higher_timeframe=timeframe,
-            gaps_1h=gaps_1h,
-            gaps_higher=gaps,
-            anomalies_1h=anomalies_1h_for_reconciliation,
-            anomalies_higher=anomalies,
-        )
+    gaps = _apply_gap_classifications(
+        find_gaps(ordered["ts"], timeframe), gap_classifications, gap_classified_by
+    )
+    reconciliation = _build_reconciliation(
+        timeframe=timeframe,
+        ordered=ordered,
+        df_1h_for_reconciliation=df_1h_for_reconciliation,
+        gaps=gaps,
+        anomalies=anomalies,
+        anomalies_1h_for_reconciliation=anomalies_1h_for_reconciliation,
+    )
 
     return QualityReport(
-        source=source,
-        symbol=symbol,
-        timeframe=timeframe,
-        rows=len(ordered),
-        first_ts=ordered["ts"].iloc[0].to_pydatetime(),
-        last_ts=ordered["ts"].iloc[-1].to_pydatetime(),
+        source=source, symbol=symbol, timeframe=timeframe, rows=len(ordered),
+        first_ts=ordered["ts"].iloc[0].to_pydatetime(), last_ts=ordered["ts"].iloc[-1].to_pydatetime(),
         coverage=coverage_by_month(ordered["ts"], timeframe),
         duplicate_timestamps=find_duplicate_timestamps(ordered["ts"]),
-        out_of_order=find_out_of_order(ordered["ts"]),
-        gaps=gaps,
-        zero_volume_bars=find_zero_volume(ordered),
-        high_eq_low_bars=find_high_eq_low(ordered),
+        out_of_order=find_out_of_order(ordered["ts"]), gaps=gaps,
+        zero_volume_bars=find_zero_volume(ordered), high_eq_low_bars=find_high_eq_low(ordered),
         return_outliers=find_return_outliers(ordered, timeframe),
-        reconciliation=reconciliation,
-        anomalies=list(anomalies),
+        reconciliation=reconciliation, anomalies=list(anomalies),
     )
 
 
