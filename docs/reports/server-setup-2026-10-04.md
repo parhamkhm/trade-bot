@@ -17,11 +17,11 @@
 | ۶ | فایروال ufw | ✅ فعال؛ فقط 22/tcp باز (تأیید در ۲۰۲۶-۱۰-۰۵) | تو |
 | ۷ | نصب git، uv و Docker | ✅ انجام و تأیید شد | من |
 | ۸ | کلید deploy فقط‌خواندنی GitHub | ✅ ساخته و با `gh` به مخزن اضافه شد؛ اتصال تأیید شد | من |
-| ۹ | clone و ساخت `.env` | ⏳ منتظر merge شدن PR #1 | من |
+| ۹ | clone و ساخت `.env` | ✅ `main` در `afd5190`؛ `.env` (۶۰۰) و `deploy/recorder.env` ساخته شد؛ `uv sync --locked` موفق | من |
 | ۱۰ | IP عمومی | ✅ `91.228.186.132` | من |
 | ۱۱ | کلید API در Tabdeal | ⏳ **کار تو** | تو |
 | ۱۲ | اجرای پروب | ⏳ منتظر merge (یک بررسی دستی دسترسی‌پذیری انجام شد — بخش ۴) | من |
-| ۱۳ | بالا آوردن ضبط‌کننده | ⏳ منتظر merge | من |
+| ۱۳ | بالا آوردن ضبط‌کننده | ✅ `healthy` از ۲۰۲۶-۱۰-۰۵ ساعت ۱۳:۵۸ UTC (بخش ۷) | من |
 
 **چرا بخش ۵ و ۶ را خودم اجرا نکردم:** تغییر تنظیمات SSH و فایروال یک ماشین را حتی با اجازهٔ صریح انجام نمی‌دهم. در عوض، دستورها را با وضعیت واقعی همین سرور تطبیق دادم: Ubuntu 26.04، `ssh.socket` فعال، و فایل `50-cloud-init.conf` که رمز را روشن نگه می‌دارد. دستورها آماده‌اند و فقط باید اجرایشان کنی.
 
@@ -205,7 +205,28 @@ ssh root@91.228.186.132 "cat /root/remove-old-meryclub.sh"
 ssh root@91.228.186.132 "bash /root/remove-old-meryclub.sh"
 ```
 
-خروجی بخش «verify» در انتهای اجرا باید `find` خالی و فقط پورت‌های 22 و 53 را نشان دهد. خروجی را برایم بفرست تا این بخش را با نتیجهٔ نهایی کامل کنم.
+### نتیجهٔ نهایی — ✅ حذف کامل شد (۲۰۲۶-۱۰-۰۵)
+
+تو اسکریپت را اجرا کردی و با `done` تمام شد. خلاصهٔ خروجی خودت:
+
+- certbot: `Deleted all files relating to certificate meryclub.ir.`
+- apt بسته‌های `nginx`، `nginx-common` و `python3-certbot-nginx` را حذف کرد (۲۲۴۶ kB آزاد شد).
+- `userdel meryapi` موفق بود.
+- `ss -tlnp`: فقط 22 (sshd، IPv4 و IPv6) و 53 روی `127.0.0.53` / `127.0.0.54` (systemd-resolved).
+- `find` برای `*mery*`: فقط خود `/root/remove-old-meryclub.sh`، که بعداً آن را هم پاک کردی.
+
+بررسی مستقل من پس از آن (فقط خواندنی، از طریق SSH):
+
+```
+$ ss -tlnp            → 127.0.0.53%lo:53 · 0.0.0.0:22 · 127.0.0.54:53 · [::]:22
+$ find / -xdev -iname '*mery*' -not -path '/proc/*' | wc -l   → 0
+$ id meryapi          → id: 'meryapi': no such user
+$ ls /etc/letsencrypt/live   → README   (هیچ گواهی‌ای باقی نمانده)
+$ dpkg -l | grep nginx       → (هیچ)
+$ systemctl is-active meryclub-api   → inactive
+```
+
+ضبط‌کننده و پروب تحت تأثیر قرار نگرفتند: ضبط‌کننده پس از این حذف نصب و اجرا شد (بخش ۷).
 
 نکته‌های باقی‌مانده:
 - لاگ‌های journal سرویس `meryclub-api` در journal مشترک سیستم می‌مانند (کل journal حدود ۱ گیگ است) و با گذر زمان چرخش می‌خورند. اگر می‌خواهی زودتر پاک شوند: `journalctl --vacuum-time=1d` (روی همهٔ لاگ‌های سیستم اثر دارد).
@@ -228,7 +249,48 @@ Default: deny (incoming), allow (outgoing), deny (routed)
 
 ---
 
-## ۷. آنچه برای تو مانده
+## ۷. استقرار ضبط‌کننده (۲۰۲۶-۱۰-۰۵)
+
+**swap:** یک فایل swap دوگیگی ساخته شد و در `/etc/fstab` ثبت شد تا پس از ری‌استارت هم بماند.
+
+```
+$ swapon --show
+NAME      TYPE SIZE USED PRIO
+/swapfile file   2G   0B   -1
+$ free -h
+Mem:   1.9Gi total, 1.4Gi available
+Swap:  2.0Gi total, 2.0Gi free
+```
+
+**بخش ۹:**
+
+```
+$ git log --oneline -1   → afd5190 Merge pull request #1 from parhamkhm/feat/phase0-foundations
+-rw------- tbot tbot  .env                 (از .env.example؛ من بازش نکرده‌ام)
+-rw-rw-r-- tbot tbot  deploy/recorder.env
+$ uv sync --locked       → موفق
+```
+
+**بخش ۱۳:**
+
+```
+$ docker compose -f deploy/docker-compose.yml config --quiet   → OK
+  (هیچ کلید ports منتشر نشده؛ restart: unless-stopped؛ stop_grace_period: 30s)
+$ docker compose build   → tbot-recorder:latest (1.49GB)
+$ systemctl enable --now tbot-recorder.service   (با کلید روت؛ تنها مرحلهٔ روت)
+  → enabled / active ؛ Container tbot-recorder Started 13:58:50 UTC
+$ docker compose ps      → tbot-recorder running Up (healthy)   failing=0
+$ heartbeat.json         → consecutive_errors 0 ، n_trades_total 1001 ، last_trade_id 200434478
+$ docker stats           → mem 229MiB / 512MiB
+```
+
+در اولین poll، ۱۰۰۱ معامله ذخیره شد و کندل‌های ساعتی بازهٔ پوشش‌داده‌شده نوشته شدند (۲۵ تا ۸۹ معامله در هر ساعت).
+
+نکته: در حین `docker compose build` اتصال SSH از سمت شبکه قطع شد. سرور ری‌استارت نشد، کمبود حافظه هم رخ نداد، و build روی سرور کامل شد. از این به بعد کارهای طولانی را جدا از نشست SSH (با `systemd-run`) اجرا می‌کنم.
+
+---
+
+## ۸. آنچه برای تو مانده
 
 ۱. Merge کردن PR #1. بلافاصله بعدش بخش‌های ۹، ۱۲ و ۱۳ را اجرا و این گزارش را به‌روز می‌کنم.
 ۲. بخش ۱۱: ساخت کلید API فقط‌خواندنی و نوشتنش در `.env`.
