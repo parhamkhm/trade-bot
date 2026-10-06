@@ -16,6 +16,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -184,6 +185,260 @@ def test_backup_of_a_concurrently_written_database_is_consistent(
     assert result.copy_trade_count >= 10
 
 
+# --- MINOR-1 (PR2 followups): WAL source livelock fix -------------------------------------
+
+
+def test_perform_backup_picks_single_step_for_wal_source_and_stepwise_otherwise(
+    source_db: Path, dest_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``perform_backup`` must call ``_backup_attempt`` with ``pages=-1`` (a single step) for a
+    WAL source, and the stepwise ``(_PAGES_PER_STEP, _SLEEP_PER_STEP_SECONDS)`` otherwise.
+
+    On the old code (always stepwise, with no `pages`/`sleep` parameters on `_backup_attempt`
+    at all) this fails outright -- the spy below cannot even be called with those keyword
+    arguments.
+    """
+    real_attempt = backup_trades._backup_attempt
+    calls: list[tuple[int, float]] = []
+
+    def _spy(
+        source: Path, tmp_dest: Path, *, pages: int, sleep: float, max_attempt_seconds: float
+    ) -> None:
+        calls.append((pages, sleep))
+        real_attempt(source, tmp_dest, pages=pages, sleep=sleep, max_attempt_seconds=max_attempt_seconds)
+
+    monkeypatch.setattr(backup_trades, "_backup_attempt", _spy)
+
+    # source_db is created with sqlite3's default (rollback-journal) mode.
+    backup_trades.perform_backup(source_db, dest_dir, now=datetime(2026, 1, 1, tzinfo=UTC))
+    assert calls[-1] == (
+        backup_trades._PAGES_PER_STEP,
+        backup_trades._SLEEP_PER_STEP_SECONDS,
+    )
+
+    conn = sqlite3.connect(str(source_db))
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    finally:
+        conn.close()
+    backup_trades.perform_backup(source_db, dest_dir, now=datetime(2026, 1, 2, tzinfo=UTC))
+    assert calls[-1] == (-1, 0.0)
+
+
+def test_perform_backup_wal_source_completes_under_a_fast_concurrent_writer_process(
+    source_db: Path, dest_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MINOR-1: SQLite's own online-backup implementation restarts a STEPWISE backup
+    (``pages=N > 0``) from page 1 whenever the source is modified between two steps. Against a
+    writer that commits about as often as a single step takes, a database large enough never
+    finishes a stepwise backup at all. Reproduced here with a genuinely separate OS process
+    (not a thread -- the actual incident report used a separate process too) committing every
+    2ms. A WAL source must instead be copied in a single step (``pages=-1``): one consistent
+    snapshot, immune to this restart behaviour, because there is no second step to restart.
+
+    `_PAGES_PER_STEP`/`_MAX_ATTEMPT_SECONDS`/`_MAX_ATTEMPTS` are shrunk only to keep this test
+    fast and deterministic. On the OLD code (always stepwise, ignoring the source's own journal
+    mode) this reliably raises `BackupError` well within the shrunk budget; the fixed code
+    detects the WAL source and completes almost immediately regardless of `_PAGES_PER_STEP`.
+    """
+    conn = sqlite3.connect(str(source_db))
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.executemany(
+            "INSERT INTO trades (trade_id, ts_ms, price, qty, is_buyer_maker, recorded_ts_ms) "
+            "VALUES (?, ?, '100.0', '0.01', 0, ?)",
+            [(i, i * 1000, i * 1000) for i in range(100, 400_100)],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(backup_trades, "_PAGES_PER_STEP", 2)
+    monkeypatch.setattr(backup_trades, "_MAX_ATTEMPT_SECONDS", 3.0)
+    monkeypatch.setattr(backup_trades, "_MAX_ATTEMPTS", 1)
+
+    writer_code = (
+        "import sqlite3, time, sys\n"
+        "c = sqlite3.connect(sys.argv[1], isolation_level=None, timeout=30.0)\n"
+        "i = 10**9\n"
+        "while True:\n"
+        "    try:\n"
+        "        c.execute('BEGIN IMMEDIATE')\n"
+        "        c.execute(\"INSERT INTO trades VALUES (?, 0, '1', '1', 0, 0)\", (i,))\n"
+        "        c.execute('COMMIT')\n"
+        "    except sqlite3.OperationalError:\n"
+        "        pass\n"
+        "    i += 1\n"
+        "    time.sleep(0.002)\n"
+    )
+    writer = subprocess.Popen([sys.executable, "-c", writer_code, str(source_db)])
+    time.sleep(0.3)  # let the writer get going before the backup starts
+    try:
+        result = backup_trades.perform_backup(source_db, dest_dir)
+    finally:
+        writer.kill()
+        writer.wait(timeout=5)
+
+    assert result.attempts == 1
+    ok, rows = backup_trades._integrity_check_ok(result.dest_path)
+    assert ok, rows
+
+
+def test_perform_backup_wal_copy_has_no_orphan_sidecars_and_is_delete_mode(
+    source_db: Path, dest_dir: Path
+) -> None:
+    """NIT (backup sidecars, PR2 followups): a copy made from a WAL source must come out of
+    `perform_backup` as a plain, self-contained ``journal_mode=DELETE`` file, with no leftover
+    ``-wal``/``-shm`` sidecar in `dest_dir` -- on the old code, these appear because the finished
+    copy stays in WAL mode, and even a later READ-ONLY open of it (e.g. this script's own
+    integrity check) can create fresh sidecars that are then never rotated away.
+    """
+    conn = sqlite3.connect(str(source_db))
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    finally:
+        conn.close()
+
+    result = backup_trades.perform_backup(source_db, dest_dir)
+
+    sidecars = list(dest_dir.glob("*-wal")) + list(dest_dir.glob("*-shm"))
+    assert sidecars == []
+
+    copy_conn = sqlite3.connect(str(result.dest_path))
+    try:
+        mode = copy_conn.execute("PRAGMA journal_mode").fetchone()[0]
+    finally:
+        copy_conn.close()
+    assert str(mode).lower() == "delete"
+
+    # Reading the copy back (as _integrity_check_ok/_count_trades_readonly already did inside
+    # perform_backup) must not itself conjure sidecars back into existence.
+    backup_trades._integrity_check_ok(result.dest_path)
+    backup_trades._count_trades_readonly(result.dest_path)
+    sidecars_after_read = list(dest_dir.glob("*-wal")) + list(dest_dir.glob("*-shm"))
+    assert sidecars_after_read == []
+
+
+def test_rotation_removes_orphan_sidecars_for_deleted_copies(dest_dir: Path) -> None:
+    """NIT (backup sidecars, PR2 followups): deleting an old copy during rotation must also
+    delete its own ``-wal``/``-shm`` sidecars (if any), and any sidecar already orphaned by an
+    older, pre-fix copy (no matching main file at all) must be swept too."""
+    now = datetime(2026, 1, 15, 2, 30, 0, tzinfo=UTC)
+    old = _touch_backup(dest_dir, now - timedelta(days=20))
+    old_wal = old.with_name(old.name + "-wal")
+    old_shm = old.with_name(old.name + "-shm")
+    old_wal.write_bytes(b"stray wal")
+    old_shm.write_bytes(b"stray shm")
+    newest = _touch_backup(dest_dir, now - timedelta(hours=1))
+
+    # An orphan sidecar with no matching main file at all (e.g. left by a run before this fix,
+    # whose main file was itself already cleaned up by some other means).
+    orphan_wal = dest_dir / "trades-20250101T000000Z.sqlite-wal"
+    orphan_wal.write_bytes(b"orphan")
+
+    deleted = backup_trades.rotate_backups(dest_dir, keep_days=14, now=now)
+
+    assert old in deleted
+    assert not old.exists()
+    assert not old_wal.exists()
+    assert not old_shm.exists()
+    assert not orphan_wal.exists()
+    assert newest.exists()
+
+
+# --- NIT (verify before rename, PR2 followups) ---------------------------------------------
+
+
+def test_perform_backup_runs_integrity_check_on_tmp_before_the_rename(
+    source_db: Path, dest_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The integrity check must run on the ``.tmp`` file BEFORE the atomic rename -- never
+    after -- so a process killed between the two can never leave an unverified file sitting
+    under the final, "looks done" name. Verified two ways: the path handed to
+    `_integrity_check_ok` is a `.tmp` path, and the final-named file does not exist yet at the
+    moment that check runs.
+    """
+    seen: dict[str, object] = {}
+    real_check = backup_trades._integrity_check_ok
+
+    def _spy_check(path: Path) -> tuple[bool, list[str]]:
+        seen["path"] = path
+        seen["final_name_exists_yet"] = (path.parent / path.name.removesuffix(".tmp")).exists()
+        ok, rows = real_check(path)
+        return bool(ok), list(rows)
+
+    monkeypatch.setattr(backup_trades, "_integrity_check_ok", _spy_check)
+
+    result = backup_trades.perform_backup(source_db, dest_dir)
+
+    assert seen["path"] is not None
+    assert str(seen["path"]).endswith(".tmp")
+    assert seen["final_name_exists_yet"] is False
+    assert result.dest_path.exists()
+
+
+def test_perform_backup_integrity_failure_never_creates_the_final_named_file(
+    source_db: Path, dest_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Old behaviour: rename-then-check meant a failed check deleted a file that, for a brief
+    window, already existed under the final name. Now, the final name must never exist at all
+    when the check fails -- not "exist briefly then get deleted"."""
+
+    def _fake_integrity_check_ok(path: Path) -> tuple[bool, list[str]]:
+        return False, ["corruption found"]
+
+    monkeypatch.setattr(backup_trades, "_integrity_check_ok", _fake_integrity_check_ok)
+
+    with pytest.raises(backup_trades.IntegrityCheckError):
+        backup_trades.perform_backup(source_db, dest_dir)
+
+    assert list(dest_dir.glob("trades-*.sqlite")) == []
+    assert list(dest_dir.glob("*.tmp")) == []
+
+
+# --- NIT (error handling, PR2 followups): corrupt/non-database source ----------------------
+
+
+def test_perform_backup_corrupt_source_raises_backup_error_not_a_raw_traceback(
+    dest_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A garbage (non-SQLite) source file raises ``sqlite3.DatabaseError`` (``"file is not a
+    database"``), NOT ``sqlite3.OperationalError`` -- the old retry loop only caught the latter,
+    so this used to propagate straight out of `perform_backup`/`run` as an uncaught traceback.
+    It must now be caught like any other backup failure: `BackupError`, no leftover `.tmp`.
+    """
+    monkeypatch.setattr(backup_trades, "_BACKOFF_BASE_SECONDS", 0.001)
+    monkeypatch.setattr(backup_trades, "_BACKOFF_MAX_SECONDS", 0.002)
+    garbage_source = dest_dir.parent / "garbage.sqlite"
+    garbage_source.write_bytes(b"not a database" * 100)
+
+    with pytest.raises(backup_trades.BackupError):
+        backup_trades.perform_backup(garbage_source, dest_dir)
+
+    assert list(dest_dir.glob("*.tmp")) == []
+    assert list(dest_dir.glob("*-wal")) == []
+    assert list(dest_dir.glob("*-shm")) == []
+
+
+def test_run_exits_1_on_a_corrupt_source_with_no_leftover_tmp_file(
+    dest_dir: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end through `run()`: exit code 1, a clean JSON error on stderr (never a raw
+    traceback), and no `.tmp` file left behind."""
+    monkeypatch.setattr(backup_trades, "_BACKOFF_BASE_SECONDS", 0.001)
+    monkeypatch.setattr(backup_trades, "_BACKOFF_MAX_SECONDS", 0.002)
+    garbage_source = dest_dir.parent / "garbage.sqlite"
+    garbage_source.write_bytes(b"not a database" * 100)
+
+    code = backup_trades.run(["--source", str(garbage_source), "--dest-dir", str(dest_dir)])
+
+    assert code == 1
+    stderr_payload = json.loads(capsys.readouterr().err)
+    assert stderr_payload["status"] == "error"
+    assert stderr_payload["stage"] == "backup"
+    assert list(dest_dir.glob("*.tmp")) == [] if dest_dir.exists() else True
+
+
 # --- integrity-check failure path ----------------------------------------------------------
 
 
@@ -236,7 +491,9 @@ def test_perform_backup_raises_backup_error_after_exhausting_retries(
 ) -> None:
     attempts: list[int] = []
 
-    def _always_fails(source: Path, tmp_dest: Path, *, max_attempt_seconds: float) -> None:
+    def _always_fails(
+        source: Path, tmp_dest: Path, *, pages: int, sleep: float, max_attempt_seconds: float
+    ) -> None:
         attempts.append(1)
         raise sqlite3.OperationalError("database is locked")
 
@@ -259,11 +516,13 @@ def test_perform_backup_succeeds_after_transient_failures(
     real_attempt = backup_trades._backup_attempt
     calls = {"n": 0}
 
-    def _fails_twice_then_succeeds(source: Path, tmp_dest: Path, *, max_attempt_seconds: float) -> None:
+    def _fails_twice_then_succeeds(
+        source: Path, tmp_dest: Path, *, pages: int, sleep: float, max_attempt_seconds: float
+    ) -> None:
         calls["n"] += 1
         if calls["n"] < 3:
             raise sqlite3.OperationalError("database is locked")
-        real_attempt(source, tmp_dest, max_attempt_seconds=max_attempt_seconds)
+        real_attempt(source, tmp_dest, pages=pages, sleep=sleep, max_attempt_seconds=max_attempt_seconds)
 
     monkeypatch.setattr(backup_trades, "_backup_attempt", _fails_twice_then_succeeds)
     monkeypatch.setattr(backup_trades, "_BACKOFF_BASE_SECONDS", 0.001)
@@ -395,3 +654,15 @@ def test_module_is_self_contained_stdlib_only() -> None:
     for forbidden in ("import tbot", "from tbot", "import structlog", "import pydantic", "import httpx"):
         assert forbidden not in source
     assert isinstance(backup_trades, ModuleType)
+
+
+def test_module_does_not_require_python_3_11_for_datetime_utc() -> None:
+    """NIT (Python version, PR2 followups): this script runs as root, outside the project's own
+    virtualenv, against whatever `python3` the server's OS package manager provides --
+    `docs/SERVER_SETUP.md` documents Ubuntu 22.04 ("jammy"), whose system `python3` is 3.10.
+    `from datetime import UTC` needs 3.11+ and would make this script crash on import on such a
+    server; `datetime.timezone.utc` is the same UTC instance, available since Python 3.2.
+    """
+    source = _MODULE_PATH.read_text(encoding="utf-8")
+    assert "from datetime import UTC" not in source
+    assert "timezone.utc" in source
