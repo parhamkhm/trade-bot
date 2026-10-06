@@ -94,7 +94,8 @@ services:
     # which parses the heartbeat file's JSON and fails unhealthy on a stale timestamp, a
     # high `consecutive_errors` count, or a stale `last_new_trade_ts_ms`); nothing to
     # override here unless the defaults (TBOT_HEARTBEAT_MAX_AGE_SECONDS /
-    # TBOT_HEARTBEAT_MAX_CONSECUTIVE_ERRORS / TBOT_HEARTBEAT_MAX_TRADE_STALENESS_SECONDS)
+    # TBOT_HEARTBEAT_MAX_CONSECUTIVE_ERRORS / TBOT_HEARTBEAT_MAX_TRADE_STALENESS_SECONDS /
+    # TBOT_HEARTBEAT_MAX_CYCLE_EXCEPTIONS)
     # stop fitting — add them under `environment:` above if they ever need a
     # per-deployment override.
 
