@@ -9,10 +9,12 @@ runtime:
   log_level: INFO
 
 costs:
-  # Tabdeal fee tier is unknown until the probe/account check; 20 bps per side is the
-  # conservative default fixed in CLAUDE.md section 3.4.
-  taker_fee_bps: "20"
-  maker_fee_bps: "20"
+  # Real Tabdeal fee table, Parham's account tier 1 (30-day volume < 1,000 USDT), decision D-047:
+  # taker 0.35 %, maker 0.33 % per side. Backtests assume TAKER unless a strategy explicitly uses
+  # limit orders. The x2 cost stress test (G3) therefore means 70 bps per side.
+  # Still to verify: whether USDT-quoted markets use the same table.
+  taker_fee_bps: "35"
+  maker_fee_bps: "33"
   slippage_bps: "5"
 
 data:

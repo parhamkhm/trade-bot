@@ -120,7 +120,7 @@ Secrets are `SecretStr`; they must never appear in logs, tracebacks, reports or 
 all three hold: `TBOT_LIVE_TRADING=true` **and** `runtime.phase >= 6` **and** `runtime.mode == "live"`.
 Loading a config with `mode: live` and `phase < 6` is a validation error. No other code may decide this.
 
-Key defaults (phase 0): taker/maker fee 20 bps per side, slippage 5 bps per side, `requests_per_second: 5`,
+Key defaults: taker fee 35 bps, maker fee 33 bps per side (Tabdeal tier 1, D-047), slippage 5 bps per side, `requests_per_second: 5`,
 `recv_window_ms: 5000`, `max_data_age_seconds: 900`, `annual_vol_target: 0.20`, `max_exposure: 1.0`.
 
 ---
@@ -284,8 +284,9 @@ fees and slippage appear in the ledger and reduce returns by the expected amount
 **G3 — Strategy (out-of-sample, after costs).** `maxDD ≤ 0.60 × maxDD(buy-and-hold)`,
 `Sharpe ≥ 0.80 × Sharpe(buy-and-hold)`, `PBO < 0.30`, Deflated Sharpe > 0 at the 95 % level using the trial
 count from `research/EXPERIMENTS.md`; neighbouring parameter sets (±1 grid step) keep ≥ 70 % of the Sharpe
-(no knife-edge optimum); ETH/USDT Sharpe > 0 with the same rules; fees and slippage ×2 keep the strategy
-profitable net of costs.
+(no knife-edge optimum); ETH/USDT Sharpe > 0 with the same rules; fees and slippage ×2 (i.e. 70 bps taker fee + 10 bps slippage per
+side, D-047) keep the strategy profitable net of costs. Every phase-3 report states annual turnover and the
+annual cost drag (fees + slippage, % of equity per year) next to the returns.
 
 **G4 — Risk + regime + holdout.** The regime overlay is kept only if it improves OOS Sharpe, or cuts maxDD
 materially at equal Sharpe; otherwise it is dropped. The one-shot sealed-holdout run must land inside the
@@ -350,13 +351,14 @@ drawdown exceeds the 95th percentile of the bootstrap distribution. Capital scal
 | D-044 | A Binance gap classification loaded without `classified_by` is `legacy` and is re-checked against the D-042 rules on every ingest (falls back to `unknown`); only an explicit `classified_by: manual` is never revisited. Close-time classification uses exact integer arithmetic in the file's own unit | round-3 MINOR-4 and NIT-1 |
 | D-045 | Tabdeal `exchangeInfo` is a bare JSON list of markets (1047 on 2026-10-05, measured from the Turkey server), not Binance's `{"symbols": [...]}`; the probe accepts both. BTCUSDT filters: tick 0.01, step 0.000001, min notional 1 USDT, market max qty 8.84 BTC | the first server probe reported BTCUSDT "not found" because of the Binance-shaped parser |
 | D-046 | The G0 probe also samples BTCIRT and USDTIRT depth each round, for comparison only (the traded pair stays BTCUSDT), reports fillable BUY/SELL size within 0.1 % / 0.5 % of mid (median and p10 across samples) and the implied BTC/USDT basis (BTCIRT/USDTIRT vs BTCUSDT) | Parham's request: execution capacity and the IRT market as context for G0 |
+| D-047 | **Fees (supersedes D-018):** Tabdeal tier 1 (30-day volume < 1,000 USDT) taker 35 bps, maker 33 bps per side (tier 2: 35/31, tier 3: 33/28, tier 4: 31/26). Backtests assume taker unless a strategy explicitly uses limit orders; the G3 ×2 stress means 70 bps per side. Phase-3 reports must show turnover and annual cost drag. Whether USDT markets use the same table is still to verify | Parham's fee-table review (2026-10-06). A pre-registration update made **before any strategy result** exists — it tightens, never loosens: a round trip now costs ≈ 0.8 % (2 × 35 bps fee + spread/slippage), which leaves only slow, low-turnover variants realistic |
 
 ---
 
 ## 9. Open questions (need Parham or the probe to answer)
 
-1. **Tabdeal fee tier** for the real account (maker/taker). Default 20 bps/side until measured — the probe's
-   `account` response or the fee schedule should settle it.
+1. ~~Tabdeal fee tier~~ — answered by Parham (D-047): tier 1, taker 35 / maker 33 bps. Still open: whether
+   USDT-quoted markets use the same table.
 2. **Real `exchangeInfo` filters** for BTCUSDT/ETHUSDT (tick, step, min-notional) — unknown until G0.
 3. **Rate limits** (undocumented). Start at 5 req/s; the probe reports observed headers and any 429.
 4. **Does any endpoint require `tabdealSymbol=BTC_USDT`** instead of `symbol=BTCUSDT`?
