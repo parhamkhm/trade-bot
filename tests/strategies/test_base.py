@@ -98,3 +98,41 @@ def test_duplicate_id_is_refused() -> None:
 )
 def test_is_valid_stop(stop: object, valid: bool) -> None:
     assert is_valid_stop(stop, Decimal("100")) is valid
+
+
+class _RequiredKeywordOnly(_Complete):
+    id = "kw_only"
+
+    def stop_price(self, window: BarWindow, entry_price: Decimal, *, mult: Decimal) -> Decimal:  # type: ignore[override]  # noqa: ARG002
+        return entry_price * mult
+
+
+class _OptionalExtraPositional(_Complete):
+    id = "optional_extra"
+
+    def stop_price(
+        self, window: BarWindow, entry_price: Decimal, buffer: Decimal | None = None  # noqa: ARG002
+    ) -> Decimal:
+        return entry_price * Decimal("0.9")
+
+
+class _VarArgs(_Complete):
+    id = "varargs"
+
+    def stop_price(self, *args: object) -> Decimal:  # noqa: ARG002
+        return Decimal(1)
+
+
+def test_required_keyword_only_argument_fails_registration() -> None:
+    with pytest.raises(StrategyRegistrationError, match="keyword-only"):
+        validate_strategy(_RequiredKeywordOnly())
+
+
+@pytest.mark.parametrize("strategy", [_OptionalExtraPositional(), _VarArgs()])
+def test_callable_with_two_positional_arguments_registers(strategy: object) -> None:
+    assert validate_strategy(strategy) is strategy
+
+
+@pytest.mark.parametrize("reference", [Decimal("NaN"), Decimal("0"), Decimal("-5"), 100.0, None])
+def test_is_valid_stop_rejects_an_invalid_reference_price_without_raising(reference: object) -> None:
+    assert is_valid_stop(Decimal("90"), reference) is False

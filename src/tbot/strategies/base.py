@@ -28,18 +28,22 @@ def _require_method(obj: object, name: str, n_params: int) -> None:
             f"{type(obj).__name__} has no callable {name}() -- every strategy must implement it (D-050)"
         )
     try:
-        params = inspect.signature(method).parameters.values()
-    except (TypeError, ValueError):  # no introspectable signature: the first call will tell
-        return
-    required_positional = [
-        p
-        for p in params
-        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) and p.default is p.empty
-    ]
-    if len(required_positional) != n_params:
+        params = list(inspect.signature(method).parameters.values())
+    except (TypeError, ValueError) as exc:  # unverifiable contract: refuse rather than hope
         raise StrategyRegistrationError(
-            f"{type(obj).__name__}.{name}() must take {n_params} positional argument(s), "
-            f"got {len(required_positional)}"
+            f"{type(obj).__name__}.{name}() has no inspectable signature"
+        ) from exc
+    where = f"{type(obj).__name__}.{name}()"
+    if any(p.kind is p.KEYWORD_ONLY and p.default is p.empty for p in params):
+        raise StrategyRegistrationError(f"{where} must not have required keyword-only arguments")
+    positional = [p for p in params if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+    required = sum(1 for p in positional if p.default is p.empty)
+    takes_varargs = any(p.kind is p.VAR_POSITIONAL for p in params)
+    # Callable with exactly n_params positional arguments: no more required, and room for all of them.
+    if required > n_params or (len(positional) < n_params and not takes_varargs):
+        raise StrategyRegistrationError(
+            f"{where} must accept {n_params} positional argument(s) "
+            f"(has {required} required, {len(positional)} total)"
         )
 
 
@@ -58,11 +62,14 @@ def validate_strategy(obj: object) -> Strategy:
     return obj
 
 
-def is_valid_stop(stop: object, reference_price: Decimal) -> bool:
-    """True iff ``stop`` is a finite, positive ``Decimal`` strictly below ``reference_price``."""
-    if not isinstance(stop, Decimal) or not stop.is_finite():
-        return False
-    return Decimal(0) < stop < reference_price
+def is_valid_stop(stop: object, reference_price: object) -> bool:
+    """True iff ``stop`` is a finite, positive ``Decimal`` strictly below ``reference_price``, which must
+    itself be a finite, positive ``Decimal`` (never raises; a NaN or float input is simply invalid)."""
+    for value in (stop, reference_price):
+        if not isinstance(value, Decimal) or not value.is_finite() or value <= 0:
+            return False
+    assert isinstance(stop, Decimal) and isinstance(reference_price, Decimal)  # narrowed above
+    return stop < reference_price
 
 
 class StrategyRegistry:

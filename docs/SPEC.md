@@ -118,6 +118,9 @@ Secrets are `SecretStr`; they must never appear in logs, tracebacks, reports or 
 
 **Live-order gate (single authority).** `Config.live_orders_enabled(secrets)` returns `True` only when
 all three hold: `TBOT_LIVE_TRADING=true` **and** `runtime.phase >= 6` **and** `runtime.mode == "live"`.
+*Superseded by D-049 (phase order 5a → 6 → 7a → 5b → 7b): the automated order path is allowed only from 7b.
+Phase labels are not numerically ordered, so phase 5a replaces the integer with an explicit ordinal enum; until
+then no order path exists, so the integer gate cannot be reached.*
 Loading a config with `mode: live` and `phase < 6` is a validation error. No other code may decide this.
 
 Key defaults: taker fee 35 bps, maker fee 33 bps per side (Tabdeal tier 1, D-047), slippage 5 bps per side, `requests_per_second: 5`,
@@ -287,9 +290,14 @@ count from `research/EXPERIMENTS.md`; neighbouring parameter sets (±1 grid step
 (no knife-edge optimum); ETH/USDT Sharpe > 0 with the same rules; fees and slippage ×2 (i.e. 70 bps taker fee + 10 bps slippage per
 side, D-047) keep the strategy profitable net of costs. Every phase-3 report states annual turnover and the
 annual cost drag (fees + slippage, % of equity per year) next to the returns.
-Every G3 number is reported twice (D-051): fill at the next bar's open, and fill after the manual delay (default
-6 h, slippage from recorded order-book snapshots). **The gate must pass on the manual-delay version**, because
-phase 7a executes by hand. Every candidate implements `stop_price()` (D-050), and its report states MinTRL.
+Every G3 number is reported twice (D-051): fill at the next bar's open, and fill after the manual delay. The
+gating delay is **6 h, fixed**: the fill price is the open of the Binance 1h bar that starts 6 h after the signal
+bar's close, minus slippage from a depth-at-size curve calibrated once on the recorder's Tabdeal order-book
+snapshots and applied to the whole 2018–2025 history (other delays are reported as sensitivity only). **The gate
+must pass on the manual-delay version**, because phase 7a executes by hand. Every candidate implements
+`stop_price()` (D-050) and its report states MinTRL — computed per Bailey & López de Prado on daily returns
+(skew and kurtosis included) at 95 % confidence, against a benchmark Sharpe of 0 and, separately, against
+buy-and-hold's Sharpe over the same period.
 
 **G4 — Risk + regime + holdout.** The regime overlay is kept only if it improves OOS Sharpe, or cuts maxDD
 materially at equal Sharpe; otherwise it is dropped. The one-shot sealed-holdout run must land inside the
@@ -309,34 +317,65 @@ any plausible strategy: G6a tests execution and parity, not edge, and cannot be 
 **G6b — Automated live (phase 7b, 3 months).** Same band and halt rule with automated execution (after 5b);
 capital scales only by a written rule.
 
-### 7.1 Allocator acceptance rule (phase 4, D-048)
+### 7.1 Allocator acceptance rule (phase 4, D-048, amended by D-054)
 
-Fixed before any phase-3 result.
+Fixed before any phase-3 result. Nothing in this section may be tuned after results are seen; every
+parameter below is a fixed number.
 
-- **S0 — locked default.** One strategy, fully specified below, locked on Parham's approval and never tuned on
-  phase-3 results. *Proposed (pending Parham):* `donchian_ens_1d` on BTCUSDT daily bars —
-  - three Donchian sub-signals with entry lookbacks N ∈ {20, 55, 100} days: long when the close exceeds the
-    highest high of the previous N days, flat when the close falls below the lowest low of the previous N/2 days;
-  - raw weight = mean of the three sub-signals (0, ⅓, ⅔ or 1);
-  - volatility targeting: weight × min(1, 0.20 / σ̂), σ̂ = EWMA (span 30 days) annualised realised vol (365);
-  - rebalance only when |target − current| ≥ 0.25 (turnover control: a round trip costs ≈ 0.8 %, D-047);
-  - `stop_price` = the exit level of the longest active sub-signal (the lowest of the active N/2-day lows) — i.e.
-    the price at which the whole position would be closed anyway.
-  These are textbook parameters (no search), so S0 counts as one trial.
-- **S1 — equal-weight blend.** Equal-weight average of the target weights of all strategies that passed G3,
-  netted into one position, same 0.25 rebalance threshold.
-- **S2 — champion/challenger.** A challenger replaces the running strategy only if (a) its trailing Deflated
-  Sharpe beats the champion's by a margin fixed before the comparison (default ΔDSR ≥ 0.10, every variant
-  counted as a trial), (b) it tripped no risk tripwire (REDUCING/HALTED, stop breach, drawdown halt) in the
-  window, and (c) it holds — Sharpe > 0 after costs — in at least 2 of 3 regime buckets (realised-vol terciles).
-- **S3 — regime-conditional selection.** Ablation only: reported, never deployed in v1. The regime overlay
-  remains an exposure scaler and must beat "no overlay" out of sample (G4).
-- **Go-live rule.** A candidate other than S0 goes live only if its walk-forward folds beat **both** S0 and S1
-  after costs (manual-delay fills) and its Deflated Sharpe stays > 0 with every variant counted. Otherwise S0 (or
-  S1, if S1 beats S0 under the same test) runs.
-- **Switching.** A switch applies to new entries only (open positions finish under the rules they were opened
-  with), the new choice is kept at least 3 months, and every switch needs Parham's written approval in
-  `docs/reports/`.
+**S0 — locked default.** One strategy, fully specified here, locked on Parham's approval and never tuned on
+phase-3 results. *Proposed (pending Parham):* `donchian_ens_1d`, BTCUSDT, 1d bars (close = 00:00 UTC).
+
+- *Sub-signals.* Three channels with entry lookback N ∈ {20, 55, 100} and exit lookback M = ⌊N/2⌋ ∈ {10, 27, 50}.
+  At the close of bar t, sub-signal i becomes **long** if `close_t > max(high_{t−N} … high_{t−1})` (bar t
+  excluded), and becomes **flat** if `close_t < min(low_{t−M} … low_{t−1})`; otherwise it keeps its state.
+- *Raw weight* `w_raw = (number of long sub-signals) / 3`.
+- *Volatility.* `r_t = ln(close_t / close_{t−1})`; `σ̂_t = sqrt(EWMA_{span=30, adjust=False}(r²) up to and
+  including t) × sqrt(365)`; no value (and weight 0) until 30 returns exist. `warmup_bars = 101`.
+- *Target.* `w_target = min(1, w_raw × min(1, 0.20 / σ̂_t))`.
+- *Rebalance rule.* Let `w_now` be the actual (drifted) weight at the close of t.
+  1. If the number of long sub-signals changed at t, trade to `w_target` (always; this includes every exit to 0
+     and every new entry).
+  2. Otherwise trade only if `|w_target − w_now| ≥ 0.25 × max(w_target, w_now)` (25 % relative band; vol-driven
+     resizing only).
+  3. A RiskManager-forced reduction or exit, and a stop-out, are never blocked by the band.
+- *Protective stop.* `stop_price` = `min(low_{t−M} … low_{t−1})` of the **longest-lookback long** sub-signal (the
+  lowest active exit level, i.e. where the whole position would go flat anyway). It raises `ValueError` when no
+  sub-signal is long (there is no position to protect). Backtest stop model: the stop computed at the close of t
+  triggers on bar t+1 if `low_{t+1} ≤ stop`, filling at `min(open_{t+1}, stop)` minus slippage. After a
+  stop-out **all** sub-signals reset to flat and each needs a fresh breakout to re-enter.
+- *Fills.* Signal at the close of t, fill at the open of t+1 (and the manual-delay variant, D-051).
+
+These are textbook parameters with no search, so S0 counts as **one trial**. At BTC's usual σ̂ (0.6–0.9) the
+target is ≈ 0.22–0.33 of equity when fully long: S0 is deliberately a low-exposure, low-turnover strategy.
+
+**S1 — equal-weight blend.** Equal-weight average of the target weights of every strategy that passed G3 (S0
+included if it passed), netted into one position, with S0's rebalance rule (relative 25 % band; transitions
+always traded). When S1 is compared with a candidate C, S1 is computed **without C** (leave-one-out). S1's trial
+count for Deflated Sharpe is the sum of its members' trial counts.
+
+**S2 — champion/challenger (from phase 7b only).** A challenger replaces the running strategy only if all hold
+over the evaluation window = every out-of-sample, paper and live day since the challenger's lock date, minimum
+365 days:
+(a) its Deflated Sharpe exceeds the champion's by **≥ 0.10** (fixed, not a default), every variant counted;
+(b) it tripped no risk tripwire (REDUCING/HALTED, stop breach, drawdown halt) in the window;
+(c) Sharpe > 0 after costs in at least 2 of 3 regime buckets — terciles of `σ̂` (the S0 estimator) with the two
+cut-points computed **once** on the 2018-01-01 … holdout_start research data and frozen.
+
+**S3 — regime-conditional selection.** Ablation only: reported, never deployed in v1. The regime overlay remains
+an exposure scaler and must beat "no overlay" out of sample (G4).
+
+**Go-live rule.**
+- *Metric.* Annualised Sharpe (365, after all costs, **manual-delay fills**) of the **pooled** out-of-sample
+  walk-forward return series (all folds concatenated).
+- *Candidate C goes live* only if C's pooled OOS Sharpe is higher than both S0's and S1's (leave-one-out), C
+  beats S0 in at least half of the folds, and C's Deflated Sharpe > 0 with every variant counted.
+- *Otherwise* the better of S0 and S1 by the same metric runs — **but only if it has itself passed G3 and G4.**
+  If neither S0 nor S1 passes G3 and G4, nothing goes live: that is the no-edge outcome of CLAUDE.md §1.
+
+**Switching.** A switch applies to new entries only: an open position is managed to its exit by the strategy
+that opened it (under S1 the netted position is treated as one position opened by S1), then the new strategy
+takes over. The new choice is kept at least 3 months, and every switch needs Parham's written approval in
+`docs/reports/`.
 
 ---
 
@@ -397,6 +436,7 @@ Fixed before any phase-3 result.
 | D-051 | From phase 3 every backtest reports two fill models — next-bar open, and a configurable manual delay (default 6 h) with slippage from recorded order-book snapshots — and validation reports state Minimum Track Record Length per candidate; paper/live records shorter than MinTRL may not be used to choose between strategies | Parham (2026-10-06): phase 7a fills are manual and late; a strategy that only works with instant fills must not pass |
 | D-052 | Order-code guardrail: a `PreToolUse` hook blocks edits under `src/` and `scripts/` introducing order/cancel/OCO/margin/withdrawal/`userDataStream` endpoints or exchange `POST`/`DELETE`; unlock only by Parham via `TBOT_ALLOW_ORDER_CODE=1`; the hook protects itself and `.claude/settings.json`; a pytest audit + CI step scan the same patterns | Parham (2026-10-06). The hook cannot see writes made through a shell, so the audit test and CI are the binding check |
 | D-053 | PR #2 review round: the late-trade / sealed-hour cursor lives in SQLite only (`sweep_cursor`, advanced after each written candle and reconciled with Parquet once per sweep, outside the poll transaction) — no Parquet access on the trade-ingestion path. Every downstream step (candle sweep, post-commit candle rewrites, order-book snapshot, heartbeat write) is isolated: a failure is logged at error level and counted in the heartbeat's `consecutive_cycle_exceptions` (healthcheck fails at 3), never via backoff or process exit. An unparsable item's gap anchors to its own plausible time, else its parsed neighbours' hour span | CLAUDE.md §3.8 (raw data first). Review M-1: one unreadable Parquet part stopped all trade recording, and Tabdeal keeps only ~29 h of history |
+| D-054 | Amends D-048/D-051 after review: S0 fully specified (M = ⌊N/2⌋, σ̂ definition, warm-up, transitions always traded, a 25 % *relative* band only for vol-driven resizing, stop model and post-stop reset); go-live metric = pooled OOS Sharpe after costs with manual-delay fills; S0/S1 run only if they themselves pass G3 and G4, else no-go; S1 leave-one-out with summed trials; S2 margin, window and frozen vol-tercile cut-points fixed; gating manual delay fixed at 6 h with a calibrated depth-at-size slippage curve; MinTRL inputs fixed | T6 review M-4/M-5: with an absolute 0.25 band and vol targeting at ~0.22–0.33 weight, the proposed S0 could never exit; unnamed metrics and "otherwise S0 runs" left choices open after results and could deploy a strategy that failed G3 |
 
 ---
 
