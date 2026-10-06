@@ -35,5 +35,8 @@ jobs:
       - name: Types (mypy; strict on core/risk/execution)
         run: uv run mypy
 
+      - name: Order-code audit (CLAUDE.md section 3.6 / SPEC D-052)
+        run: uv run pytest tests/test_order_code_audit.py -q
+
       - name: Tests (pytest)
         run: uv run pytest
