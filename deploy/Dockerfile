@@ -69,21 +69,26 @@ VOLUME ["/app/data"]
 # (`tbot.data.tabdeal_recorder.write_heartbeat`, called from `process_once` — including on
 # a cycle whose poll itself failed) with the fixed JSON contract:
 #   {"last_poll_ts": "<ISO-8601 UTC>", "last_trade_id": int|null, "n_trades_total": int,
-#    "consecutive_errors": int, "last_new_trade_ts_ms": int|null}
+#    "consecutive_errors": int, "last_new_trade_ts_ms": int|null,
+#    "consecutive_cycle_exceptions": int}
 # deploy/healthcheck.py reads this file and fails unhealthy if `last_poll_ts` is older than
 # $TBOT_HEARTBEAT_MAX_AGE_SECONDS, if `consecutive_errors` has reached
 # $TBOT_HEARTBEAT_MAX_CONSECUTIVE_ERRORS (the process is alive but every poll is failing —
-# the file would otherwise look fresh forever), or (fourth fix round, m3) if
-# `last_new_trade_ts_ms` is older than $TBOT_HEARTBEAT_MAX_TRADE_STALENESS_SECONDS (polling
-# itself looks healthy but the exchange's own trade feed has gone stale, which neither check
-# above can see). The m3 default (7200s) is sized against BTCUSDT's measured inter-trade gap
-# on Tabdeal (p99 641s, max 2120s over a 29h sample taken 2026-10-04) — do not tighten it
-# without re-measuring. If the recorder's actual heartbeat path/contract ever changes, update
-# these ENV defaults (and the matching values in docker-compose.yml) to match.
+# the file would otherwise look fresh forever), if (fourth fix round, m3) `last_new_trade_ts_ms`
+# is older than $TBOT_HEARTBEAT_MAX_TRADE_STALENESS_SECONDS (polling itself looks healthy but
+# the exchange's own trade feed has gone stale, which neither check above can see), or
+# (PR2 review, m-3) `consecutive_cycle_exceptions` has reached
+# $TBOT_HEARTBEAT_MAX_CYCLE_EXCEPTIONS (the poll keeps succeeding — consecutive_errors stays 0 —
+# but the candle sweep keeps raising every cycle, e.g. on a corrupt Parquet part; neither check
+# above can see that either). The m3 default (7200s) is sized against BTCUSDT's measured
+# inter-trade gap on Tabdeal (p99 641s, max 2120s over a 29h sample taken 2026-10-04) — do not
+# tighten it without re-measuring. If the recorder's actual heartbeat path/contract ever changes,
+# update these ENV defaults (and the matching values in docker-compose.yml) to match.
 ENV TBOT_HEARTBEAT_FILE=/app/data/tabdeal/heartbeat.json \
     TBOT_HEARTBEAT_MAX_AGE_SECONDS=180 \
     TBOT_HEARTBEAT_MAX_CONSECUTIVE_ERRORS=10 \
-    TBOT_HEARTBEAT_MAX_TRADE_STALENESS_SECONDS=7200
+    TBOT_HEARTBEAT_MAX_TRADE_STALENESS_SECONDS=7200 \
+    TBOT_HEARTBEAT_MAX_CYCLE_EXCEPTIONS=3
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD ["python", "healthcheck.py"]
