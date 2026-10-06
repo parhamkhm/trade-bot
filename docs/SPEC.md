@@ -287,17 +287,56 @@ count from `research/EXPERIMENTS.md`; neighbouring parameter sets (±1 grid step
 (no knife-edge optimum); ETH/USDT Sharpe > 0 with the same rules; fees and slippage ×2 (i.e. 70 bps taker fee + 10 bps slippage per
 side, D-047) keep the strategy profitable net of costs. Every phase-3 report states annual turnover and the
 annual cost drag (fees + slippage, % of equity per year) next to the returns.
+Every G3 number is reported twice (D-051): fill at the next bar's open, and fill after the manual delay (default
+6 h, slippage from recorded order-book snapshots). **The gate must pass on the manual-delay version**, because
+phase 7a executes by hand. Every candidate implements `stop_price()` (D-050), and its report states MinTRL.
 
 **G4 — Risk + regime + holdout.** The regime overlay is kept only if it improves OOS Sharpe, or cuts maxDD
 materially at equal Sharpe; otherwise it is dropped. The one-shot sealed-holdout run must land inside the
 95 % stationary-block-bootstrap band for both Sharpe and maxDD. Run once, logged in `research/HOLDOUT_LOG.md`.
+The allocator acceptance rule (D-048) decides what runs: S0 unless a candidate beats both S0 and S1.
 
 **G5 — Paper (8–12 weeks).** Zero unresolved state mismatches; for every bar, the live signal equals the
 backtest signal computed on the same bars (100 % match); no unhandled exception; reconciliation clean after
 each restart; alerting verified by fault injection.
 
-**G6 — Small live (3 months).** Realised Sharpe and drawdown inside the expected band; automatic halt if
-drawdown exceeds the 95th percentile of the bootstrap distribution. Capital scales only by a written rule.
+**G6a — Small live, manual execution (phase 7a, 3 months).** Parham places every order by hand from the bot's
+signal and logs each fill (price, qty, time). Realised results inside the expected band of the **manual-delay**
+backtest; automatic halt (signals stop, Parham alerted) if drawdown exceeds the 95th percentile of the bootstrap
+distribution. Measured slippage vs signal price is reported per trade. Three months is shorter than MinTRL for
+any plausible strategy: G6a tests execution and parity, not edge, and cannot be used to switch strategies.
+
+**G6b — Automated live (phase 7b, 3 months).** Same band and halt rule with automated execution (after 5b);
+capital scales only by a written rule.
+
+### 7.1 Allocator acceptance rule (phase 4, D-048)
+
+Fixed before any phase-3 result.
+
+- **S0 — locked default.** One strategy, fully specified below, locked on Parham's approval and never tuned on
+  phase-3 results. *Proposed (pending Parham):* `donchian_ens_1d` on BTCUSDT daily bars —
+  - three Donchian sub-signals with entry lookbacks N ∈ {20, 55, 100} days: long when the close exceeds the
+    highest high of the previous N days, flat when the close falls below the lowest low of the previous N/2 days;
+  - raw weight = mean of the three sub-signals (0, ⅓, ⅔ or 1);
+  - volatility targeting: weight × min(1, 0.20 / σ̂), σ̂ = EWMA (span 30 days) annualised realised vol (365);
+  - rebalance only when |target − current| ≥ 0.25 (turnover control: a round trip costs ≈ 0.8 %, D-047);
+  - `stop_price` = the exit level of the longest active sub-signal (the lowest of the active N/2-day lows) — i.e.
+    the price at which the whole position would be closed anyway.
+  These are textbook parameters (no search), so S0 counts as one trial.
+- **S1 — equal-weight blend.** Equal-weight average of the target weights of all strategies that passed G3,
+  netted into one position, same 0.25 rebalance threshold.
+- **S2 — champion/challenger.** A challenger replaces the running strategy only if (a) its trailing Deflated
+  Sharpe beats the champion's by a margin fixed before the comparison (default ΔDSR ≥ 0.10, every variant
+  counted as a trial), (b) it tripped no risk tripwire (REDUCING/HALTED, stop breach, drawdown halt) in the
+  window, and (c) it holds — Sharpe > 0 after costs — in at least 2 of 3 regime buckets (realised-vol terciles).
+- **S3 — regime-conditional selection.** Ablation only: reported, never deployed in v1. The regime overlay
+  remains an exposure scaler and must beat "no overlay" out of sample (G4).
+- **Go-live rule.** A candidate other than S0 goes live only if its walk-forward folds beat **both** S0 and S1
+  after costs (manual-delay fills) and its Deflated Sharpe stays > 0 with every variant counted. Otherwise S0 (or
+  S1, if S1 beats S0 under the same test) runs.
+- **Switching.** A switch applies to new entries only (open positions finish under the rules they were opened
+  with), the new choice is kept at least 3 months, and every switch needs Parham's written approval in
+  `docs/reports/`.
 
 ---
 
@@ -352,6 +391,11 @@ drawdown exceeds the 95th percentile of the bootstrap distribution. Capital scal
 | D-045 | Tabdeal `exchangeInfo` is a bare JSON list of markets (1047 on 2026-10-05, measured from the Turkey server), not Binance's `{"symbols": [...]}`; the probe accepts both. BTCUSDT filters: tick 0.01, step 0.000001, min notional 1 USDT, market max qty 8.84 BTC | the first server probe reported BTCUSDT "not found" because of the Binance-shaped parser |
 | D-046 | The G0 probe also samples BTCIRT and USDTIRT depth each round, for comparison only (the traded pair stays BTCUSDT), reports fillable BUY/SELL size within 0.1 % / 0.5 % of mid (median and p10 across samples) and the implied BTC/USDT basis (BTCIRT/USDTIRT vs BTCUSDT) | Parham's request: execution capacity and the IRT market as context for G0 |
 | D-047 | **Fees (supersedes D-018):** Tabdeal tier 1 (30-day volume < 1,000 USDT) taker 35 bps, maker 33 bps per side (tier 2: 35/31, tier 3: 33/28, tier 4: 31/26). Backtests assume taker unless a strategy explicitly uses limit orders; the G3 ×2 stress means 70 bps per side. Phase-3 reports must show turnover and annual cost drag. Whether USDT markets use the same table is still to verify | Parham's fee-table review (2026-10-06). A pre-registration update made **before any strategy result** exists — it tightens, never loosens: a round trip now costs ≈ 0.8 % (2 × 35 bps fee + spread/slippage), which leaves only slow, low-turnover variants realistic |
+| D-048 | Allocator acceptance rule S0/S1/S2/S3 and the go-live rule (§7.1). S0's definition is **proposed, pending Parham's lock** | Parham, design additions from the peer project (2026-10-06). Locking a default before results is the only defence against picking the best of many backtests |
+| D-049 | Phase order 0 → 1 → 2 → 3 → 4 → 5a (signal infra, no order code) → 6 paper → 7a small live with manual execution → 5b order code → 7b automated live | Parham (2026-10-06): order code is the riskiest code in the project; it is written only after a manual live period has proven the signals. The `runtime.phase` integer and the `mode: live` check in `core/config.py` are re-mapped to these labels in phase 5a (no order path exists before then) |
+| D-050 | `Strategy.stop_price(window, entry_price) -> Decimal` is mandatory; registration fails without it; the RiskManager (phase 4) refuses a long whose stop is missing, non-positive or not below the price | Parham (2026-10-06). The stop rule is part of the strategy: its parameters are fixed in advance and every variant counts as a trial. In 7a the stop is placed by hand; exchange-side stops arrive with 5b (`docs/vendor/tabdeal-api-notes.md` §3) |
+| D-051 | From phase 3 every backtest reports two fill models — next-bar open, and a configurable manual delay (default 6 h) with slippage from recorded order-book snapshots — and validation reports state Minimum Track Record Length per candidate; paper/live records shorter than MinTRL may not be used to choose between strategies | Parham (2026-10-06): phase 7a fills are manual and late; a strategy that only works with instant fills must not pass |
+| D-052 | Order-code guardrail: a `PreToolUse` hook blocks edits under `src/` and `scripts/` introducing order/cancel/OCO/margin/withdrawal/`userDataStream` endpoints or exchange `POST`/`DELETE`; unlock only by Parham via `TBOT_ALLOW_ORDER_CODE=1`; the hook protects itself and `.claude/settings.json`; a pytest audit + CI step scan the same patterns | Parham (2026-10-06). The hook cannot see writes made through a shell, so the audit test and CI are the binding check |
 | D-053 | PR #2 review round: the late-trade / sealed-hour cursor lives in SQLite only (`sweep_cursor`, advanced after each written candle and reconciled with Parquet once per sweep, outside the poll transaction) — no Parquet access on the trade-ingestion path. Every downstream step (candle sweep, post-commit candle rewrites, order-book snapshot, heartbeat write) is isolated: a failure is logged at error level and counted in the heartbeat's `consecutive_cycle_exceptions` (healthcheck fails at 3), never via backoff or process exit. An unparsable item's gap anchors to its own plausible time, else its parsed neighbours' hour span | CLAUDE.md §3.8 (raw data first). Review M-1: one unreadable Parquet part stopped all trade recording, and Tabdeal keeps only ~29 h of history |
 
 ---

@@ -52,10 +52,17 @@ stop before live trading — that is a successful result of this process, not a 
    Every experiment (parameter set, variant) is logged in `research/EXPERIMENTS.md` so the trial count for
    Deflated Sharpe / PBO is honest.
 6. **Safety by default.**
-   - Dry-run is the default mode. The live order path is only reachable when `LIVE_TRADING=true` AND the
-     config phase is ≥ 6.
+   - Dry-run is the default mode. **No exchange order code exists before phase 5b** (see §9): until then the bot
+     only emits signals and a human places orders by hand (phase 7a). From 5b on, the automated order path is only
+     reachable when `LIVE_TRADING=true` AND the config phase is ≥ 7b.
+   - **Order-code guardrail.** A Claude Code `PreToolUse` hook (`.claude/hooks/block_order_code.py`, wired in
+     `.claude/settings.json`, matcher `Write|Edit|MultiEdit`) blocks any edit under `src/` or `scripts/` that
+     introduces order / cancel / OCO / margin / withdrawal / `userDataStream` endpoints or HTTP `POST`/`DELETE`
+     calls to the exchange. It also blocks edits to itself and to `.claude/settings.json`. Only Parham unlocks it,
+     by setting `TBOT_ALLOW_ORDER_CODE=1` himself (phase 5b). The same patterns are scanned by a pytest audit test
+     and a CI step, which are the real enforcement: the hook does not see files written through a shell command.
    - Secrets only in `.env` on the server (never in the repo, logs, tracebacks, chat or Telegram).
-   - Tabdeal API key: **no withdrawal permission**, IP-whitelisted to the server's static IP, read-only until phase 6.
+   - Tabdeal API key: **no withdrawal permission**, IP-whitelisted to the server's static IP, read-only until phase 5b.
    - Every order carries a unique `client_order_id`; on timeout, query by that ID — never blindly resend.
    - Any mismatch between internal state and the exchange (balances, open orders, position) → trading state
      `HALTED` + Telegram alert.
@@ -151,6 +158,10 @@ class Strategy(Protocol):
     id: str
     warmup_bars: int
     def on_bar(self, window: BarWindow) -> TargetIntent: ...   # window = closed bars up to and incl. t
+    def stop_price(self, window: BarWindow, entry_price: Decimal) -> Decimal: ...
+        # protective stop for an open long (e.g. ATR- or channel-based); mandatory — a strategy without it
+        # fails registration, and the RiskManager refuses a long without a valid stop below the price.
+        # The stop rule is part of the strategy: its parameters are fixed in advance and counted as trials.
 
 class RegimeModel(Protocol):
     def update(self, window: BarWindow) -> RegimeState: ...     # RegimeState.exposure ∈ [0, 1]
@@ -214,8 +225,17 @@ Adding any other dependency requires a one-line justification in `docs/SPEC.md` 
 - **Robustness:** same rules on ETH/USDT; neighbouring parameters must not collapse (no knife-edge optimum).
 - **Resampling:** stationary block bootstrap of returns for the drawdown distribution (not plain trade shuffling).
 - **Benchmarks:** always report vs buy-and-hold and vs buy-and-hold scaled to equal volatility.
+- **Two fill assumptions (from phase 3):** every backtest reports results twice — fill at the next bar's open,
+  and fill after a configurable manual delay (default 6 h) with slippage taken from the recorder's order-book
+  snapshots. Phase 7a executes by hand, so the delayed version is the one that must still clear the gate.
+- **Minimum Track Record Length:** validation reports state MinTRL per candidate. Live or paper results shorter
+  than MinTRL cannot be used to choose between strategies.
+- **Allocator rule (phase 4):** S0 / S1 / S2 / S3 as defined in `docs/SPEC.md` D-048. A candidate replaces the
+  locked default only if it beats both S0 and S1 out of sample after costs.
 
 ## 9. Phases and gates (summary — details in the plan doc)
+
+Order of execution: 0 → 1 → 2 → 3 → 4 → **5a → 6 → 7a → 5b → 7b** (approved by Parham 2026-10-06, D-049).
 
 | Phase | Output | Gate to pass |
 |---|---|---|
@@ -224,9 +244,11 @@ Adding any other dependency requires a one-line justification in `docs/SPEC.md` 
 | 2 Engine | Event-driven backtester, SimulatedBroker, Portfolio, metrics, baselines, truncation test | G2: truncation test passes; baselines match vectorbt |
 | 3 Strategy | Trend strategy + vol targeting, walk-forward, PBO/DSR, ETH robustness | G3: OOS after costs: maxDD ≤ 60% of B&H, Sharpe ≥ 80% of B&H, PBO < 0.3 |
 | 4 Risk + regime + holdout | RiskManager (states, limits, kill switch), regime overlay (kept only if it beats no-overlay OOS), one-shot sealed holdout | G4: holdout inside the 95% bootstrap band |
-| 5 Live infra | TabdealBroker, OMS, reconciliation, persistence, Telegram (/status, /halt), Docker + systemd | Fault-injection tests pass (timeouts, 429, restart mid-order) |
-| 6 Paper | 8–12 weeks dry-run on the server with live data | G5: zero unresolved mismatches; live signals == backtest on same bars |
-| 7 Small live | Minimal capital, scale only by rule | G6: 3 months inside expected band; halt if DD > 95th pct of bootstrap |
+| 5a Signal infra | Telegram alerts, `/confirm` and `/skip`, manual fill logging (price, qty, time), `/status`, `/halt`, persistence, Docker + systemd. **No order code** | Fault-injection tests pass (restart mid-signal, Telegram down); every signal and every manual fill is logged |
+| 6 Paper | 8–12 weeks of automatic dry-run on the server with live data, no money | G5: zero unresolved mismatches; live signals == backtest on the same bars |
+| 7a Small live — manual | Minimal capital. The bot signals; Parham places each order on Tabdeal by hand and logs the fill | G6a: 3 months inside the expected band of the manual-delay backtest; halt if DD > 95th pct of bootstrap. Too short to choose between strategies (MinTRL) — it tests execution, not edge |
+| 5b Order code | TabdealBroker, OMS (client order ids, idempotency, reconciliation), exchange-side protective stops, kill switch. Starts only after 7a passes; the order-code hook is unlocked by Parham | Fault-injection tests pass (timeouts, 429, restart mid-order, non-atomic cancel-all) |
+| 7b Automated live | Automated execution with the same capital as 7a; scale only by rule | G6b: 3 months inside the expected band; same halt rule |
 
 ## 10. Agent workflow
 
