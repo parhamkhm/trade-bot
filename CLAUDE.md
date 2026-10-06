@@ -60,7 +60,13 @@ stop before live trading — that is a successful result of this process, not a 
      `HALTED` + Telegram alert.
 7. **Small, typed, tested.** Python 3.12, type hints everywhere, `mypy --strict` on `core/`, `risk/`, `execution/`.
    No function longer than ~60 lines without a reason. Pure functions for indicators and strategy logic.
-8. **Honesty and push-back.** If a request from Parham (or from the plan) is illogical, unsafe or likely to produce
+8. **Raw data first.** Raw trade ingestion (Tabdeal `/trades` → SQLite) must never depend on any downstream step
+   — candle building, Parquet reads or writes, quality checks, reports. A downstream failure may stop only that
+   step, log at error level (alert) and mark the healthcheck degraded; trades keep being recorded. Reason: Tabdeal
+   returns only ~29 h of trade history, so raw trades are the one dataset we cannot re-download, while everything
+   derived from them can be rebuilt. Enforced by `test_trade_ingestion_survives_downstream_failure` and by a
+   nightly online backup of `trades.sqlite` (14 days, integrity-checked).
+9. **Honesty and push-back.** If a request from Parham (or from the plan) is illogical, unsafe or likely to produce
    an imaginary result, say so clearly, explain why, and propose the correct way. Do not just agree.
    Short push-back goes in the terminal in English; a full written argument goes to `docs/reports/` in Persian.
 
