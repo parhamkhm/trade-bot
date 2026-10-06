@@ -1,0 +1,35 @@
+# Daily trigger for tbot-trades-backup.service -- see that unit and the "Nightly backup of
+# trades.sqlite" section of deploy/SERVER_SETUP.md for the full picture.
+#
+# Install (both units together -- the timer alone is enabled; the .service is never enabled
+# directly, only ever triggered by this timer or run once by hand to test):
+#   sudo cp deploy/systemd/tbot-trades-backup.service deploy/systemd/tbot-trades-backup.timer \
+#       /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now tbot-trades-backup.timer
+
+[Unit]
+Description=Daily timer for the trades.sqlite backup (tbot-trades-backup.service)
+Documentation=file:///opt/tbot/trade-bot/deploy/SERVER_SETUP.md
+
+[Timer]
+# 02:30 UTC -- quiet hours for a thinly-traded BTCUSDT feed (see deploy/healthcheck.py's own
+# measured inter-trade-gap notes), comfortably clear of the recorder's own ~5s write cadence.
+# Explicit "UTC" (systemd.time(7) accepts a trailing timezone in OnCalendar=) rather than
+# relying on the server's local timezone, which deploy/SERVER_SETUP.md section 2 already sets
+# to UTC anyway -- this is belt-and-suspenders against that ever changing.
+OnCalendar=*-*-* 02:30:00 UTC
+
+# If the server was off/rebooting at 02:30, run the missed backup as soon as it's back up,
+# instead of silently waiting a full day for the next scheduled time.
+Persistent=true
+
+# Spread the start over a 10-minute window so this never fires at EXACTLY the same wall-clock
+# second every day -- harmless here (there is only one server), but a cheap, conventional
+# habit for any periodic timer.
+RandomizedDelaySec=10min
+
+Unit=tbot-trades-backup.service
+
+[Install]
+WantedBy=timers.target

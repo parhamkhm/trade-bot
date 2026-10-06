@@ -752,7 +752,163 @@ $ sudo systemctl start tbot-recorder.service
 
 ---
 
-## 16. Checklist — what Parham must do by hand
+## 16. Nightly backup of trades.sqlite
+
+CLAUDE.md section 3 item 8 ("Raw data first") requires a nightly, integrity-checked backup of
+the recorder's raw trades database, because Tabdeal's `/trades` endpoint returns only ~29h of
+history (SPEC section 5.4) — once a raw trade scrolls out of that window *and* is lost from the
+local database, it is gone for good. Everything else (candles, Parquet, reports) can always be
+rebuilt from the raw trades; the raw trades themselves cannot be rebuilt from anything.
+
+`deploy/backup_trades.py` does the actual work: an **online** SQLite backup (not a plain file
+copy — the recorder's own write transactions commit roughly every 5 seconds, and a plain copy
+taken mid-transaction can be torn) into a timestamped file under `/var/backups/tbot/trades/`,
+deliberately **outside** the `tbot-data` Docker volume, so that a `docker volume rm tbot-data`
+(or volume-level corruption) cannot take the backups down with the live database. Every backup
+is verified with `PRAGMA integrity_check` before being kept; a bad copy is deleted immediately,
+never left on disk for a later run or an operator to trust by mistake. Backups older than 14
+days are rotated away automatically, except the single newest one, which is never deleted even
+if it is itself older than 14 days — e.g. if this job has silently been broken for a while,
+losing the last remaining copy on top of that would defeat the entire point.
+
+`deploy/systemd/tbot-trades-backup.service` + `.timer` run this once a day, at 02:30 UTC, as
+`root` — it needs to resolve the Docker volume's real host path (`docker volume inspect`, never
+hardcoded) and read a file owned by the container's internal UID, neither of which the `tbot`
+user can do on its own. See the unit files' own comments for the full reasoning.
+
+### 16.1 Install
+
+```
+$ cd /opt/tbot/trade-bot
+$ sudo cp deploy/systemd/tbot-trades-backup.service deploy/systemd/tbot-trades-backup.timer /etc/systemd/system/
+$ sudo systemctl daemon-reload
+$ sudo systemctl enable --now tbot-trades-backup.timer
+```
+
+Confirm the timer is actually scheduled:
+
+```
+$ systemctl list-timers tbot-trades-backup.timer
+```
+
+You should see a `NEXT` time around 02:30 UTC (plus up to 10 minutes of `RandomizedDelaySec`)
+and `LEFT` counting down to it.
+
+**Do not wait until 02:30 to find out whether it works.** Run the one-shot service by hand right
+now and read what it logged:
+
+```
+$ sudo systemctl start tbot-trades-backup.service
+$ sudo systemctl status tbot-trades-backup.service
+$ sudo journalctl -u tbot-trades-backup -n 50 --no-pager
+```
+
+`systemctl status` shows `Active: inactive (dead)` immediately — that's normal for a oneshot
+unit that already finished; what matters is whether that run's result was `status=0/SUCCESS` and
+what the journal says. A successful run prints one JSON line (stdout), e.g.:
+
+```
+{"attempts": 1, "copy_trade_count": 12345, "dest": "/var/backups/tbot/trades/trades-20261006T023000Z.sqlite", "duration_seconds": 0.842, "rotated_deleted": [], "source_trade_count": 12345, "status": "ok"}
+```
+
+A failed run instead logs one JSON line on stderr with `"status": "error"` and a `"stage"` of
+either `"backup"` (exit code 1 — no verified copy could be produced at all, e.g. the Docker
+volume could not be inspected, or the source database stayed locked past every retry) or
+`"integrity_check"` (exit code 2 — a copy was produced but failed `PRAGMA integrity_check`; it
+has already been deleted by the time you read the log). Either failure leaves the unit visible
+in:
+
+```
+$ systemctl --failed
+```
+
+until the next successful run clears it. There is no Telegram alerting yet (that's phase 5), so
+this and the recorder's own daily health check (section 14) are the only two things worth
+glancing at by hand for now.
+
+If `/usr/bin/python3` is not where this server's `python3` actually lives, find the real path
+with `which python3`, edit the `ExecStart=` line in `/etc/systemd/system/tbot-trades-backup.service`
+to match, then `sudo systemctl daemon-reload` before trusting any of the above.
+
+### 16.2 Listing backups
+
+```
+$ sudo ls -lh /var/backups/tbot/trades/
+```
+
+Filenames are `trades-<UTC timestamp>.sqlite`, e.g. `trades-20261006T023000Z.sqlite` — plain
+alphabetical sort already puts them in chronological order, since the timestamp is zero-padded
+and year-first. The directory is root-owned, mode `0750`; files are mode `0640` — reading
+anything in there needs `sudo`.
+
+### 16.3 Testing a restore — **always into a scratch path, never over the live database**
+
+Restoring straight over `trades.sqlite` inside the running recorder's volume is exactly the kind
+of thing this document otherwise warns against doing casually — the recorder writes to that file
+roughly every 5 seconds, and overwriting it out from under a live process turns one problem into
+two. Test restores into a throwaway path instead. Only move a backup into the live location as a
+deliberate, recorder-stopped recovery step if the real database is actually lost or corrupted —
+and even then, keep the corrupted original aside until the restore is confirmed good.
+
+```
+$ sudo mkdir -p /tmp/trades-restore-test
+$ sudo cp /var/backups/tbot/trades/trades-20261006T023000Z.sqlite /tmp/trades-restore-test/trades.sqlite
+$ sudo chown "$(whoami)":"$(whoami)" /tmp/trades-restore-test/trades.sqlite
+$ sqlite3 /tmp/trades-restore-test/trades.sqlite "PRAGMA integrity_check; SELECT COUNT(*) FROM trades;"
+```
+
+The first command should print a single line, `ok`; the second prints a row count, which should
+be at or below whatever that backup's own journal log (section 16.1) reported as
+`copy_trade_count` — the live database only ever grows, so an older backup's count can be lower
+than today's, never a sign of a problem by itself.
+
+Clean up afterwards:
+
+```
+$ sudo rm -rf /tmp/trades-restore-test
+```
+
+### 16.4 Pulling a copy to Parham's Windows laptop
+
+The backup files are root-owned (`0640`, readable only by `root`), so a direct `scp` as `tbot`
+fails with "Permission denied" — and this task does not assume you have `tbot`'s own `sudo`
+password memorized over SSH. Use the root SSH key instead (reserved for systemd installs like
+this one — section 8) to stage the file into `tbot`'s home first, where the ordinary `tbot`
+login used for everything else in this document can read it:
+
+```
+C:\> ssh root@<server-ip> "install -o tbot -g tbot -m 0640 /var/backups/tbot/trades/trades-20261006T023000Z.sqlite /home/tbot/"
+C:\> scp tbot@<server-ip>:/home/tbot/trades-20261006T023000Z.sqlite C:\trade-bot-backups\
+```
+
+(Create `C:\trade-bot-backups\` first if it doesn't exist yet: `mkdir C:\trade-bot-backups`.)
+
+Delete the staged copy in `tbot`'s home once the laptop has it — it's a second copy of raw trade
+data sitting somewhere less controlled than `/var/backups/tbot/trades/`:
+
+```
+C:\> ssh tbot@<server-ip> "rm /home/tbot/trades-20261006T023000Z.sqlite"
+```
+
+**One-liner for "just give me the newest one"**, run from PowerShell (finds the latest filename
+on the server, stages it into `tbot`'s home with the root key, pulls it, then removes the staged
+copy):
+
+```powershell
+C:\> $f = ssh root@<server-ip> "ls -1 /var/backups/tbot/trades/ | grep -E '^trades-[0-9]{8}T[0-9]{6}Z\.sqlite$' | sort | tail -n 1"
+C:\> ssh root@<server-ip> "install -o tbot -g tbot -m 0640 /var/backups/tbot/trades/$f /home/tbot/$f"
+C:\> scp tbot@<server-ip>:/home/tbot/$f C:\trade-bot-backups\
+C:\> ssh tbot@<server-ip> "rm /home/tbot/$f"
+```
+
+`$f` ends up holding a plain filename (`trades-<timestamp>.sqlite`), never a path with spaces,
+so no extra quoting is needed around it above — but it's still worth glancing at what `$f`
+printed before running the next line, the same caution this document asks for anywhere else a
+captured value gets pasted into a following command.
+
+---
+
+## 17. Checklist — what Parham must do by hand
 
 Nothing above runs itself; in particular, none of this was executed against a real server
 from the machine that wrote it (no Docker/Linux available there — see the note at the top).

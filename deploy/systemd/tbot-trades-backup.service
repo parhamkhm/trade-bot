@@ -1,0 +1,70 @@
+# Nightly online backup of the Tabdeal recorder's trades.sqlite (CLAUDE.md section 3 item 8
+# "Raw data first" -- Tabdeal's /trades endpoint returns only ~29h of history, so the raw
+# `trades` table is the one dataset in this project that cannot be re-downloaded).
+#
+# Triggered daily by deploy/systemd/tbot-trades-backup.timer -- this unit is never enabled
+# directly; see the "Nightly backup of trades.sqlite" section of deploy/SERVER_SETUP.md for
+# the full install/verify walkthrough.
+#
+# Install:
+#   sudo cp deploy/systemd/tbot-trades-backup.service deploy/systemd/tbot-trades-backup.timer \
+#       /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now tbot-trades-backup.timer
+#
+# ASSUMPTION: the repo is cloned to /opt/tbot/trade-bot (same assumption as
+# deploy/systemd/tbot-recorder.service) and the `recorder` service's Docker Compose project
+# uses the named volume `tbot-data`. If either differs on your server, edit the
+# WorkingDirectory=/ExecStart= paths and the volume name in ExecStart= below before
+# installing.
+
+[Unit]
+Description=Nightly online backup of the Tabdeal recorder's trades.sqlite
+Documentation=file:///opt/tbot/trade-bot/deploy/SERVER_SETUP.md
+# Needs Docker up (to resolve the volume's host path) but deliberately NOT
+# network-online.target -- this script never makes a network call, only reads a local
+# Docker volume path and a local SQLite file, and writes local files under
+# /var/backups/tbot/trades.
+After=docker.service
+Requisite=docker.service
+
+[Service]
+Type=oneshot
+
+# Runs as root deliberately: resolving the Docker volume's host Mountpoint (`docker volume
+# inspect`) and reading the recorder's SQLite file under it both need access the `tbot` user
+# would not otherwise have -- the volume's on-disk files are owned by the container's
+# internal UID (see deploy/Dockerfile's `useradd --uid 10001 ... tbot`), not the host `tbot`
+# user. deploy/backup_trades.py itself never writes to the source database (it opens it
+# `mode=ro`) and only ever writes under /var/backups/tbot/trades (root-owned 0750 dir, files
+# 0640 -- see deploy/backup_trades.py and deploy/SERVER_SETUP.md). The root SSH key is
+# otherwise reserved for systemd installs (per this task's own server facts) -- this unit
+# runs under systemd, as root, without ever needing an interactive root login.
+User=root
+
+# Low priority: a nightly backup must never compete with the recorder's own ~5s poll loop
+# for CPU or disk I/O on a small VPS. `idle` I/O scheduling only runs when nothing else wants
+# the disk; Nice=19 is the lowest (non-realtime) CPU priority.
+Nice=19
+IOSchedulingClass=idle
+
+WorkingDirectory=/opt/tbot/trade-bot
+
+# The volume's host Mountpoint is resolved HERE, at run time, via `docker volume inspect` --
+# never hardcoded. It is typically /var/lib/docker/volumes/tbot-data/_data but is not
+# guaranteed to be (see deploy/SERVER_SETUP.md section 14, "Where the data lives"), and can
+# differ across Docker versions/configurations.
+ExecStart=/bin/sh -c 'VOL=$(docker volume inspect tbot-data --format "{{ .Mountpoint }}") && exec /usr/bin/python3 /opt/tbot/trade-bot/deploy/backup_trades.py --source "$VOL/tabdeal/trades.sqlite" --dest-dir /var/backups/tbot/trades --keep-days 14'
+
+# Generous timeout: the online backup intentionally paces itself (small sleeps between
+# page-copy steps so the recorder's own writes are never blocked for long -- see
+# deploy/backup_trades.py's module docstring) and retries with backoff on a locked source, so
+# this can legitimately take longer than a typical oneshot unit without anything being wrong.
+TimeoutStartSec=600
+
+# Deliberately no Restart= here. A failed oneshot backup must show up as `failed` in
+# `systemctl --failed` and the journal -- there is no Telegram alerting before phase 5
+# (CLAUDE.md section 3.6) -- and simply wait for the timer's own next scheduled run (with its
+# RandomizedDelaySec) to try again the following day, rather than being silently retried
+# moments later by systemd against the same root cause (e.g. a source that is locked for an
+# unusually long time, or a disk that is genuinely full).
