@@ -123,9 +123,11 @@ Sixth fix round (this task -- round-3 review, MINOR/NIT fixes ahead of the G1b 7
   still outstanding -- the feed's own ``verified_poll_ts_ms`` keeps advancing on the wall clock
   even though the *data* it returns has not moved on at all. ``_persist_poll`` now detects, inside
   the same transaction as the insert, any newly-inserted trade (by this poll's own
-  ``recorded_ts_ms``) whose ``ts_ms`` falls at or before the sweep's resumption cursor (see
-  ``_resumption_cursor_ms``, shared with ``build_due_candles``) -- i.e. a trade for an hour already
-  sealed one way or another. Each such hour gets a ``late_trades`` gap row and, once the poll's own
+  ``recorded_ts_ms``) whose ``ts_ms`` falls at or before the sweep's resumption cursor (at the
+  time, ``_resumption_cursor_ms``, shared with ``build_due_candles`` -- see the seventh fix
+  round's M-1 for why this is SQLite-only, via ``RecorderStore.last_swept_close_ms``, from here
+  on) -- i.e. a trade for an hour already sealed one way or another. Each such hour gets a
+  ``late_trades`` gap row and, once the poll's own
   transaction has committed, a correction: ``_rewrite_hour_for_late_trades`` either rewrites an
   already-written candle ``complete=False`` (delegating to ``_rewrite_candle_incomplete_if_written``)
   or, for an hour that was swept as empty/poisoned with no candle at all, writes a fresh
@@ -177,6 +179,62 @@ Sixth fix round (this task -- round-3 review, MINOR/NIT fixes ahead of the G1b 7
   ``_sweep_now_ms``'s own ``min(real_clock_now_ms, verified_poll_ts_ms)``) instead of re-querying
   the raw, uncapped ``verified_poll_ts_ms`` itself -- it self-corrects the instant the real clock
   reading drops back below the stale verified value, with no separate write-side clamp needed.
+
+Seventh fix round (this task -- PR2 review, ahead of merge):
+
+* M-1 (MAJOR): ``_persist_poll``'s own ``BEGIN IMMEDIATE`` transaction -- the one wrapping
+  ``insert_trades`` -- used to reach ``_detect_late_trades`` -> ``_resumption_cursor_ms`` ->
+  ``candles.last_written_close_ms``, a Parquet read, to find the late-trade cursor. A
+  corrupt/unreadable Parquet part raised there and rolled back ``insert_trades`` on *every*
+  poll (reproduced: 30 cycles, trade count stuck; ``run_forever`` hits its fatal-exit threshold,
+  restarts, repeats) -- any raw trade past the ``/trades`` endpoint's ~29h response window was
+  then lost forever, with no way to ever recover it. The late-trade (and now also
+  partial-unparsable) cursor lives in SQLite only from here on: ``RecorderStore.
+  last_swept_close_ms`` (the existing ``sweep_cursor`` table). ``_process_due_hour`` now calls
+  the new ``RecorderStore.advance_sweep_cursor`` right after a successful ``write_candle`` (not
+  just on a gapped hour, which already advanced it via ``record_hour_gap``), and
+  ``build_due_candles`` reconciles ``sweep_cursor = max(sweep_cursor, last_written_close_ms)``
+  once at the start of every sweep (``_reconcile_sweep_cursor``), strictly outside any poll
+  transaction and inside its own try/except (log + skip reconciliation on a read failure). No
+  Parquet read happens inside the poll transaction, or anywhere on the trade-ingestion path, any
+  more; ``_persist_poll`` no longer even takes a ``parquet_root`` parameter.
+* m-1 (MINOR): ``_lenient_item_time_ms`` used to trust a dropped item's own ``time`` field at
+  face value, with no plausibility check -- an implausible value (e.g. seconds-scale, a unit
+  bug) anchored the resulting ``partial_unparsable`` gap to a bogus 1970-ish hour, leaving the
+  item's REAL hour with no gap row at all (sealed ``complete=True`` later, with that trade
+  silently missing). It now applies the exact same plausibility bounds ``parse_trade_item``
+  itself uses, and falls back (via the new ``_parse_items_with_neighbors``) to the hour span
+  between the item's nearest successfully-parsed neighbours in the response's own order, only
+  falling back further, to the poll's own hour, when there is no parsed neighbour at all.
+* m-2 (MINOR): a ``partial_unparsable`` gap recorded for an hour already swept past never
+  rewrote that hour the way a ``late_trades`` gap does -- only ``_detect_late_trades`` triggered
+  ``_rewrite_hour_for_late_trades``. ``_persist_poll`` now checks every newly-recorded
+  ``partial_unparsable`` gap's ``hour_close_ms`` against the same SQLite sweep cursor used for
+  late trades, and routes it through the identical post-commit rewrite
+  (``_apply_gap_rewrites``) when it is at or before that cursor.
+* m-3 (MINOR): the healthcheck's ``consecutive_errors`` rule never fired on a sweep-only failure
+  -- a successful poll reset ``_consecutive_errors`` to 0 right before ``build_due_candles``
+  raised, and the one counter that DID climb (``_consecutive_cycle_exceptions``, ``run_forever``
+  -only) was never written to the heartbeat at all. ``HeartbeatState``/``write_heartbeat`` now
+  carry ``consecutive_cycle_exceptions`` (including the current failing cycle), and
+  ``deploy/healthcheck.py`` fails once it reaches ``TBOT_HEARTBEAT_MAX_CYCLE_EXCEPTIONS``
+  (default 3).
+* NITs: ``RecorderStore.late_trade_ts_ms`` now narrows by ``trade_id IN (...)`` (this poll's own
+  ids, the primary key) before the ``recorded_ts_ms``/``ts_ms`` filters, instead of scanning the
+  whole ``trades`` table on every poll; ``TabdealRecorderService.process_once`` wraps its own
+  heartbeat write in a dedicated ``try``/``except`` so a failure writing it (e.g. a full disk)
+  can never replace or mask the cycle's own exception, nor the ``last_cycle_error`` it carries.
+* Engineering rule added to CLAUDE.md Sec.3 following this review: raw trade ingestion must
+  never depend on any downstream step. ``poll_trades_once``'s post-commit Parquet rewrite
+  (``_apply_post_commit_corrections``) and ``TabdealRecorderService.process_once``'s candle
+  sweep and order-book poll are each independently contained -- a failure in any one of them is
+  logged at error level and folded into the heartbeat (``PollOutcome.degraded_error`` /
+  ``_consecutive_degraded_cycles``), but never allowed to raise out of ``poll_trades_once`` or
+  ``process_once`` respectively. This is what M-1 above already did for the trade-ingestion
+  transaction itself (no Parquet read inside it at all); this generalizes the same containment
+  to every OTHER downstream step the recorder also runs, so a permanently broken candle sweep or
+  order-book poll can degrade monitoring (via the heartbeat) without ever throttling (via
+  ``run_forever``'s backoff) or killing (via ``RecorderFatalError``) trade ingestion itself.
 """
 
 from __future__ import annotations
@@ -742,19 +800,34 @@ class RecorderStore:
         row = self._conn.execute("SELECT MAX(recorded_ts_ms) FROM trades").fetchone()
         return row[0] if row is not None and row[0] is not None else None
 
-    def late_trade_ts_ms(self, *, recorded_ts_ms: int, max_ts_ms: int) -> list[int]:
-        """``ts_ms`` for every trade this exact poll newly inserted (``recorded_ts_ms`` set by
-        ``insert_trades`` at insert time, never touched again by a later duplicate ``INSERT OR
-        IGNORE``) whose own timestamp is at or before ``max_ts_ms``.
+    def late_trade_ts_ms(
+        self, *, trade_ids: Sequence[int], recorded_ts_ms: int, max_ts_ms: int
+    ) -> list[int]:
+        """``ts_ms`` for every one of ``trade_ids`` (this poll's own parsed trades -- the caller
+        already knows exactly which ids that is) that this exact poll newly inserted
+        (``recorded_ts_ms`` set by ``insert_trades`` at insert time, never touched again by a
+        later duplicate ``INSERT OR IGNORE``) and whose own timestamp is at or before
+        ``max_ts_ms``.
 
         MINOR-1 (sixth fix round): used by ``_detect_late_trades`` to find trades that arrived
-        for an hour the sweep has already passed (``max_ts_ms`` is the resumption cursor, see
-        ``_resumption_cursor_ms``) -- i.e. late arrivals that a prior seal (complete=True, or an
-        empty/poisoned-hour gap) did not have yet.
+        for an hour the sweep has already passed (``max_ts_ms`` is the SQLite-only resumption
+        cursor, see ``RecorderStore.last_swept_close_ms``) -- i.e. late arrivals that a prior seal
+        (complete=True, or an empty/poisoned-hour gap) did not have yet.
+
+        NIT (PR2 review): previously filtered by ``recorded_ts_ms = ?`` alone, which has no index
+        and scans the whole ``trades`` table on every single poll. ``trade_id`` is the primary
+        key, so narrowing by ``trade_id IN (...)`` first (this poll's own ids, at most
+        ``trades_limit``) makes this an indexed, O(poll size) lookup instead of O(table size);
+        the ``recorded_ts_ms``/``max_ts_ms`` filters are kept exactly as before so the result is
+        unchanged, just reached faster.
         """
+        if not trade_ids:
+            return []
+        placeholders = ",".join("?" * len(trade_ids))
         rows = self._conn.execute(
-            "SELECT ts_ms FROM trades WHERE recorded_ts_ms = ? AND ts_ms <= ?",
-            (recorded_ts_ms, max_ts_ms),
+            f"SELECT ts_ms FROM trades WHERE trade_id IN ({placeholders}) "
+            "AND recorded_ts_ms = ? AND ts_ms <= ?",
+            (*trade_ids, recorded_ts_ms, max_ts_ms),
         ).fetchall()
         return [r[0] for r in rows]
 
@@ -937,12 +1010,32 @@ class RecorderStore:
                 reason=reason,
                 hour_close_ms=close_ms,
             )
-            self._conn.execute(
-                "INSERT INTO sweep_cursor (symbol, last_swept_close_ms) VALUES (?, ?) "
-                "ON CONFLICT(symbol) DO UPDATE SET "
-                "last_swept_close_ms = MAX(last_swept_close_ms, excluded.last_swept_close_ms)",
-                (symbol, close_ms),
-            )
+            self.advance_sweep_cursor(symbol=symbol, close_ms=close_ms)
+
+    def advance_sweep_cursor(self, *, symbol: str, close_ms: int) -> None:
+        """Advance (never regress) the per-symbol ``sweep_cursor`` to ``close_ms``, with no gap
+        row -- the bare cursor-advance half of ``record_hour_gap``, factored out so a hour that
+        gets a real candle (not a gap) can also advance it.
+
+        M-1 (PR2 review): ``_process_due_hour`` calls this right after a successful
+        ``write_candle`` so the SQLite ``sweep_cursor`` tracks every hour the sweep has processed
+        -- candle-written or gapped -- without ever touching Parquet. Before this, the only
+        SQLite-side resumption signal was ``record_hour_gap`` (gapped hours only); a
+        candle-written hour's progress lived exclusively in the Parquet file itself
+        (``candles.last_written_close_ms``), which is exactly what made
+        ``_detect_late_trades`` -- on the trade-ingestion path, inside the poll's own
+        transaction -- need a Parquet read to find it. Also used by
+        ``tabdeal_recorder._reconcile_sweep_cursor`` (called at the start of every sweep, outside
+        any poll transaction) to catch the cursor up to whatever is already on disk, e.g. after a
+        crash between ``write_candle`` and this call, or a database migrated from before this
+        fix existed.
+        """
+        self._conn.execute(
+            "INSERT INTO sweep_cursor (symbol, last_swept_close_ms) VALUES (?, ?) "
+            "ON CONFLICT(symbol) DO UPDATE SET "
+            "last_swept_close_ms = MAX(last_swept_close_ms, excluded.last_swept_close_ms)",
+            (symbol, close_ms),
+        )
 
     def record_empty_hour_gap(self, *, symbol: str, close_ms: int, detected_ts_ms: int) -> None:
         """Record a ``no_trades_in_hour`` gap for the bucket ending at ``close_ms`` AND advance the
@@ -1103,7 +1196,14 @@ class RecorderStore:
 
 @dataclass(frozen=True, slots=True)
 class PollOutcome:
-    """Outcome of one ``/trades`` poll, after persistence."""
+    """Outcome of one ``/trades`` poll, after persistence.
+
+    Engineering rule (CLAUDE.md Sec.3, added following the PR2 review): raw trade ingestion must
+    never depend on any downstream step. ``ok``/``inserted`` reflect ONLY the HTTP call, parsing,
+    and the trade-insert transaction (``_persist_poll``) -- never a downstream, Parquet-touching
+    correction (the post-commit window-no-overlap / late-trade / sealed-hour-partial-unparsable
+    candle rewrites). A failure in one of those is captured separately, in ``degraded_error``.
+    """
 
     ok: bool
     status_code: int | None
@@ -1118,6 +1218,11 @@ class PollOutcome:
     inserted: int
     gap: tuple[int, int] | None
     error: str | None
+    # Engineering rule (PR2 review): set (redacted) when a post-commit Parquet rewrite
+    # (_handle_detected_gap / _apply_gap_rewrites) raised -- the trades themselves are already
+    # safely committed by the time this can happen, so it never affects `ok`/`inserted` above.
+    # `None` when no such correction was attempted this poll, or all of them succeeded.
+    degraded_error: str | None = None
 
 
 def _window_span_seconds(trades: Sequence[candles_mod.Trade]) -> float | None:
@@ -1143,7 +1248,13 @@ class _ParsedResponse:
     # separately from `trades` so _record_partial_unparsable can anchor each one's own gap to its
     # own (leniently-read) time instead of to whatever hours the trades that DID parse happen to
     # span.
-    dropped_items: list[Any]
+    #
+    # m-1 (PR2 review): each entry also carries the ts_ms of the nearest successfully-parsed
+    # trade immediately before and after it in the response's own order (None at either end when
+    # there is no such neighbour) -- see _parse_items_with_neighbors and
+    # _record_partial_unparsable's own docstring for why this replaces trusting the dropped
+    # item's own (possibly implausible, e.g. seconds-scale) "time" field at face value.
+    dropped_items: list[tuple[Any, int | None, int | None]]
     # NIT (sixth fix round): sampled AFTER client.trades() returns (including any retries it took
     # internally) -- see that function's docstring for why sampling it beforehand was wrong.
     now_ms: int
@@ -1168,14 +1279,9 @@ def _fetch_and_parse(client: TabdealClient, symbol: str, limit: int, *, clock: C
     unexpected_body_type = result.ok and not body_is_list
     n_items_received = len(result.body) if result.ok and body_is_list else 0
     trades: list[candles_mod.Trade] = []
-    dropped_items: list[Any] = []
+    dropped_items: list[tuple[Any, int | None, int | None]] = []
     if result.ok and body_is_list:
-        for item in result.body:
-            trade = parse_trade_item(item, now_ms=now_ms)
-            if trade is not None:
-                trades.append(trade)
-            else:
-                dropped_items.append(item)
+        trades, dropped_items = _parse_items_with_neighbors(result.body, now_ms=now_ms)
     return _ParsedResponse(
         result=result,
         trades=trades,
@@ -1184,6 +1290,45 @@ def _fetch_and_parse(client: TabdealClient, symbol: str, limit: int, *, clock: C
         dropped_items=dropped_items,
         now_ms=now_ms,
     )
+
+
+def _parse_items_with_neighbors(
+    items: Sequence[Any], *, now_ms: int
+) -> tuple[list[candles_mod.Trade], list[tuple[Any, int | None, int | None]]]:
+    """Parse every ``/trades`` response item, in response order. Returns the trades that parsed
+    and, for each item that did not, ``(item, prev_ts_ms, next_ts_ms)`` -- the ``ts_ms`` of the
+    nearest successfully-parsed trade immediately before and after it in the response's own
+    order (``None`` at either end when there is no such neighbour).
+
+    m-1 (PR2 review): used by ``_record_partial_unparsable`` to anchor a dropped item's gap to
+    the hour span between its real neighbours when its own ``time`` field is missing or
+    implausible, instead of trusting that field at face value -- the round-3 reviewer's exact
+    repro was a single item with a seconds-scale ``time`` (a unit bug), which used to anchor the
+    gap to a bogus 1970-ish hour while the item's REAL hour (where a trade is genuinely missing)
+    got no gap row at all and was later sealed ``complete=True``. Two linear passes (not the
+    naive O(n^2) "scan backward/forward from each dropped index"): a forward pass tracks the
+    most recently parsed ``ts_ms`` for ``prev_ts_ms``, a backward pass does the same for
+    ``next_ts_ms``.
+    """
+    parsed = [parse_trade_item(item, now_ms=now_ms) for item in items]
+    trades = [t for t in parsed if t is not None]
+    n = len(parsed)
+    prev_ts: list[int | None] = [None] * n
+    last_ts: int | None = None
+    for i in range(n):
+        prev_ts[i] = last_ts
+        trade = parsed[i]
+        if trade is not None:
+            last_ts = trade.ts_ms
+    next_ts: list[int | None] = [None] * n
+    upcoming_ts: int | None = None
+    for i in range(n - 1, -1, -1):
+        next_ts[i] = upcoming_ts
+        trade = parsed[i]
+        if trade is not None:
+            upcoming_ts = trade.ts_ms
+    dropped = [(items[i], prev_ts[i], next_ts[i]) for i in range(n) if parsed[i] is None]
+    return trades, dropped
 
 
 @dataclass(frozen=True, slots=True)
@@ -1250,41 +1395,83 @@ def _detect_window_gap(first_id: int | None, prev_max: int | None) -> tuple[int,
     return None
 
 
-def _lenient_item_time_ms(item: Any) -> int | None:
+def _lenient_item_time_ms(item: Any, *, now_ms: int) -> int | None:
     """Best-effort ``time`` field extraction for a response item that already failed
     ``parse_trade_item`` -- used only to anchor its ``partial_unparsable`` gap to roughly the
     right hour (MINOR-2, sixth fix round), never to validate or store the item itself. Returns
     ``None`` (never raises) for anything not even readable as an integer-ish value.
+
+    m-1 (PR2 review): also returns ``None`` when the value fails the exact same plausibility
+    bounds ``parse_trade_item`` itself uses (``_MIN_PLAUSIBLE_TRADE_TS_MS`` /
+    ``_MAX_FUTURE_SKEW_MS``). Previously an implausible value (e.g. a seconds-scale unit bug --
+    the round-3 reviewer's exact repro) was trusted at face value and anchored the gap to a bogus
+    1970-ish hour -- nowhere near the item's real hour, which then got no gap row at all and was
+    later swept ``complete=True`` with that trade silently missing. The caller
+    (``_record_partial_unparsable``) falls back to anchoring by the item's parsed neighbours in
+    response order when this returns ``None``.
     """
     if not isinstance(item, dict):
         return None
     try:
-        return int(item["time"])
+        time_ms = int(item["time"])
     except (KeyError, TypeError, ValueError):
         return None
+    if time_ms < _MIN_PLAUSIBLE_TRADE_TS_MS or time_ms > now_ms + _MAX_FUTURE_SKEW_MS:
+        return None
+    return time_ms
 
 
 def _record_partial_unparsable(
-    store: RecorderStore, dropped_items: Sequence[Any], now_ms: int
-) -> None:
-    """MAJOR M-B, amended MINOR-2 (sixth fix round): mark each hour a dropped item actually
-    belongs to as having a known shortfall, so the candle sweep builds it ``complete=False``
-    rather than treating a partial drop as full coverage.
+    store: RecorderStore,
+    dropped_items: Sequence[tuple[Any, int | None, int | None]],
+    now_ms: int,
+) -> list[tuple[int, int]]:
+    """MAJOR M-B, amended MINOR-2 (sixth fix round), amended m-1/m-2 (PR2 review): mark each hour
+    a dropped item actually belongs to as having a known shortfall, so the candle sweep builds it
+    ``complete=False`` rather than treating a partial drop as full coverage. Returns ``(rowid,
+    hour_close_ms)`` for every row this call newly inserted (not an already-existing dedup
+    no-op) -- m-2 (PR2 review): ``_persist_poll`` uses this to find any newly-recorded
+    ``partial_unparsable`` gap whose hour is at or before the sweep's own resumption cursor, i.e.
+    an hour already sealed one way or another, so it goes through the same rewrite path
+    ``late_trades`` already uses (``_rewrite_hour_for_late_trades``) instead of silently leaving
+    that already-sealed candle wrong forever.
 
     MINOR-2: previously this anchored every affected hour to the hours of the trades that DID
     parse in the same poll -- on a poll whose response spans the full ~29h/1000-trade window,
     one unrelated bad item could mark roughly 29 consecutive hours incomplete, and re-record a
-    gap for every one of them on every single poll (the old anchor had nothing to do with the bad
-    item's own time). Each dropped item's own ``time`` field is now read leniently (even though
-    the rest of the item failed real parsing) and used as that item's own anchor; only an item
-    with no readable time at all falls back to the hour containing the poll itself.
+    gap for every one of them on every single poll. Each dropped item's own ``time`` field was
+    read leniently (even though the rest of the item failed real parsing) and used as that item's
+    own anchor.
+
+    m-1 (PR2 review): that lenient read is now also checked for plausibility
+    (``_lenient_item_time_ms``) -- an implausible own time (e.g. seconds-scale) no longer anchors
+    the gap to a bogus hour. When the own time is missing or implausible, the anchor is instead
+    the hour SPAN between the item's nearest successfully-parsed neighbours in response order
+    (``prev_ts_ms``/``next_ts_ms``, from ``_parse_items_with_neighbors``) -- tightly bounding the
+    affected hours to roughly where the bad item actually sits in the feed, rather than the whole
+    poll's time range. Only an item with no readable time AND no parsed neighbour at all (every
+    item in the response failed to parse) falls back to the hour containing the poll itself.
     ``record_gap_once`` dedupes by ``(reason, hour_close_ms)`` so rediscovering the same affected
     hour on a later poll is a no-op, not another row.
     """
-    for item in dropped_items:
-        item_time_ms = _lenient_item_time_ms(item)
-        close_ms = candles_mod.hour_bounds_ms(item_time_ms if item_time_ms is not None else now_ms)[1]
-        store.record_gap_once(detected_ts_ms=now_ms, reason="partial_unparsable", hour_close_ms=close_ms)
+    recorded: list[tuple[int, int]] = []
+    for item, prev_ts_ms, next_ts_ms in dropped_items:
+        item_time_ms = _lenient_item_time_ms(item, now_ms=now_ms)
+        if item_time_ms is not None:
+            close_candidates = [candles_mod.hour_bounds_ms(item_time_ms)[1]]
+        else:
+            neighbor_ts_ms = [ts for ts in (prev_ts_ms, next_ts_ms) if ts is not None]
+            if neighbor_ts_ms:
+                close_candidates = _gap_touched_hour_closes(min(neighbor_ts_ms), max(neighbor_ts_ms))
+            else:
+                close_candidates = [candles_mod.hour_bounds_ms(now_ms)[1]]
+        for close_ms in close_candidates:
+            rowid = store.record_gap_once(
+                detected_ts_ms=now_ms, reason="partial_unparsable", hour_close_ms=close_ms
+            )
+            if rowid is not None:
+                recorded.append((rowid, close_ms))
+    return recorded
 
 
 def _gap_touched_hour_closes(lo_ts_ms: int, hi_ts_ms: int) -> list[int]:
@@ -1329,9 +1516,15 @@ def _resumption_cursor_ms(store: RecorderStore, parquet_root: Path, symbol: str)
     written" and "last hour swept as an empty/poisoned/etc. gap" (MAJOR M3) -- or ``None`` if
     nothing has been swept at all yet.
 
-    Shared by ``build_due_candles`` (to know where to resume) and ``_detect_late_trades`` (MINOR-1,
-    sixth fix round: a trade landing in an hour at or before this cursor arrived after that hour
-    was already sealed one way or another).
+    Used by ``build_due_candles`` (to know where to resume) and by ``_rewrite_hour_for_late_trades``
+    / ``_rewrite_candle_incomplete_if_written`` (both post-commit, outside any poll transaction).
+
+    M-1 (PR2 review): this reads Parquet (``candles.last_written_close_ms``) and must therefore
+    never be called from the trade-ingestion path (``_persist_poll``'s transaction) -- that is
+    exactly the incident this fix round closes. ``_detect_late_trades`` no longer uses this
+    function; it takes a plain ``cursor_ms`` from ``RecorderStore.last_swept_close_ms`` (SQLite
+    only) instead. See the module docstring's seventh fix round and
+    ``RecorderStore.advance_sweep_cursor``.
     """
     last_written_ms = candles_mod.last_written_close_ms(parquet_root, symbol)
     last_swept_ms = store.last_swept_close_ms(symbol)
@@ -1403,25 +1596,35 @@ def _handle_detected_gap(
 
 
 def _detect_late_trades(
-    store: RecorderStore, *, now_ms: int, symbol: str, parquet_root: Path | None
+    store: RecorderStore,
+    *,
+    now_ms: int,
+    trade_ids: Sequence[int],
+    cursor_ms: int | None,
 ) -> list[int]:
     """Hour-close buckets (deduped, ascending) of this poll's newly-inserted trades (identified
-    by ``recorded_ts_ms == now_ms``) whose own ``ts_ms`` falls at or before the sweep's
-    resumption cursor -- i.e. trades that arrived for an hour already sealed one way or another
-    (MINOR-1, sixth fix round: a feed that answers HTTP 200 but is actually frozen/stale can let
-    the quiet-hour timeout seal an hour, or an empty/poisoned hour, before all of that hour's real
-    trades have actually arrived).
+    by ``trade_id in trade_ids`` -- this poll's own parsed trades -- AND ``recorded_ts_ms ==
+    now_ms``) whose own ``ts_ms`` falls at or before ``cursor_ms`` -- i.e. trades that arrived
+    for an hour already sealed one way or another (MINOR-1, sixth fix round: a feed that answers
+    HTTP 200 but is actually frozen/stale can let the quiet-hour timeout seal an hour, or an
+    empty/poisoned hour, before all of that hour's real trades have actually arrived).
 
-    ``[]`` when ``parquet_root`` is ``None`` (most tests; nothing to check the written-candle half
-    of the cursor against -- ``TabdealRecorderService`` always passes it in production) or nothing
-    has been swept yet.
+    M-1 (PR2 review): ``cursor_ms`` is supplied by the caller -- it must be
+    ``RecorderStore.last_swept_close_ms`` (the SQLite-only sweep cursor), never
+    ``_resumption_cursor_ms`` (which also reads the Parquet store via
+    ``candles.last_written_close_ms``). This function runs on the trade-ingestion path, inside
+    ``_persist_poll``'s own ``BEGIN IMMEDIATE`` transaction -- a corrupt/unreadable Parquet part
+    reached from here used to roll back ``insert_trades`` on every single poll, permanently
+    losing any trade past the ``/trades`` endpoint's ~29h response window. ``_process_due_hour``
+    now keeps the SQLite cursor caught up for every hour it processes (candle-written or
+    gapped), and ``build_due_candles``'s own ``_reconcile_sweep_cursor`` catches it up further
+    (outside any poll transaction, try/except-guarded) from whatever is already on disk.
+
+    ``[]`` when ``cursor_ms`` is ``None`` (nothing has been swept yet) or ``trade_ids`` is empty.
     """
-    if parquet_root is None:
+    if cursor_ms is None or not trade_ids:
         return []
-    cursor_ms = _resumption_cursor_ms(store, parquet_root, symbol)
-    if cursor_ms is None:
-        return []
-    late_ts_ms = store.late_trade_ts_ms(recorded_ts_ms=now_ms, max_ts_ms=cursor_ms)
+    late_ts_ms = store.late_trade_ts_ms(trade_ids=trade_ids, recorded_ts_ms=now_ms, max_ts_ms=cursor_ms)
     return sorted({candles_mod.hour_bounds_ms(ts)[1] for ts in late_ts_ms})
 
 
@@ -1432,9 +1635,13 @@ class _PersistResult:
 
     inserted: int
     overlap_gap_rowid: int | None
-    # MINOR-1 (sixth fix round): (rowid, hour_close_ms) per late-trades gap row just recorded, for
-    # the post-commit Parquet correction (_rewrite_hour_for_late_trades) + mark_gap_rewritten.
-    late_trade_gaps: tuple[tuple[int, int], ...]
+    # MINOR-1 (sixth fix round), extended m-2 (PR2 review): (rowid, hour_close_ms) per gap row
+    # just recorded whose hour is already sealed one way or another -- a late_trades gap
+    # (MINOR-1) or a partial_unparsable gap newly recorded for an hour at or before the sweep's
+    # own cursor (m-2) -- for the post-commit Parquet correction
+    # (_rewrite_hour_for_late_trades) + mark_gap_rewritten. Both reasons get exactly the same
+    # treatment: _rewrite_hour_for_late_trades only cares about close_ms, not why it is late.
+    rewrite_gaps: tuple[tuple[int, int], ...]
 
 
 def _persist_poll(
@@ -1444,26 +1651,44 @@ def _persist_poll(
     symbol: str,
     parsed: _ParsedResponse,
     m: _PollMetrics,
-    parquet_root: Path | None,
 ) -> _PersistResult:
     """The single atomic transaction (MAJOR-3) for one poll: the trades, any window-overlap gap
     row, any partial-unparsable gap rows, any late-trades gap rows (MINOR-1), the ``poll_log``
     row, and -- only when ``m.ok`` -- the verified-poll marker ``build_due_candles`` caps the
     sweep against.
+
+    M-1 (PR2 review): no longer takes ``parquet_root`` and never touches Parquet in any way --
+    the resumption cursor used to gate late-trade and sealed-hour partial-unparsable rewrites now
+    comes exclusively from the SQLite ``sweep_cursor`` table (``store.last_swept_close_ms``),
+    which ``_process_due_hour`` keeps advancing for every hour it processes (candle-written or
+    gapped), not just gapped ones. Previously, ``_detect_late_trades`` read
+    ``candles.last_written_close_ms`` (a Parquet read) from *inside* this function's own ``BEGIN
+    IMMEDIATE`` transaction -- a corrupt/unreadable Parquet part raised there and rolled back
+    ``insert_trades`` on every single poll, permanently losing any trade past the ``/trades``
+    endpoint's ~29h response window. The actual Parquet rewrite this function's callers still do
+    (``_handle_detected_gap``, ``_apply_gap_rewrites``) happens strictly after this transaction
+    has committed, in ``poll_trades_once`` -- a failure there can no longer roll back a trade that
+    is already safely stored.
     """
     result = parsed.result
     gap_rowid: int | None = None
-    late_trade_gaps: list[tuple[int, int]] = []
+    rewrite_gaps: list[tuple[int, int]] = []
     with store.transaction():
         inserted = store.insert_trades(parsed.trades, recorded_ts_ms=now_ms) if parsed.trades else 0
         if m.gap is not None:
             gap_rowid = store.record_gap(
                 detected_ts_ms=now_ms, from_id=m.gap[0], to_id=m.gap[1], reason="window_no_overlap"
             )
-        _record_partial_unparsable(store, parsed.dropped_items, now_ms)
+        # M-1/m-2 (PR2 review): SQLite-only, safe inside this transaction -- see this function's
+        # own docstring for why no Parquet read may happen here.
+        cursor_ms = store.last_swept_close_ms(symbol)
+        for rowid, close_ms in _record_partial_unparsable(store, parsed.dropped_items, now_ms):
+            if cursor_ms is not None and close_ms <= cursor_ms:
+                rewrite_gaps.append((rowid, close_ms))
         if inserted > 0:
+            trade_ids = [t.trade_id for t in parsed.trades]
             for close_ms in _detect_late_trades(
-                store, now_ms=now_ms, symbol=symbol, parquet_root=parquet_root
+                store, now_ms=now_ms, trade_ids=trade_ids, cursor_ms=cursor_ms
             ):
                 rowid = store.record_gap(
                     detected_ts_ms=now_ms,
@@ -1472,7 +1697,7 @@ def _persist_poll(
                     reason="late_trades",
                     hour_close_ms=close_ms,
                 )
-                late_trade_gaps.append((rowid, close_ms))
+                rewrite_gaps.append((rowid, close_ms))
         store.record_poll(
             poll_ts_ms=now_ms,
             first_id=m.first_id,
@@ -1488,7 +1713,7 @@ def _persist_poll(
         if m.ok:
             store.record_verified_poll(symbol=symbol, poll_ts_ms=now_ms)
     return _PersistResult(
-        inserted=inserted, overlap_gap_rowid=gap_rowid, late_trade_gaps=tuple(late_trade_gaps)
+        inserted=inserted, overlap_gap_rowid=gap_rowid, rewrite_gaps=tuple(rewrite_gaps)
     )
 
 
@@ -1533,22 +1758,59 @@ def _log_poll_outcome(
         )
 
 
-def _apply_late_trade_corrections(
+def _apply_gap_rewrites(
     store: RecorderStore,
     parquet_root: Path | None,
     symbol: str,
-    late_trade_gaps: tuple[tuple[int, int], ...],
+    rewrite_gaps: tuple[tuple[int, int], ...],
 ) -> None:
-    """Correct every hour MINOR-1's late-trade detection flagged this poll
-    (``_rewrite_hour_for_late_trades``) and mark each gap row rewritten. Pulled out of
-    ``poll_trades_once`` purely to keep that function's own flow easy to see at a glance (m12),
-    the same reason ``_handle_detected_gap`` was split out for the ``window_no_overlap`` case.
+    """Correct every hour MINOR-1's late-trade detection, or m-2's sealed-hour
+    partial-unparsable detection, flagged this poll (``_rewrite_hour_for_late_trades``) and mark
+    each gap row rewritten. Pulled out of ``poll_trades_once`` purely to keep that function's own
+    flow easy to see at a glance (m12), the same reason ``_handle_detected_gap`` was split out
+    for the ``window_no_overlap`` case.
     """
     if parquet_root is None:
         return
-    for rowid, close_ms in late_trade_gaps:
+    for rowid, close_ms in rewrite_gaps:
         _rewrite_hour_for_late_trades(store, parquet_root, symbol, close_ms)
         store.mark_gap_rewritten(rowid)
+
+
+def _apply_post_commit_corrections(
+    store: RecorderStore,
+    parquet_root: Path | None,
+    symbol: str,
+    *,
+    gap: tuple[int, int] | None,
+    gap_rowid: int | None,
+    rewrite_gaps: tuple[tuple[int, int], ...],
+) -> str | None:
+    """Run every post-commit, Parquet-touching candle correction for this poll
+    (``_handle_detected_gap``, ``_apply_gap_rewrites``) and return a redacted error string if
+    either raised -- never raises itself.
+
+    Engineering rule (CLAUDE.md Sec.3, PR2 review): "raw trade ingestion must never depend on any
+    downstream step." By the time this runs, ``_persist_poll``'s transaction has already
+    committed -- the trades, the poll_log row, and the gap rows it recorded are all durable. A
+    Parquet failure here (a corrupt part, a full disk, ...) must stop only this correction, never
+    unwind or block the ingestion that already succeeded, and never propagate out of
+    ``poll_trades_once`` -- it is logged at error level (an alert) and surfaced to the caller as
+    ``PollOutcome.degraded_error`` instead, which ``TabdealRecorderService.process_once`` folds
+    into the heartbeat so the healthcheck can flag it, without affecting ``ok``/``inserted`` or
+    making the recorder back off/retry as though the poll itself had failed.
+    """
+    try:
+        if gap is not None and gap_rowid is not None:
+            _handle_detected_gap(store, parquet_root, symbol, gap, gap_rowid)
+        _apply_gap_rewrites(store, parquet_root, symbol, rewrite_gaps)
+    except Exception as exc:
+        message = _redact_cycle_error(str(exc))
+        logger.error(
+            "tabdeal_recorder.downstream_candle_correction_failed", symbol=symbol, error=message
+        )
+        return message
+    return None
 
 
 def poll_trades_once(
@@ -1568,22 +1830,33 @@ def poll_trades_once(
     ``True`` only when the HTTP call succeeded, the body was a list, and items did not arrive
     with none of them parsing. ``parquet_root``, when given, lets a newly-discovered gap
     immediately correct an already-written candle (``_rewrite_candle_incomplete_if_written``)
-    and lets a late-arriving trade correct an hour already sealed one way or another
-    (``_apply_late_trade_corrections``, MINOR-1); most tests omit it.
+    and lets a late-arriving trade (or a sealed-hour partial-unparsable item, m-2) correct an
+    hour already sealed one way or another (``_apply_gap_rewrites``, MINOR-1/m-2); most tests
+    omit it. M-1 (PR2 review): all of this Parquet access happens here, strictly after
+    ``_persist_poll``'s own transaction has committed -- never inside it. See ``_persist_poll``'s
+    docstring.
+
+    Engineering rule (PR2 review): a failure in that post-commit correction
+    (``_apply_post_commit_corrections``) never raises out of this function -- it is reported via
+    ``PollOutcome.degraded_error`` instead, so a broken downstream (Parquet) step can never make
+    this function's own caller treat an otherwise-successful poll as failed.
     """
     prev_max = store.max_trade_id()
     parsed = _fetch_and_parse(client, symbol, limit, clock=clock)
     now_ms = parsed.now_ms  # NIT: sampled inside _fetch_and_parse, after the HTTP round-trip
     result = parsed.result
     m = _derive_poll_metrics(parsed, prev_max, limit, poll_interval_seconds)
-    persisted = _persist_poll(
-        store, now_ms=now_ms, symbol=symbol, parsed=parsed, m=m, parquet_root=parquet_root
-    )
-    inserted, gap_rowid = persisted.inserted, persisted.overlap_gap_rowid
+    persisted = _persist_poll(store, now_ms=now_ms, symbol=symbol, parsed=parsed, m=m)
+    inserted = persisted.inserted
 
-    if m.gap is not None and gap_rowid is not None:
-        _handle_detected_gap(store, parquet_root, symbol, m.gap, gap_rowid)
-    _apply_late_trade_corrections(store, parquet_root, symbol, persisted.late_trade_gaps)
+    degraded_error = _apply_post_commit_corrections(
+        store,
+        parquet_root,
+        symbol,
+        gap=m.gap,
+        gap_rowid=persisted.overlap_gap_rowid,
+        rewrite_gaps=persisted.rewrite_gaps,
+    )
 
     _log_poll_outcome(
         symbol=symbol,
@@ -1609,6 +1882,7 @@ def poll_trades_once(
         inserted=inserted,
         gap=m.gap,
         error=result.error,
+        degraded_error=degraded_error,
     )
 
 
@@ -1839,6 +2113,11 @@ def _process_due_hour(
         _handle_poisoned_hour(store, symbol, close_ms, now_ms)
         return None
     candles_mod.write_candle(parquet_root, symbol, record)
+    # M-1 (PR2 review): advance the SQLite sweep_cursor for a candle-written hour too, not just
+    # a gapped one (record_hour_gap already did this for those) -- this is what lets
+    # _detect_late_trades rely on store.last_swept_close_ms alone, with zero Parquet reads
+    # anywhere on the trade-ingestion path. See RecorderStore.advance_sweep_cursor.
+    store.advance_sweep_cursor(symbol=symbol, close_ms=close_ms)
     logger.info(
         "tabdeal_recorder.candle_written",
         symbol=symbol,
@@ -1847,6 +2126,33 @@ def _process_due_hour(
         complete=record.complete,
     )
     return record
+
+
+def _reconcile_sweep_cursor(store: RecorderStore, parquet_root: Path, symbol: str) -> None:
+    """Catch the SQLite ``sweep_cursor`` up to whatever candle is already on disk, in case it
+    lags behind (M-1, PR2 review) -- e.g. a crash between ``write_candle`` and
+    ``RecorderStore.advance_sweep_cursor`` in ``_process_due_hour``, or a database that predates
+    this fix (its cursor never advanced for a candle-written hour at all, only a gapped one).
+
+    Read failure (e.g. a corrupt/unreadable Parquet part) is caught, logged, and this
+    reconciliation is simply skipped for this sweep -- the cursor stays at its current, still
+    safe (if possibly stale) value, and reconciliation is retried on the next sweep. This must
+    never prevent a poll's own trade insert, which is why it lives here, at the very start of
+    ``build_due_candles``, strictly outside any poll transaction -- never on
+    ``_detect_late_trades``'s path (see that function's own docstring for the incident this
+    separation fixes). The rest of this sweep (below) may still raise on the same corrupt part
+    while actually trying to build candles -- that is a separate, loud sweep failure, not this
+    best-effort catch-up.
+    """
+    try:
+        last_written_ms = candles_mod.last_written_close_ms(parquet_root, symbol)
+    except Exception:
+        logger.warning(
+            "tabdeal_recorder.sweep_cursor_reconcile_failed", symbol=symbol, exc_info=True
+        )
+        return
+    if last_written_ms is not None:
+        store.advance_sweep_cursor(symbol=symbol, close_ms=last_written_ms)
 
 
 def build_due_candles(
@@ -1870,7 +2176,11 @@ def build_due_candles(
     crash between a poll's own transaction committing and its inline candle-rewrite (see
     ``_recover_unrewritten_gaps``) -- this runs even when the rest of the sweep below ends up
     doing nothing (e.g. no poll has ever been verified yet).
+
+    M-1 (PR2 review): also reconciles the SQLite sweep cursor against the Parquet store
+    (``_reconcile_sweep_cursor``) before anything else -- see that function's own docstring.
     """
+    _reconcile_sweep_cursor(store, parquet_root, symbol)
     _recover_unrewritten_gaps(store, parquet_root, symbol)
     now_ms = _sweep_now_ms(store, symbol, _dt_to_ms(clock.now()))
     if now_ms is None:  # m-D: no poll has ever been verified -- nothing is due yet.
@@ -1920,6 +2230,15 @@ class HeartbeatState:
     # tbot.monitoring.logging.redact_secrets before it ever reaches this file. See
     # TabdealRecorderService.process_once and deploy/healthcheck.py.
     last_cycle_error: str | None = None
+    # m-3 (PR2 review): consecutive process_once() exceptions, including the current cycle if it
+    # is the one failing -- mirrors what TabdealRecorderService.run_forever's own
+    # _consecutive_cycle_exceptions counter will be immediately after this cycle. A sweep-only
+    # failure (e.g. build_due_candles hitting a corrupt Parquet part) used to be invisible to
+    # deploy/healthcheck.py: the poll itself kept succeeding every cycle, which reset
+    # consecutive_errors to 0 right before the sweep raised, and this counter (the one that DID
+    # climb) was never written to the heartbeat at all. 0 on a cycle that completed normally --
+    # also not sticky, same as last_cycle_error.
+    consecutive_cycle_exceptions: int = 0
 
 
 def write_heartbeat(path: Path, state: HeartbeatState) -> None:
@@ -1934,6 +2253,7 @@ def write_heartbeat(path: Path, state: HeartbeatState) -> None:
         "last_new_trade_ts_ms": state.last_new_trade_ts_ms,
         "first_poll_ts_ms": state.first_poll_ts_ms,
         "last_cycle_error": state.last_cycle_error,
+        "consecutive_cycle_exceptions": state.consecutive_cycle_exceptions,
     }
     tmp_path = path.with_name(path.name + ".tmp")
     tmp_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -2003,8 +2323,23 @@ class TabdealRecorderService:
     _consecutive_errors: int = field(default=0, init=False)
     # m-E (fifth fix round): distinct from _consecutive_errors -- counts consecutive
     # process_once() exceptions (a bug/crash), not ordinary poll failures process_once already
-    # handles gracefully. See run_forever.
+    # handles gracefully. See run_forever. Engineering rule (PR2 review): this must NEVER climb
+    # because of a downstream-only failure (candle sweep, order-book poll, a post-commit
+    # Parquet rewrite) -- those are fully contained inside process_once (see
+    # _consecutive_degraded_cycles below) and never raise out of it, specifically so this
+    # counter -- which drives run_forever's backoff AND its RecorderFatalError exit -- stays
+    # tied to genuine ingestion-path bugs only. Raw trade ingestion must never be throttled or
+    # killed by a problem in a downstream step.
     _consecutive_cycle_exceptions: int = field(default=0, init=False)
+    # Engineering rule (PR2 review): consecutive cycles with ANY problem -- a genuine
+    # process_once() exception (ingestion-path), or a downstream step (candle sweep, order-book
+    # poll, post-commit Parquet rewrite) that process_once caught and logged without raising.
+    # Owned entirely by process_once itself (never by run_forever, unlike
+    # _consecutive_cycle_exceptions above) so it keeps accumulating correctly across a run of
+    # purely-downstream-degraded cycles, which never raise and therefore never touch
+    # _consecutive_cycle_exceptions. This is what feeds the heartbeat's
+    # consecutive_cycle_exceptions field that deploy/healthcheck.py's m-3 threshold reads.
+    _consecutive_degraded_cycles: int = field(default=0, init=False)
     _next_orderbook_due_ms: int | None = field(default=None, init=False)
     _stop: bool = field(default=False, init=False)
     _stop_event: threading.Event = field(default_factory=threading.Event, init=False)
@@ -2021,17 +2356,78 @@ class TabdealRecorderService:
     def close(self) -> None:
         self.store.close()
 
+    def _run_downstream_steps(self, outcome: PollOutcome) -> list[str]:
+        """Run the candle sweep and order-book poll, each independently contained, and return
+        every redacted error message collected (``outcome.degraded_error`` included) -- empty if
+        everything succeeded. Never raises.
+
+        Engineering rule (CLAUDE.md Sec.3, added following the PR2 review): "raw trade ingestion
+        must never depend on any downstream step (candle building, Parquet, quality checks). A
+        downstream failure may stop only that step, raise an alert (log at error level) and mark
+        the healthcheck degraded/unhealthy -- trades keep being recorded." A failure in either
+        step is logged at error level (the "alert") and collected here, but never propagates --
+        see ``process_once``'s own docstring for why that matters (it must never touch
+        ``_consecutive_cycle_exceptions``, which drives backoff/fatal-exit). ``poll_trades_once``
+        applies the same containment to its own post-commit Parquet rewrite one level down (see
+        ``PollOutcome.degraded_error``, folded in here as this cycle's first entry).
+        """
+        degraded: list[str] = []
+        if outcome.degraded_error is not None:
+            degraded.append(outcome.degraded_error)
+        try:
+            build_due_candles(
+                self.store,
+                symbol=self.settings.symbol,
+                parquet_root=self.parquet_root,
+                grace_period_seconds=self.settings.grace_period_seconds,
+                clock=self.clock,
+                quiet_hour_timeout_seconds=self.settings.quiet_hour_timeout_seconds,
+            )
+        except Exception as exc:
+            message = _redact_cycle_error(str(exc))
+            logger.error(
+                "tabdeal_recorder.candle_sweep_failed", symbol=self.settings.symbol, error=message
+            )
+            degraded.append(message)
+        try:
+            self._maybe_poll_orderbook()
+        except Exception as exc:
+            message = _redact_cycle_error(str(exc))
+            logger.error(
+                "tabdeal_recorder.orderbook_poll_failed", symbol=self.settings.symbol, error=message
+            )
+            degraded.append(message)
+        return degraded
+
     def process_once(self) -> PollOutcome:
         """One poll/sweep/orderbook cycle.
 
-        MINOR-3 (sixth fix round): the heartbeat is now written from a ``finally`` block, so it
-        is rewritten even when this cycle raises (e.g. a bug inside ``build_due_candles``) --
-        previously an exception anywhere after the poll itself left the heartbeat file stale from
-        before the failure started, with nothing in it to say a cycle had failed at all between
-        ``run_forever``'s own (redacted) log line and the next successful cycle, which could be a
-        long time away given MINOR-3's backoff fix below. ``last_cycle_error`` carries that
-        cycle's own error text (scrubbed through the existing redaction pipeline), ``None`` on a
-        cycle that completed normally -- it is not sticky.
+        Engineering rule (CLAUDE.md Sec.3, PR2 review): raw trade ingestion must never depend on
+        any downstream step. ``poll_trades_once`` (the poll + trade-insert transaction) is the
+        ONLY step whose exception is allowed to propagate out of this method -- a genuine
+        ingestion-path failure, which ``run_forever``'s existing backoff/fatal-exit machinery
+        (``_consecutive_cycle_exceptions``) exists to handle. Every downstream step
+        (``_run_downstream_steps``: the candle sweep, the order-book poll, and
+        ``poll_trades_once``'s own post-commit Parquet rewrite) is independently contained
+        instead -- see that method's docstring. ``_consecutive_degraded_cycles`` (below, owned
+        entirely by this method, never by ``run_forever``) is what actually climbs for those,
+        so it keeps accumulating correctly across a run of purely-downstream-degraded cycles --
+        none of which raise, and therefore none of which would ever touch ``run_forever``'s own
+        ``_consecutive_cycle_exceptions`` -- while that counter itself, and the backoff/fatal-exit
+        it drives, stays tied to genuine ingestion-path bugs only.
+
+        MINOR-3 (sixth fix round): the heartbeat is written from a ``finally`` block, rewritten
+        even when this cycle raises, carrying ``last_cycle_error`` (scrubbed through the existing
+        redaction pipeline, every message folded together when more than one step degraded in
+        the same cycle) -- ``None`` on a cycle with no problem at all; not sticky. m-3 (PR2
+        review): it also carries ``consecutive_cycle_exceptions``, fed from
+        ``self._consecutive_degraded_cycles`` -- a sweep-only failure used to be invisible to
+        ``deploy/healthcheck.py`` entirely (the poll kept succeeding, resetting
+        ``consecutive_errors`` to 0 right before the sweep raised).
+
+        NIT (PR2 review): the heartbeat write itself is wrapped in its own ``try``/``except`` --
+        a failure there (e.g. a full disk) must not replace or mask whatever exception this cycle
+        itself raised, nor prevent this method from returning/raising normally either way.
         """
         last_cycle_error: str | None = None
         try:
@@ -2046,32 +2442,34 @@ class TabdealRecorderService:
             )
             self._consecutive_errors = 0 if outcome.ok else self._consecutive_errors + 1
 
-            build_due_candles(
-                self.store,
-                symbol=self.settings.symbol,
-                parquet_root=self.parquet_root,
-                grace_period_seconds=self.settings.grace_period_seconds,
-                clock=self.clock,
-                quiet_hour_timeout_seconds=self.settings.quiet_hour_timeout_seconds,
-            )
-
-            self._maybe_poll_orderbook()
+            degraded = self._run_downstream_steps(outcome)
+            if degraded:
+                last_cycle_error = "; ".join(degraded)
         except Exception as exc:
             last_cycle_error = _redact_cycle_error(str(exc))
             raise
         finally:
-            write_heartbeat(
-                self.heartbeat_file,
-                HeartbeatState(
-                    last_poll_ts=self.clock.now(),
-                    last_trade_id=self.store.max_trade_id(),
-                    n_trades_total=self.store.total_trade_count(),
-                    consecutive_errors=self._consecutive_errors,
-                    last_new_trade_ts_ms=self.store.last_recorded_ts_ms(),
-                    first_poll_ts_ms=self.store.first_poll_ts_ms(),
-                    last_cycle_error=last_cycle_error,
-                ),
+            self._consecutive_degraded_cycles = (
+                self._consecutive_degraded_cycles + 1 if last_cycle_error is not None else 0
             )
+            try:
+                write_heartbeat(
+                    self.heartbeat_file,
+                    HeartbeatState(
+                        last_poll_ts=self.clock.now(),
+                        last_trade_id=self.store.max_trade_id(),
+                        n_trades_total=self.store.total_trade_count(),
+                        consecutive_errors=self._consecutive_errors,
+                        last_new_trade_ts_ms=self.store.last_recorded_ts_ms(),
+                        first_poll_ts_ms=self.store.first_poll_ts_ms(),
+                        last_cycle_error=last_cycle_error,
+                        consecutive_cycle_exceptions=self._consecutive_degraded_cycles,
+                    ),
+                )
+            except Exception:
+                logger.exception(
+                    "tabdeal_recorder.heartbeat_write_failed", symbol=self.settings.symbol
+                )
         return outcome
 
     def _maybe_poll_orderbook(self) -> None:

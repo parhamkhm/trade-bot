@@ -1343,6 +1343,7 @@ def test_write_heartbeat_content(tmp_path: Path) -> None:
         "last_new_trade_ts_ms": 123,
         "first_poll_ts_ms": 100,
         "last_cycle_error": None,  # MINOR-3 (sixth fix round): None on a cycle that never ran
+        "consecutive_cycle_exceptions": 0,  # m-3 (PR2 review): same default-construction default
     }
 
 
@@ -3148,10 +3149,12 @@ def test_next_wait_seconds_backs_off_on_cycle_exceptions_even_while_polls_keep_s
 def test_process_once_writes_heartbeat_with_redacted_last_cycle_error_when_the_sweep_raises(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """MINOR-3: the heartbeat must still be rewritten (from a ``finally``) even when
-    ``process_once`` itself raises, carrying that cycle's own error text -- scrubbed through the
-    existing redaction pipeline (``tbot.monitoring.logging.redact_secrets``) before it is ever
-    written to disk."""
+    """MINOR-3, updated by the PR2-review engineering rule ("raw trade ingestion must never
+    depend on any downstream step"): a sweep failure is now fully contained inside
+    ``process_once`` -- it must NOT raise out of this method any more (it used to, before that
+    rule; see the superseded ``run_forever``-fatal-exit risk this closes). The heartbeat must
+    still carry that cycle's own error text -- scrubbed through the existing redaction pipeline
+    (``tbot.monitoring.logging.redact_secrets``) before it is ever written to disk."""
     respx.get(TRADES_URL).mock(return_value=httpx.Response(200, json=[]))
     clock = FakeClock()
     client = make_client(clock)
@@ -3171,13 +3174,14 @@ def test_process_once_writes_heartbeat_with_redacted_last_cycle_error_when_the_s
 
     monkeypatch.setattr(trd, "build_due_candles", _boom)
 
-    with pytest.raises(RuntimeError, match="sweep bug"):
-        service.process_once()
+    outcome = service.process_once()  # must NOT raise -- the sweep failure is contained
 
+    assert outcome.ok is True  # the poll itself succeeded; the sweep failure is a separate concern
     payload = json.loads(heartbeat_file.read_text(encoding="utf-8"))
     assert payload["last_cycle_error"] is not None
     assert "sweep bug" in payload["last_cycle_error"]
     assert "do-not-leak-this-secret" not in payload["last_cycle_error"]  # redacted
+    assert payload["consecutive_cycle_exceptions"] == 1
     client.close()
     store.close()
 
@@ -3186,9 +3190,9 @@ def test_process_once_writes_heartbeat_with_redacted_last_cycle_error_when_the_s
 def test_process_once_heartbeat_last_cycle_error_is_not_sticky(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``last_cycle_error`` reflects only the MOST RECENT cycle -- a cycle that fails and is then
-    followed by one that succeeds must clear it back to ``None``, not leave the old error
-    visible forever."""
+    """``last_cycle_error`` reflects only the MOST RECENT cycle -- a cycle that degrades and is
+    then followed by one that succeeds must clear it back to ``None``, not leave the old error
+    visible forever. ``consecutive_cycle_exceptions`` must likewise reset to 0."""
     respx.get(TRADES_URL).mock(return_value=httpx.Response(200, json=[]))
     respx.get(DEPTH_URL).mock(return_value=httpx.Response(200, json=_load_json("tabdeal_depth_sample.json")))
     clock = FakeClock()
@@ -3215,13 +3219,119 @@ def test_process_once_heartbeat_last_cycle_error_is_not_sticky(
 
     monkeypatch.setattr(trd, "build_due_candles", _boom_once)
 
-    with pytest.raises(RuntimeError):
-        service.process_once()
+    service.process_once()  # must not raise -- contained, per the PR2-review engineering rule
     payload_after_failure = json.loads(heartbeat_file.read_text(encoding="utf-8"))
     assert payload_after_failure["last_cycle_error"] is not None
+    assert payload_after_failure["consecutive_cycle_exceptions"] == 1
 
     service.process_once()
     payload_after_recovery = json.loads(heartbeat_file.read_text(encoding="utf-8"))
     assert payload_after_recovery["last_cycle_error"] is None
+    assert payload_after_recovery["consecutive_cycle_exceptions"] == 0
+    client.close()
+    store.close()
+
+
+# ---------------------------------------------------------------------------------
+# Engineering rule (CLAUDE.md Sec.3, added following the PR2 review): "raw trade ingestion must
+# never depend on any downstream step (candle building, Parquet, quality checks). A downstream
+# failure may stop only that step, raise an alert (log at error level) and mark the healthcheck
+# degraded/unhealthy -- trades keep being recorded." This section proves that end to end for
+# every downstream step `TabdealRecorderService.process_once` runs, injecting a failure into
+# each one in turn.
+# ---------------------------------------------------------------------------------
+
+_DOWNSTREAM_FAILURE_CASES = (
+    "candle_sweep_write_candle",
+    "parquet_read_in_sweep_reconciliation",
+    "late_trade_candle_rewrite",
+    "orderbook_snapshot",
+    "heartbeat_write",
+)
+
+
+@pytest.mark.parametrize("case", _DOWNSTREAM_FAILURE_CASES)
+@respx.mock
+def test_trade_ingestion_survives_downstream_failure(
+    case: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """For each downstream step in turn, a failure there must (a) never prevent this poll's
+    trades from landing in SQLite, (b) never make the poll itself be recorded as failed
+    (``PollOutcome.ok``), and (c) be visible as a degradation via the heartbeat (or, for the
+    heartbeat-write case itself, via an error-level log line, since the heartbeat cannot record
+    a failure to write itself)."""
+    trade_ts_ms = HOUR0_MS + 1_000  # lands in the hour closing at HOUR1_MS
+    respx.get(TRADES_URL).mock(
+        return_value=httpx.Response(
+            200, json=[{"id": 1, "price": "100.0", "qty": "1.0", "time": trade_ts_ms}]
+        )
+    )
+    respx.get(DEPTH_URL).mock(
+        return_value=httpx.Response(200, json=_load_json("tabdeal_depth_sample.json"))
+    )
+    # Past the hour's close plus a trivial grace/quiet-timeout so the sweep has something to do
+    # for the candle-sweep/Parquet-reconciliation cases, without needing a second trade after it.
+    clock = FakeClock(start=candles_mod.ms_to_utc(HOUR1_MS + 61_000))
+    client = make_client(clock)
+    store = RecorderStore(tmp_path / "trades.sqlite")
+    heartbeat_file = tmp_path / "hb.json"
+    service = TabdealRecorderService(
+        client=client,
+        store=store,
+        parquet_root=tmp_path / "parquet",
+        heartbeat_file=heartbeat_file,
+        settings=RecorderSettings(
+            symbol="BTCUSDT", quiet_hour_timeout_seconds=_TRIVIAL_QUIET_TIMEOUT_SECONDS
+        ),
+        clock=clock,
+    )
+
+    def _boom(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("boom")
+
+    with capture_logs() as logs:
+        if case == "candle_sweep_write_candle":
+            monkeypatch.setattr(candles_mod, "write_candle", _boom)
+        elif case == "parquet_read_in_sweep_reconciliation":
+            monkeypatch.setattr(candles_mod, "last_written_close_ms", _boom)
+        elif case == "late_trade_candle_rewrite":
+            # Seed the SQLite sweep cursor as if hour HOUR1_MS were already swept BEFORE this
+            # poll -- the trade this poll inserts (ts HOUR0_MS+1_000, hour-close HOUR1_MS) is
+            # then a late arrival for an already-sealed hour, driving _apply_gap_rewrites ->
+            # _rewrite_hour_for_late_trades, which is what is made to fail here.
+            store.advance_sweep_cursor(symbol="BTCUSDT", close_ms=HOUR1_MS)
+            monkeypatch.setattr(trd, "_rewrite_hour_for_late_trades", _boom)
+        elif case == "orderbook_snapshot":
+            monkeypatch.setattr(trd, "poll_orderbook_once", _boom)
+        elif case == "heartbeat_write":
+            monkeypatch.setattr(trd, "write_heartbeat", _boom)
+        else:  # pragma: no cover - guards against a typo in _DOWNSTREAM_FAILURE_CASES
+            raise AssertionError(f"unhandled case {case!r}")
+
+        outcome = service.process_once()  # must never raise, regardless of which step failed
+
+    # (a) the polled trade is still inserted into SQLite.
+    assert store.total_trade_count() == 1
+    assert store.trade_ts_ms(1) == trade_ts_ms
+
+    # (b) the poll itself is recorded as ok -- a downstream failure never taints it.
+    assert outcome.ok is True
+    assert outcome.inserted == 1
+
+    # (c) the failure is visible: either in the heartbeat, or (the one case where the heartbeat
+    # write is itself what failed) as an error-level log line.
+    if case == "heartbeat_write":
+        assert not heartbeat_file.exists()
+        assert any(
+            log.get("event") == "tabdeal_recorder.heartbeat_write_failed"
+            and log.get("log_level") == "error"
+            for log in logs
+        )
+    else:
+        payload = json.loads(heartbeat_file.read_text(encoding="utf-8"))
+        assert payload["last_cycle_error"] is not None
+        assert "boom" in payload["last_cycle_error"]
+        assert payload["consecutive_cycle_exceptions"] == 1
+
     client.close()
     store.close()
