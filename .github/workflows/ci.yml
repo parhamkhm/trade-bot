@@ -36,7 +36,13 @@ jobs:
         run: uv run mypy
 
       - name: Order-code audit (CLAUDE.md section 3.6 / SPEC D-052)
-        run: uv run pytest tests/test_order_code_audit.py -q
+        run: |
+          set -o pipefail
+          env -u TBOT_ALLOW_ORDER_CODE uv run pytest tests/test_order_code_audit.py -q -rs | tee order_audit.log
+          if grep -qi "skipped" order_audit.log; then
+            echo "::error::order-code audit test(s) were skipped in CI -- this must never happen (CLAUDE.md section 3.6 / SPEC D-052)"
+            exit 1
+          fi
 
       - name: Tests (pytest)
         run: uv run pytest

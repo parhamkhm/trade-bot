@@ -10,18 +10,47 @@ enforcement points can never drift apart. Everything here is stdlib-only (``re``
   "fail closed on any exception for an in-scope path" would then block nearly every ordinary edit,
   not just order-code ones. A plain, forgiving regex pass on raw text never raises, so it works
   identically on a full file (``Write``) and on a two-line fragment (``Edit``).
-* Using the exact same masking + pattern code for full files (the audit test reads whole ``*.py``
-  files from disk) and fragments (the hook) is what "same source of truth" has to mean in practice:
-  a single AST-based masker for files and a different regex-based one for fragments would be two
-  rule sets wearing one name.
+* Using the exact same masking + pattern code for full files (the audit test reads whole files from
+  disk) and fragments (the hook) is what "same source of truth" has to mean in practice: a single
+  AST-based masker for files and a different regex-based one for fragments would be two rule sets
+  wearing one name.
 
-Known, accepted limitation: masking blanks out *every* triple-quoted string (not just true
-docstrings -- distinguishing the two needs a real parser, which fragments don't allow, see above).
-Real order-placement code deliberately hidden inside a triple-quoted string literal would therefore
-evade both the hook and the audit test. This is a defense-in-depth tool for catching ordinary/
-accidental additions, not an adversarial sandbox; CLAUDE.md section 9 keeps a human (Parham) in the
-loop before phase 5b regardless, and nothing in src/ or scripts/ does this today (see the module
-docstring of ``tabdeal_client.py``, which explains the client is deliberately kept read-only).
+Known, accepted limitations (defense-in-depth tool, not an adversarial sandbox; CLAUDE.md section
+9/12 keeps a human, Parham, in the loop before phase 5b regardless):
+
+1. Masking blanks out *every* triple-quoted string (not just true docstrings -- distinguishing the
+   two needs a real parser, which fragments don't allow, see above). Real order-placement code
+   deliberately hidden inside a triple-quoted string literal would therefore evade both the hook and
+   the audit test. Nothing in src/ or scripts/ does this today (see the module docstring of
+   ``tabdeal_client.py``, which explains the client is deliberately kept read-only).
+2. (MINOR-5) **f-string same-quote-reuse bypass.** Python 3.12 (PEP 701) lets an f-string reuse its
+   own delimiter quote character inside the ``{...}`` expression part, e.g. ``f"{"#"}"`` is valid
+   syntax. ``_strip_one_line_comment`` below is a naive, line-local quote tracker: it has no concept
+   of an f-string's ``{``/``}`` expression boundaries, so it just toggles "inside a string" on every
+   occurrence of the line's active quote character, in source order. A line that mixes a PEP-701
+   same-quote f-string with real code can desynchronize that toggle for the rest of the line --
+   either harmlessly over-masking real code as "still inside a string" (a missed detection: a
+   bypass), or under-masking a comment as real code (harmless: at worst a spurious finding). A real
+   tokenizer would resolve this correctly but, as above, cannot run on a bare fragment. Accepted gap,
+   same category as (1); not hardened here because a correct fix needs real lexing, which conflicts
+   with "must never raise on a fragment".
+3. (MINOR-6) **Fragment-masking is an approximation, not equivalent to a full-file parse.** An
+   ``Edit``/``MultiEdit`` ``old_string``/``new_string`` fragment can open a triple-quoted string or an
+   f-string on one line with no syntactic "close" anywhere in the fragment (the real close lives
+   outside the edited region, in surrounding file text the hook never sees), or vice versa -- a
+   fragment can *look* like it closes a string that, in the full file, was never opened. Both
+   directions are possible: the masker can treat real code as "inside a string" (a potential bypass)
+   or treat part of a string literal as real code (a potential false positive). The audit test does
+   not have this problem (it always reads the whole file), which is one more reason it -- not the
+   hook -- is the binding enforcement; see the hook's module docstring.
+4. A deliberately space-padded fake endpoint (``"/api/v1/ order"``) would also be allowed through by
+   the allow-listed-string-literal rule below; same category of intentional-evasion gap as (1).
+
+Known limitation specific to the pattern list (not masking): every pattern here is a plain regex
+scoped as tightly as the known bypasses to date require (see the git history of this file and of
+``tests/test_order_code_audit.py`` for the concrete repro cases each pattern/false-positive-fix was
+added for). A new, cleverer bypass is always possible; this module is reviewed whenever a reviewer
+finds one, not treated as complete.
 """
 
 from __future__ import annotations
@@ -39,20 +68,30 @@ __all__ = [
 # ---------------------------------------------------------------------------
 # Forbidden patterns
 # ---------------------------------------------------------------------------
-# Every pattern is case-insensitive (`(?i)`) and deliberately does NOT include the bare word
-# "order" -- "OrderRequest", "OrderType", "OrderAck", "OrderStatus", "OrderState",
-# "client_order_id" (core/types.py contracts) and "order book" / "orderbook" / "order_book"
-# (data/tabdeal_recorder.py, data/depth.py, data/candles.py) all pass *by construction*: none of
-# them contain a "/" next to "order", none of them are one of the specific camelCase endpoint
-# names below, and none of them are an HTTP-verb call or a *ClientOrderId parameter name.
+# Every pattern is case-insensitive (`(?i)`) UNLESS noted otherwise, and deliberately does NOT
+# include the bare word "order" -- "OrderRequest", "OrderType", "OrderAck", "OrderStatus",
+# "OrderState", "client_order_id" (core/types.py contracts) and "order book" / "orderbook" /
+# "order_book" (data/tabdeal_recorder.py, data/depth.py, data/candles.py) all pass *by
+# construction*: none of them contain a "/" next to "order", none of them are one of the specific
+# camelCase endpoint names below, and none of them are an HTTP-verb call or a *ClientOrderId
+# parameter name.
 #
 # `\boco\b` (not a bare `oco` substring) matters for a very concrete reason: "Protocol" and
 # "protocol" both contain the letters "oco" (pr-OTO-col -> ...t-OCO-l), and `Protocol` is used
 # throughout core/types.py (`Strategy(Protocol)`, `Broker(Protocol)`, ...). A bare substring match
 # would flag every `Protocol` base class in the codebase.
+#
+# `http:verb-call` / `http:withdraw-call` are deliberately scoped to receivers that *look* like an
+# HTTP client (`http...`, `client...`, `session...`, `httpx...`, `requests...`, `_http...`) so that
+# `self._events.put(event)`, `await queue.put(x)`, `ledger.post(entry)` and
+# `portfolio.record_withdrawal(...)` all pass -- none of those receivers matches the prefix list.
+# Coverage for a *generic* verb-call regardless of receiver name (e.g. `client.request("POST", ...)`,
+# `posixpath.join(prefix, "order")`, a bare `"/api/v1/orders"` path string) comes from the
+# receiver-agnostic patterns below instead (`http:verb-literal`, `literal:order`, `path:/order`).
 FORBIDDEN_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("path:/order", re.compile(r"(?i)/order(?:/|\b)")),
+    ("path:/order", re.compile(r"(?i)/orders?(?:/|\b)")),
     ("path:order/", re.compile(r"(?i)\border/")),
+    ("literal:order", re.compile(r"(?i)([\"'])orders?\1")),
     ("endpoint:openOrders", re.compile(r"(?i)\bopenorders\b")),
     ("endpoint:allOrders", re.compile(r"(?i)\ballorders\b")),
     ("endpoint:orderList", re.compile(r"(?i)\borderlist\b")),
@@ -60,15 +99,24 @@ FORBIDDEN_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("endpoint:nonExpiredAllOrders", re.compile(r"(?i)\bnonexpiredallorders\b")),
     ("endpoint:oco", re.compile(r"(?i)\boco\b")),
     ("path:/margin", re.compile(r"(?i)/margin\b")),
-    ("action:withdraw", re.compile(r"(?i)withdraw")),
+    ("path:/withdraw", re.compile(r"(?i)/withdraw")),
+    ("literal:withdraw", re.compile(r"(?i)([\"'])withdraw\w*\1")),
     ("stream:userDataStream", re.compile(r"(?i)userdatastream")),
     ("stream:listenKey", re.compile(r"(?i)listenkey")),
-    ("http:post-call", re.compile(r"(?i)\.post\s*\(")),
-    ("http:delete-call", re.compile(r"(?i)\.delete\s*\(")),
-    ("http:put-call", re.compile(r"(?i)\.put\s*\(")),
+    (
+        "http:verb-call",
+        re.compile(r"(?i)\b(?:http|client|session|httpx|requests|_http)\w*\.(?:post|delete|put)\s*\("),
+    ),
+    (
+        "http:withdraw-call",
+        re.compile(r"(?i)\b(?:http|client|session|httpx|requests|_http)\w*\.withdraw\w*\s*\("),
+    ),
     ("http:method-kwarg", re.compile(r'(?i)method\s*=\s*["\'](?:post|delete|put)["\']')),
-    ("http:httpx-verb", re.compile(r"(?i)httpx\.(?:post|delete|put)\b")),
-    ("http:requests-verb", re.compile(r"(?i)requests\.(?:post|delete|put)\b")),
+    # Case-SENSITIVE by design (no `(?i)`): a bare quoted HTTP-verb literal passed positionally,
+    # e.g. `client.request("POST", ORDER_PATH)` or `client.stream("POST", url)`. Exact uppercase
+    # only, matching how Binance-style exchange APIs spell the verb; "GET" is deliberately not in
+    # the alternation (`tabdeal_client.py` uses `method="GET"` throughout and must stay allowed).
+    ("http:verb-literal", re.compile(r"([\"'])(?:POST|DELETE|PUT)\1")),
     ("param:newClientOrderId", re.compile(r"(?i)newclientorderid")),
     ("param:origClientOrderId", re.compile(r"(?i)origclientorderid")),
     ("param:listClientOrderId", re.compile(r"(?i)listclientorderid")),
@@ -78,7 +126,7 @@ FORBIDDEN_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 
 # Exact string-literal allow-list. A quoted string literal (single/double, NOT triple-quoted --
 # those are already blanked wholesale, see `mask_text`) whose content is EXACTLY one of these is
-# never flagged, even though its text matches `action:withdraw`.
+# never flagged, even though its text matches `literal:withdraw` / `path:/withdraw`.
 #
 # Why these three and only these three: `scripts/tabdeal_probe.py::classify_key_permissions`
 # reads the Tabdeal/Binance-style account-info response to confirm the API key has NO withdraw
@@ -110,7 +158,8 @@ def _strip_one_line_comment(line: str) -> str:
     Approximate on purpose (no handling of raw strings, f-string braces, or backslash edge cases
     beyond a single backslash-escape check) -- good enough to stop real comments like
     ``# ... withdraw permission ...`` from being scanned, without needing a real tokenizer (which
-    would raise on a bare code fragment; see the module docstring).
+    would raise on a bare code fragment; see the module docstring). See the module docstring
+    (MINOR-5) for the specific, accepted f-string same-quote-reuse bypass this approximation has.
     """
     quote: str | None = None
     for i, ch in enumerate(line):
