@@ -37,7 +37,7 @@ _HOOK_SCRIPT = _HOOKS_DIR / "block_order_code.py"
 if str(_HOOKS_DIR) not in sys.path:
     sys.path.insert(0, str(_HOOKS_DIR))
 
-from order_code_patterns import find_matches  # type: ignore[import-not-found]  # noqa: E402
+from order_code_patterns import find_matches  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("TBOT_ALLOW_ORDER_CODE") == "1",

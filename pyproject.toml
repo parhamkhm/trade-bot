@@ -52,7 +52,7 @@ known-first-party = ["tbot"]
 
 [tool.mypy]
 python_version = "3.12"
-files = ["src", "tests", "scripts", "deploy"]
+files = ["src", "tests", "scripts", "deploy", ".claude/hooks"]
 warn_unused_configs = true
 warn_redundant_casts = true
 warn_unused_ignores = true
