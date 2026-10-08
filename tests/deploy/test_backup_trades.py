@@ -666,3 +666,27 @@ def test_module_does_not_require_python_3_11_for_datetime_utc() -> None:
     source = _MODULE_PATH.read_text(encoding="utf-8")
     assert "from datetime import UTC" not in source
     assert "timezone.utc" in source
+
+
+def test_one_step_copy_is_never_discarded_for_exceeding_the_attempt_budget(tmp_path: Path) -> None:
+    """Review MINOR-2: on the one-step (WAL) path the progress callback only fires after the copy
+    is complete; a slow but finished copy must be kept, not thrown away as a timeout."""
+    source = tmp_path / "trades.sqlite"
+    _create_source_db(source, n_rows=5000)
+    tmp_dest = tmp_path / "copy.sqlite.tmp"
+    backup_trades._backup_attempt(source, tmp_dest, pages=-1, sleep=0.0, max_attempt_seconds=-1.0)
+    conn = sqlite3.connect(str(tmp_dest))
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 5000
+    finally:
+        conn.close()
+
+
+def test_stepwise_copy_still_aborts_past_the_attempt_budget(tmp_path: Path) -> None:
+    source = tmp_path / "trades.sqlite"
+    _create_source_db(source, n_rows=5000)  # many pages, so the first step leaves some remaining
+    with pytest.raises(TimeoutError):
+        backup_trades._backup_attempt(
+            source, tmp_path / "copy.sqlite.tmp", pages=1, sleep=0.0, max_attempt_seconds=-1.0
+        )
+

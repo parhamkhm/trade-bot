@@ -315,6 +315,13 @@ def test_parse_trade_item_rejects_negative_id() -> None:
     assert parse_trade_item(item, now_ms=now_ms) is None
 
 
+def test_parse_trade_item_rejects_the_first_id_beyond_sqlite_int64() -> None:
+    """Exact boundary: 2**63 is one past SQLite's signed 64-bit maximum and must be rejected."""
+    now_ms = 1_767_225_600_000
+    item = {"id": 2**63, "price": "100", "qty": "1", "time": now_ms}
+    assert parse_trade_item(item, now_ms=now_ms) is None
+
+
 def test_parse_trade_item_accepts_the_maximum_valid_sqlite_int64_id() -> None:
     now_ms = 1_767_225_600_000
     item = {"id": 2**63 - 1, "price": "100", "qty": "1", "time": now_ms}

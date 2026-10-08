@@ -302,7 +302,7 @@ _MIN_PLAUSIBLE_TRADE_TS_MS = 1_500_000_000_000
 _MAX_FUTURE_SKEW_MS = 5 * 60 * 1000
 
 # MINOR-3 (PR2 followups): SQLite's INTEGER PRIMARY KEY (the `trades.trade_id` column) is a
-# signed 64-bit integer -- an id at or above this value raises sqlite3.OperationalError /
+# signed 64-bit integer -- an id above this value raises sqlite3.OperationalError /
 # IntegrityError INSIDE insert_trades's executemany, which aborts and rolls back the whole
 # poll's transaction (every other trade in the same 1000-trade window, not just the bad one).
 # Rejected here instead, in parse_trade_item, so an out-of-range id takes the normal

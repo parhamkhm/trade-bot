@@ -42,8 +42,10 @@ is far less likely to repeat indefinitely, and bounding each attempt's wall time
 against a persistently locked source. The whole call is wrapped in an outer attempt loop with
 exponential backoff, bounded by both an attempt count (``_MAX_ATTEMPTS``) and a per-attempt
 wall-clock budget (``_MAX_ATTEMPT_SECONDS``, enforced via the ``progress`` callback), so a
-persistently locked (or, for the one-step WAL path, persistently failing) source fails this run
-loudly (exit 1) rather than hanging the timer indefinitely.
+persistently locked source fails this run loudly (exit 1) rather than hanging the timer
+indefinitely. The budget only aborts an *unfinished* stepwise copy: the one-step WAL path reports
+progress once, after the copy is complete, and a finished copy is never discarded for being slow --
+systemd's TimeoutStartSec bounds that path instead.
 
 Exit codes: 0 ok, 1 backup failed (could not produce a verified copy), 2 integrity check failed
 (a copy was produced but ``PRAGMA integrity_check`` did not return a single ``ok`` row -- the bad
@@ -184,7 +186,10 @@ def _backup_attempt(
     started_at = time.monotonic()
 
     def _progress(_status: int, remaining: int, total: int) -> None:
-        if time.monotonic() - started_at > max_attempt_seconds:
+        # Only an unfinished copy can be aborted: on the one-step WAL path the callback fires once,
+        # after the copy is complete (remaining == 0), and a finished copy must never be discarded
+        # for being slow -- systemd's TimeoutStartSec bounds that path instead (review MINOR-2).
+        if remaining > 0 and time.monotonic() - started_at > max_attempt_seconds:
             raise TimeoutError(
                 f"backup attempt exceeded {max_attempt_seconds:.0f}s "
                 f"with {remaining}/{total} pages remaining"
