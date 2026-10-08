@@ -1302,7 +1302,18 @@ def test_hook_docstring_does_not_claim_path_order_requires_api_token() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _junit_structural_check(xml_path: Path, minimum: int) -> tuple[bool, str]:
+_REQUIRED_AUDIT_TESTS = frozenset(
+    {
+        "test_no_order_code_under_src_scripts_or_deploy",
+        "test_scanned_tree_covers_known_safe_modules",
+        "test_skip_predicate_never_skips_in_ci",
+    }
+)
+
+
+def _junit_structural_check(
+    xml_path: Path, minimum: int, required: frozenset[str] = frozenset()
+) -> tuple[bool, str]:
     """Port of `.github/workflows/ci.yml`'s inline JUnit-XML check (round 5, MAJOR-G2).
 
     Returns ``(ok, message)``. ``ok`` is ``False`` if any ``<testcase>`` has a ``<skipped>``,
@@ -1319,6 +1330,11 @@ def _junit_structural_check(xml_path: Path, minimum: int) -> tuple[bool, str]:
     failures = sum(1 for tc in testcases if tc.find("failure") is not None)
     errors = sum(1 for tc in testcases if tc.find("error") is not None)
     bad = skipped + failures + errors
+    names = {tc.get("name", "") for tc in testcases}
+    missing = sorted(required - names)
+    strangers = sorted(n for n in names if not n.startswith("test_"))
+    if missing or strangers:
+        return False, f"collection altered: missing={missing} non-test items={strangers}"
     if bad:
         return False, f"{bad} skipped/failed/errored testcase(s) out of {tests}"
     passed = tests - skipped - failures - errors
@@ -1428,6 +1444,12 @@ def test_ci_workflow_order_audit_step_shape() -> None:
     assert "xfail_strict=true" in audit_section
     assert "-rsxX" in audit_section
     assert "--noconftest" in audit_section
+    # round 6 (fifth review MAJOR-1): no project ini, no autoloaded plugins, binding tests by name.
+    assert "-c /dev/null" in audit_section
+    assert "--rootdir ." in audit_section
+    assert "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1" in audit_section
+    for name in _REQUIRED_AUDIT_TESTS:
+        assert name in audit_section, f"CI must require {name} by name"
     assert "no:cacheprovider" in audit_section
     assert "--junitxml" in audit_section
     assert "uv run python -c" in audit_section, "must use 'uv run python', not a bare interpreter"
@@ -1450,3 +1472,45 @@ def test_ci_workflow_order_audit_step_shape() -> None:
         f"own addopts (reset here via -o addopts=\"\", but easy to forget) that is exactly the "
         f"double -q (-qq, no summary line) that caused MAJOR-G2. tokens={flag_tokens!r}"
     )
+
+
+def _write_junit(path: Path, names: list[str]) -> None:
+    cases = "".join(f'<testcase classname="t" name="{n}" time="0"/>' for n in names)
+    path.write_text(
+        f'<?xml version="1.0"?><testsuites><testsuite name="pytest" tests="{len(names)}">'
+        f"{cases}</testsuite></testsuites>",
+        encoding="utf-8",
+    )
+
+
+def test_junit_check_fails_when_a_binding_test_was_not_collected(tmp_path: Path) -> None:
+    """Fifth review MAJOR-1: an ini edit (e.g. `python_functions`) can drop the scanning test while
+    keeping the count; the check must notice that a required test name is missing."""
+    xml = tmp_path / "audit.xml"
+    names = sorted(_REQUIRED_AUDIT_TESTS - {"test_no_order_code_under_src_scripts_or_deploy"})
+    _write_junit(xml, [*names, "test_filler_1", "test_filler_2"])
+    ok, message = _junit_structural_check(xml, minimum=1, required=_REQUIRED_AUDIT_TESTS)
+    assert not ok
+    assert "test_no_order_code_under_src_scripts_or_deploy" in message
+
+
+def test_junit_check_fails_when_a_non_test_item_was_collected(tmp_path: Path) -> None:
+    """The same ini edit collected a helper (`_scanned_files`) as a test to keep the count."""
+    xml = tmp_path / "audit.xml"
+    _write_junit(xml, [*sorted(_REQUIRED_AUDIT_TESTS), "_scanned_files"])
+    ok, message = _junit_structural_check(xml, minimum=1, required=_REQUIRED_AUDIT_TESTS)
+    assert not ok
+    assert "_scanned_files" in message
+
+
+def test_rooted_paths_with_a_segment_merely_ending_in_order_are_not_endpoints() -> None:
+    """Fifth review m-1: round 5's query-tail fix made `/data/recorder/...` match `path:/order`."""
+    for snippet in (
+        'DB = "/data/recorder/trades.sqlite"',
+        'p = Path("/srv/tbot/recorder")',
+        'css = "/static/border"',
+    ):
+        assert find_matches(snippet) == [], snippet
+    for snippet in ('u = "/api/v1/order?"', 'u = "/order"', 'u = "/api/v1/orders/x"'):
+        assert find_matches(snippet), snippet
+

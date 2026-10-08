@@ -312,8 +312,8 @@ of 0 and, separately, against buy-and-hold's Sharpe over the same period.
 **G4 — Risk + regime + holdout.** The regime overlay is kept only if, on the pooled OOS manual-delay series,
 its Sharpe is strictly higher than the same strategy without the overlay **and** its maxDD is not worse;
 otherwise it is dropped. Every overlay variant tried is a trial in `research/EXPERIMENTS.md`. The keep/drop
-decision is made before the gates and is part of the strategy's configuration. The one-shot sealed-holdout run must land inside the
-95 % stationary-block-bootstrap band for both Sharpe and maxDD. Run once, logged in `research/HOLDOUT_LOG.md`.
+decision is made before the gates and is part of the strategy's configuration. The one-shot sealed-holdout run must pass the band defined in §7.1 (stationary
+bootstrap, adverse tails only: Sharpe ≥ 2.5th percentile and maxDD ≤ 97.5th percentile). Run once, logged in `research/HOLDOUT_LOG.md`.
 What runs is decided only by the go-live rule in §7.1 (D-048, D-057); the holdout is applied there once, as a
 pass/fail gate on a single walk-forward choice.
 
@@ -367,7 +367,8 @@ phase-3 results. *Proposed (pending Parham):* `donchian_ens_1d`, BTCUSDT, 1d bar
      relative band; vol-driven resizing only). Rule 2 never opens a position from flat: after an execution-only
      stop-out (manual-delay 1h model or a real Tabdeal fill) while the signal state is still long, or when the
      live runner starts mid-trend, the position stays flat until rule 1 fires (the next change in the number of
-     long sub-signals).
+     long sub-signals). Rule 1 then trades to `w_target`, so even a partial exit signal (3 → 2 long
+     sub-signals) re-enters at the 2/3 target from flat — deterministic, and identical in backtest and live.
   3. A RiskManager-forced reduction or exit, and a stop-out, are never blocked by the band.
 - *Protective stop.* `stop_price` = `min(low_{t−M} … low_{t−1})` of the **longest-lookback long** sub-signal (the
   lowest active exit level, i.e. where the whole position would go flat anyway). It raises `ValueError` when no
@@ -390,11 +391,12 @@ target is ≈ 0.22–0.33 of equity when fully long: S0 is deliberately a low-ex
 
 **S1 — equal-weight blend.** Equal-weight average of the target weights of every strategy that passed G3 (S0
 included if it passed), netted into one position, with S0's rebalance rule (relative 25 % band; transitions
-always traded). When S1 is compared with a candidate C, S1 is computed **without C** (leave-one-out). S1's trial
-count for Deflated Sharpe is the sum of its members' trial counts.
+always traded). When S1 is compared with a candidate C, S1 is computed **without C** (leave-one-out). S1's DSR uses the
+same trial count as every other non-S0 contender (see "Deflated Sharpe" below).
 
 **S2 — champion/challenger (from phase 7b only).** A challenger replaces the running strategy only if all hold
-over the evaluation window = the **paper and live days after the challenger's lock date** (historical
+over the evaluation window = the **paper and live days after the challenger's lock date** — the commit date of
+the challenger's frozen entry in `research/EXPERIMENTS.md` — (historical
 walk-forward days all predate the lock and do not count), minimum 365 days:
 (a) its DSR exceeds the champion's by **≥ 0.10** in DSR probability units (fixed, not a default), every variant
 counted. Accepted consequence: once the champion's DSR is ≥ 0.90, no challenger can replace it — a strong
@@ -411,11 +413,11 @@ ratio expressed as a probability, `DSR = PSR(SR*) ∈ [0, 1]`. Inputs, all fixed
 - the return series is the **pooled OOS manual-delay daily return series** of the strategy being judged;
 - Sharpe inside PSR and SR* is the **daily, non-annualised** Sharpe; T = the number of OOS days; PSR uses the
   skew and kurtosis of that series;
-- SR* = the expected maximum of N independent daily Sharpes, where for **any candidate other than S0**, N = all
-  non-S0 trials logged in `research/EXPERIMENTS.md` up to that candidate's lock date, **across all strategy
-  types** (no "family" partitioning), and V[SR] = the variance of the daily Sharpe across exactly those trials,
-  each computed on its own pooled OOS manual-delay series. Only S0 — locked before any result — uses N = 1, so
-  SR* = 0 and DSR = PSR(0).
+- SR* = the expected maximum of N independent daily Sharpes. For **every contender other than S0** (each
+  candidate C and S1) N is the same number: all non-S0 trials logged in `research/EXPERIMENTS.md` up to **the
+  date X is chosen**, across all strategy types (no "family" partitioning), and V[SR] = the variance of the
+  daily Sharpe across exactly those trials, each computed on its own pooled OOS manual-delay series. If that
+  count is 1, SR* = 0. Only S0 — locked before any result — always uses N = 1, so SR* = 0 and DSR = PSR(0).
 "Deflated Sharpe > 0 at the 95 % level" (G3) means **DSR ≥ 0.95**; every DSR threshold and margin in this
 document is in these probability units.
 
@@ -431,6 +433,9 @@ document is in these probability units.
 - *The single choice X* is made on walk-forward results only: the qualifying C with the highest pooled OOS Sharpe;
   if none qualifies, the baseline (S0 or S1) with the higher pooled OOS Sharpe **among those that pass the
   walk-forward gates**; if neither passes, X = none and nothing goes live — the no-edge outcome of CLAUDE.md §1.
+- *Parameters of X for the holdout and for live.* A strategy with per-fold parameters runs with the parameter
+  set its own selection procedure picks on the final training window that ends at `holdout_start` (all research
+  data); that set is logged with the band, before unsealing. S0 has no parameters to pick.
 - *Holdout band (fixed, computed before unsealing).* Source series: X's pooled OOS manual-delay daily returns.
   Stationary bootstrap (Politis–Romano) with mean block length 20 days, path length = the number of days in the
   holdout, 10,000 resamples, seed 20261008. From the resampled paths, the 2.5th percentile of annualised Sharpe
@@ -515,6 +520,7 @@ takes over. The new choice is kept at least 3 months, and every switch needs Par
 | D-056 | Amends D-054: σ̂ is a finite 150-return exponential kernel (start-independent; `warmup_bars = 151`); one DSR definition (probability units, G3 threshold DSR ≥ 0.95); go-live picks the best qualifying candidate, which must itself pass G3/G4; baseline fallback order fixed; the single holdout unsealing evaluates S0, S1 and all qualifying candidates together and only gates the walk-forward choice; S2 window = post-lock paper/live days; manual-delay stop model, adverse depth-at-size slippage calibration window and MinTRL input series fixed | T6 round-3 review MAJOR-1/2 and m-4..m-6: an infinite-memory EWMA broke the warm-up test and live/backtest parity; several go-live choices were still open after results |
 | D-057 | Amends D-054/D-056: S0's sub-signal state is defined by anchored replay from `history_start` (all flat at close #1; backtest, every walk-forward fold and the live runner replay every Binance 1d bar) — `warmup_bars = 151` is only the minimum before trading (first tradable close 2018-06-01); the stop-out reset follows the Binance-bar rule only; the manual-delay stop fills at `min(open_h, stop)` with adverse slippage; DSR inputs fixed (pooled OOS manual-delay daily series, daily non-annualised Sharpe, N and V[SR] from the logged trials, SR* = 0 for N = 1); the holdout is unsealed once for a single walk-forward choice X and only gates it — no fallback after a holdout failure; G4's summary now points to §7.1; slippage measured from the best quote. D-055's "endpoint literals are matched" is restored by the round-4 guardrail fix | T6 third review MAJOR-A/B, m-a, m-b, m-d and NITs: hysteresis made the Donchian state start-dependent beyond any fixed warm-up; qualifying on G4 while also gating on the holdout was circular |
 | D-058 | Amends D-056/D-057 after the fourth T6 review: DSR trial count for any non-S0 candidate = all non-S0 trials up to its lock date across all strategy types (no family partitioning); G3 for S0 = six fixed one-at-a-time neighbour variants (sensitivity runs, not trials), PBO N/A for S0 and S1; holdout band fully specified (stationary bootstrap of X's pooled OOS manual-delay returns, block 20, 10,000 paths, seed 20261008, adverse-tail percentiles) and logged before unsealing; post-G4 live bar store outside the research loader; the daily Binance rule alone drives S0's state, rule 2 never re-enters from flat; anchored replay and charged fold-boundary trades for every stateful strategy; overlay keep rule numeric and overlay variants counted as trials; fold metric named | T6 fourth review MAJOR-S1/S2/S3 and m-1..m-4: each left a choice open after results (trial partitioning, an S0 that could never pass G3, a holdout band whose parameters could be picked after unsealing) |
+| D-059 | Amends D-058 after the fifth T6 review: every non-S0 contender (each candidate and S1) uses one DSR trial count — all non-S0 trials logged up to the date X is chosen — and SR* = 0 if that count is 1; "lock date" is defined only for S2 (commit date of the challenger's frozen EXPERIMENTS.md entry); X's parameters for holdout and live = its own procedure on the final training window ending at holdout_start, logged before unsealing; G4 points to the one-sided §7.1 band. Guardrail: the CI audit runs with no project ini (`-c /dev/null`) and no autoloaded plugins, and requires the binding tests by name; `/order` must be a whole path segment | Fifth review MAJOR-1 (a pyproject `python_functions` edit dropped the scanning test while keeping the count) and MAJOR-2 (two contradicting trial-count rules for S1, undefined lock date) |
 
 ---
 

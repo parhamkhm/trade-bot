@@ -70,9 +70,17 @@ jobs:
           # though the structural check is what actually fails the build. `uv run python` (not a
           # bare `python`) is used throughout this step, including for the JUnit check below, so
           # the interpreter/environment match the rest of CI.
-          env -u TBOT_ALLOW_ORDER_CODE uv run pytest tests/test_order_code_audit.py \
+          # round 6 (fifth review MAJOR-1): `-c /dev/null --rootdir .` ignores pyproject.toml's
+          # [tool.pytest.ini_options] entirely -- `-o addopts=""` alone left every other ini key in
+          # force, and a two-line `python_functions = ...` edit there (pyproject.toml is not
+          # self-protected) silently dropped the scanning test while keeping the count at 178.
+          # PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 stops a plugin pulled in by a new dependency from
+          # rewriting collection; junitxml is built in. The structural check below also requires
+          # the binding tests BY NAME and refuses any collected item not named test_*.
+          env -u TBOT_ALLOW_ORDER_CODE PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+            uv run pytest tests/test_order_code_audit.py -c /dev/null --rootdir . \
             --noconftest -p no:cacheprovider -o addopts="" -o xfail_strict=true -rsxX \
-            --junitxml=order_audit.xml | tee order_audit.log
+            --strict-markers --junitxml=order_audit.xml | tee order_audit.log
           # NIT (round 3): a plain `grep -qi "skipped"` would also fire on any incidental line
           # that happens to contain the substring "skipped" (e.g. a future test name or docstring
           # excerpt pytest echoes back) with no real skip having occurred -- a false alarm that
@@ -99,14 +107,15 @@ jobs:
           # carries a `<skipped>`, `<failure>` or `<error>` CHILD ELEMENT (this file must have zero
           # of all three, always -- it is the binding enforcement for CLAUDE.md section 3.6), then
           # separately require `passed = tests - skipped - failures - errors >= minimum` as a
-          # second, independent guard. 178 is the exact test count in
+          # second, independent guard. 181 is the exact test count in
           # tests/test_order_code_audit.py as of the fourth T6 guardrail review's fix
-          # (fix/guardrail-round5) -- bump this number in the SAME commit/PR whenever a new test is
+          # (fix/guardrail-round5) plus the three round-6 tests -- bump this number in the SAME commit/PR whenever a new test is
           # added to that file; never lower it.
           uv run python -c "
           import sys
           import xml.etree.ElementTree as ET
-          minimum = 178
+          minimum = 181
+          required = {'test_no_order_code_under_src_scripts_or_deploy', 'test_scanned_tree_covers_known_safe_modules', 'test_skip_predicate_never_skips_in_ci'}
           root = ET.parse('order_audit.xml').getroot()
           suite = root.find('testsuite') if root.tag != 'testsuite' else root
           testcases = suite.findall('testcase') if suite is not None else []
@@ -115,6 +124,12 @@ jobs:
           failures = sum(1 for tc in testcases if tc.find('failure') is not None)
           errors = sum(1 for tc in testcases if tc.find('error') is not None)
           bad = skipped + failures + errors
+          names = {tc.get('name', '') for tc in testcases}
+          missing = sorted(required - names)
+          strangers = sorted(n for n in names if not n.startswith('test_'))
+          if missing or strangers:
+              print(f'::error::order-code audit collection was altered: missing={missing} non-test items={strangers} (CLAUDE.md section 3.6 / SPEC D-052, D-055)')
+              sys.exit(1)
           if bad:
               print(f'::error::order-code audit has {bad} skipped/failed/errored testcase(s) out of {tests} -- this must never happen (CLAUDE.md section 3.6 / SPEC D-052, D-055)')
               sys.exit(1)
