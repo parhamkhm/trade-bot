@@ -1,6 +1,6 @@
 # خلاصهٔ افزوده‌های طراحی (T6)
 
-تاریخ: ۲۰۲۶-۱۰-۰۶ · نویسنده: ارکستریتور (Opus) · شاخه: `feat/design-additions`
+تاریخ: ۲۰۲۶-۱۰-۰۸ · نویسنده: ارکستریتور (Opus) · شاخه: `feat/design-additions`
 
 همهٔ این‌ها **قبل از هر نتیجهٔ فاز ۳** ثبت شده‌اند. پس پیش‌ثبت (pre-registration) حساب می‌شوند، نه تطبیق با نتیجه. هیچ کد سفارش‌گذاری نوشته نشده است.
 
@@ -84,31 +84,66 @@
 
 ---
 
-## ۴. نگهبان کد سفارش (D-052، CLAUDE.md §3.6)
+## ۴. نگهبان کد سفارش (D-052، D-055، CLAUDE.md §3.6) — وضعیت پس از چهار دور بازبینی
 
-- یک هوک `PreToolUse` در Claude Code روی `Write|Edit|MultiEdit`.
-  - هر ویرایشی زیر `src/` یا `scripts/` را که endpoint سفارش، لغو، OCO، مارجین، برداشت یا `userDataStream`، یا `POST`/`DELETE` به صرافی اضافه کند، مسدود می‌کند.
-  - ویرایش خودش و `.claude/settings.json` را هم مسدود می‌کند.
-  - باز کردن قفل فقط با `TBOT_ALLOW_ORDER_CODE=1` است که خودت تنظیم می‌کنی.
-- همان الگوها با یک تست pytest و یک مرحلهٔ جدا در CI هم بررسی می‌شوند.
-- **پیاده‌سازی:**
-  - `.claude/hooks/block_order_code.py`: فقط stdin و متغیرهای محیطی را می‌خواند. بدون شبکه، بدون نوشتن فایل، و فقط از کتابخانهٔ استاندارد استفاده می‌کند.
-  - `.claude/hooks/order_code_patterns.py`: منبع واحد الگوها. هم هوک و هم تست از آن استفاده می‌کنند.
-  - `.claude/settings.json`: یک هوک `PreToolUse` با فرمان `uv run --no-project --quiet python "$CLAUDE_PROJECT_DIR/.claude/hooks/block_order_code.py" || exit 2`. قسمت `|| exit 2` باعث می‌شود اگر پایتون پیدا نشد یا اسکریپت خطا داد، ویرایش **مسدود** شود (fail closed). روی ویندوز `python3` فقط میان‌بُر Microsoft Store است، برای همین از `uv` استفاده شد.
-- **الگوها (۲۳ مورد):**
-  - مسیرهای `/order` و `order/`؛
-  - `openOrders`، `allOrders`، `orderList`، `paginatedOpenOrders`، `nonExpiredAllOrders`؛
-  - `oco` به‌صورت کلمهٔ کامل (چون «Protocol» در کد زیاد آمده)، `/margin`، `withdraw`، `userDataStream`، `listenKey`؛
-  - فراخوانی‌های `.post(`، `.delete(` و `.put(` **فقط روی گیرنده‌های HTTP** (`client`، `_client`، `session`، `httpx`، `requests`، `_http`)، رشته‌های فعل HTTP مثل `"POST"`، و متدهای سفارش به سبک SDK مثل `new_order(` و `create_order(`؛
-  - پارامترهای `newClientOrderId` و چهار پارامتر هم‌خانوادهٔ آن.
-- **فهرست مجاز (allow-list):** فقط `canWithdraw`، `WITHDRAW` و `WITHDRAWALS`. این‌ها نام فیلدهایی‌اند که پروب در **پاسخ** حساب می‌خواند تا مطمئن شود کلید مجوز برداشت **ندارد**. قراردادهای `OrderRequest` و `OrderType` و «order book» نیازی به استثنا ندارند و خودشان از الگوها رد می‌شوند.
-- **نتیجه:**
-  - روی درخت فعلی `src/` و `scripts/`: **صفر** مورد.
-  - ۴۵ تست قبول شد (اسکن کامل، و اجرای خود هوک با ورودی‌های مصنوعی).
-  - همهٔ آزمون‌های لوله‌ای کد خروج درست دادند:
+**چه می‌کند:**
+- یک هوک `PreToolUse` در Claude Code روی `Write|Edit|MultiEdit|NotebookEdit`.
+- هر ویرایشی را مسدود می‌کند که در مسیری با یکی از پوشه‌های `src`، `scripts`، `deploy` یا `config` (در هر worktree یا کپی) این‌ها را اضافه کند:
+  - endpoint سفارش، لغو، OCO، مارجین، برداشت یا `userDataStream`؛
+  - یا فراخوانی `POST`/`DELETE`/`PUT` به صرافی.
+- این فایل‌ها را **همیشه** محافظت می‌کند، حتی با `TBOT_ALLOW_ORDER_CODE=1`:
+  - `.claude/settings.json` و `.claude/settings.local.json`؛
+  - کل پوشهٔ `.claude/hooks/`؛
+  - `tests/test_order_code_audit.py`؛
+  - `.github/workflows/ci.yml`.
+- `TBOT_ALLOW_ORDER_CODE=1` فقط قفل **کد سفارش** را باز می‌کند (برای فاز ۵b) و فقط خودت آن را تنظیم می‌کنی.
 
-    | حالت | کد خروج |
-    |---|---|
+**فرمان هوک** در `.claude/settings.json`:
+`PYTHONDONTWRITEBYTECODE=1 uv run --no-project --quiet --offline --python 3.12 python -P ".../block_order_code.py" || exit 2`
+- `|| exit 2`: اگر پایتون پیدا نشد یا اسکریپت خطا داد، ویرایش **مسدود** می‌شود (fail closed).
+- `-P`: یک فایل جعلی (مثلاً `json.py`) کنار هوک نمی‌تواند آن را از کار بیندازد.
+- روی ویندوز `python3` فقط میان‌بُر Microsoft Store است، برای همین از `uv` استفاده شد.
+- خود هوک فقط stdin و متغیرهای محیطی را می‌خواند و فقط از کتابخانهٔ استاندارد استفاده می‌کند: بدون شبکه و بدون نوشتن فایل.
+
+**چه چیزهایی گرفته می‌شود (نمونه‌های واقعی که در بازبینی‌ها آزموده شدند):**
+- رشته‌هایی به شکل endpoint، مثل `"/order"` و `BASE + "/order"`، و دنبالهٔ f-string به سبک خود پروژه، مثل `f"{prefix or self._write_prefix}/order"`.
+- `openOrders`، `allOrders`، `orderList`، `oco`، `/margin`، `/withdraw`، `userDataStream`، `listenKey`.
+- در YAML و TOML: `order_path: /order`.
+- `.post(`، `.delete(` و `.put(` روی گیرنده‌های HTTP (`client`، `_client`، `session`، `httpx`، `requests`، `_http`، `_api`، `_rest`، `transport`، `_aiohttp`).
+- رشتهٔ فعل HTTP (`"POST"` یا `"post"`)، `HTTPMethod.POST` و `HTTPMethod.DELETE`.
+- متدهای سفارش به سبک SDK: `new_order(`، `create_order(`، `cancel_order(`، `delete_order(`، `cancel_replace(`.
+- پارامترهای `newClientOrderId` و هم‌خانواده‌هایش.
+
+**چه چیزهایی دیگر مسدود نمی‌شود (مثبت کاذب برطرف شد):**
+- `queue.put(`، `ledger.post(`، `record_withdrawal(`؛
+- `Path("data/orders.csv")`، `df.sort_values("order")`، `table = "orders"`، `WITHDRAWAL = "withdrawal"`؛
+- `client_cache.put(`؛
+- متن عادی داخل docstring و توضیحات؛
+- قرارداد `get_order` در `core/types.py`.
+
+یک مورد عمداً مسدود می‌ماند: `op = "DELETE"`. تا فاز ۵b نیاز مشروعی به آن نیست.
+
+**اجرای واقعی قاعده: تست و CI**
+- `tests/test_order_code_audit.py` همان الگوها را روی کل `src/`، `scripts/`، `deploy/` و `config/` اجرا می‌کند. روی درخت فعلی **صفر** مورد پیدا می‌شود.
+- **۱۴۷ تست** شامل همهٔ راه‌های دور زدن و مثبت‌های کاذبی است که در چهار دور بازبینی پیدا شد.
+- مرحلهٔ CI «Order-code audit» قبل از اجرای کامل pytest اجرا می‌شود:
+  - هرگز رد (skip) نمی‌شود؛
+  - اگر تستی deselect یا xfail شود شکست می‌خورد؛
+  - کف ۱۴۷ تست قبول‌شده را چک می‌کند.
+- کل مجموعهٔ تست: **۷۳۲ قبول**؛ ruff و mypy تمیز.
+
+**راه‌های دور زدن شناخته‌شده (پذیرفته‌شده؛ همه عمدی و خصمانه‌اند، نه خطای تصادفی):**
+- نوشتن فایل از طریق shell (هوک آن را نمی‌بیند؛ تست و CI می‌بینند)؛
+- کد پنهان در رشتهٔ سه‌گیومه‌ای؛
+- رشتهٔ endpoint با فاصلهٔ عمدی؛
+- ترفند نقل‌قول تودرتو در f-string؛
+- مسیر کوتاه ۸.۳ ویندوز (`CLAUD~1`).
+
+این یک مانع دفاع در عمق است، نه جعبهٔ شنی در برابر حمله. کلید API تا فاز ۵b فقط‌خواندنی است و هر تغییر در `execution/` را خودت بازبینی می‌کنی.
+
+**پیش از فاز ۷a:** برای اینکه بتوان وجود حد ضرر دستی را با `GET /r/api/v1/openOrders` تأیید کرد، یک فهرست مجاز کوچک و بازبینی‌شده لازم است. چون فایل الگوها محافظت‌شده است، این تغییر را **فقط خودت** با ویرایش دستی و بیرون از Claude انجام می‌دهی.
+
+---|---|
     | کد سفارش در `src/` | ۲ |
     | کد تمیز | ۰ |
     | خارج از `src/` و `scripts/` | ۰ |
