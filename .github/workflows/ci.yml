@@ -45,43 +45,84 @@ jobs:
           # env var explicitly (see `_run_hook`) and touch neither the real-network guard nor the
           # holdout-log redirect conftest.py installs, so skipping conftest.py here changes
           # nothing about what they actually verify. `-p no:cacheprovider` avoids writing/reading
-          # .pytest_cache across CI runs for this one-off step. `pyproject.toml`'s
-          # `[tool.pytest.ini_options]` (testpaths/addopts/markers) is an ini file, not a
-          # conftest.py, so `--noconftest` does not affect it.
+          # .pytest_cache across CI runs for this one-off step.
+          #
+          # round 5 (MAJOR-G2 fix): pyproject.toml's `[tool.pytest.ini_options]` sets
+          # `addopts = "-q ..."`; this step used to add its OWN `-q` on top, which pytest treats
+          # as `-qq` ("print no summary line at all"). Combined with a module-level
+          # `pytestmark = pytest.mark.xfail(strict=False)` dropped onto this test file (by accident
+          # or otherwise), a REAL failure was reported as XFAIL, printed nothing under `-qq`, and
+          # is represented in the JUnit XML as a `<testcase>` with a `<skipped type="pytest.xfail">`
+          # child -- NOT a `<failure>` -- while the testsuite's `tests` count still included it, so
+          # the old grep check (nothing to match) AND the old `tests >= minimum` floor check
+          # (count unaffected) both silently passed. Reproduced locally by copying this test file,
+          # swapping its skipif `pytestmark` for an unstrict `xfail`, injecting a real order-code
+          # violation, and running the pre-round-5 version of this exact step end to end -- see
+          # `tests/test_order_code_audit.py::test_junit_structural_check_fails_on_xfail_masked_real_failure`
+          # for the automated version of that reproduction, and this PR's report for the manual one.
+          # Fix: `-o addopts=""` resets the ini's addopts for this one invocation (this step owns
+          # its flags completely instead of stacking a second `-q` onto the project default -- see
+          # `tests/test_order_code_audit.py::test_ci_workflow_order_audit_step_shape`, which fails
+          # if a bare `-q`/`-qq` creeps back in here); `-o xfail_strict=true` is defense in depth
+          # (an UNSTRICT xfail marker like the one above still overrides it at the marker level,
+          # which is exactly why the JUnit-structure check below -- not this flag -- is the real
+          # fix); `-rsxX` prints skip/xfail/xpass reasons to the log for a human to read, even
+          # though the structural check is what actually fails the build. `uv run python` (not a
+          # bare `python`) is used throughout this step, including for the JUnit check below, so
+          # the interpreter/environment match the rest of CI.
           env -u TBOT_ALLOW_ORDER_CODE uv run pytest tests/test_order_code_audit.py \
-            --noconftest -p no:cacheprovider -q -rs --junitxml=order_audit.xml | tee order_audit.log
+            --noconftest -p no:cacheprovider -o addopts="" -o xfail_strict=true -rsxX \
+            --junitxml=order_audit.xml | tee order_audit.log
           # NIT (round 3): a plain `grep -qi "skipped"` would also fire on any incidental line
           # that happens to contain the substring "skipped" (e.g. a future test name or docstring
           # excerpt pytest echoes back) with no real skip having occurred -- a false alarm that
           # would fail CI for the wrong reason. Match only pytest's actual skip-report shapes: a
-          # per-test "SKIPPED [...]" line (`-rs`) at the start of a line, or the run summary's
-          # "N skipped" count.
-          # round 4 (m-e review): a deselected, xfailed or xpassed test is the same kind of
-          # silent-shrinkage risk as a skipped one -- none of them fail the pytest exit code on
-          # their own, so without this check a future `-k`/`--deselect`/`@pytest.mark.xfail` added
-          # to this file (by accident or otherwise) would quietly reduce the binding enforcement
-          # while CI still goes green.
-          if grep -Eq '^SKIPPED|[0-9]+ skipped' order_audit.log || grep -Eq '[0-9]+ (deselected|xfailed|xpassed)' order_audit.log; then
+          # per-test "SKIPPED [...]" line (`-rs`), an "XFAIL [...]"/"XPASS [...]" line (`-rx`/`-rX`,
+          # round 5), or the run summary's "N skipped/deselected/xfailed/xpassed" count. This grep
+          # is belt-and-suspenders now that `-o addopts=""` + `-rsxX` guarantee a summary is
+          # actually printed (round 4's version of this check could never fire under the old `-qq`
+          # -- see the MAJOR-G2 note above); the structural JUnit check further below is the real,
+          # can't-be-silenced-by-a-missing-summary-line enforcement.
+          if grep -Eq '^(SKIPPED|XFAIL|XPASS)' order_audit.log || grep -Eq '[0-9]+ (skipped|deselected|xfailed|xpassed)' order_audit.log; then
             echo "::error::order-code audit test(s) were skipped/deselected/xfailed/xpassed in CI -- this must never happen (CLAUDE.md section 3.6 / SPEC D-052, D-055)"
             exit 1
           fi
-          # round 4 (m-e review): a minimum-passed-tests floor via the JUnit XML's own `tests`
-          # count -- independent of exit-code/grep-based checks, so an empty-but-"successful" run
-          # (e.g. a collection error that still exits 0, or a rootdir/path misconfiguration that
-          # makes pytest silently collect 0 tests from the wrong location) is also caught. 147 is
-          # the exact test count in tests/test_order_code_audit.py as of this fix
-          # (fix/guardrail-round4, round 4 of the T6 guardrail review) -- bump this number in the
-          # SAME commit/PR whenever a new test is added to that file; never lower it.
-          python -c "
+          # round 4 (m-e review): a minimum-passed-tests floor, independent of exit-code/grep-based
+          # checks, so an empty-but-"successful" run (e.g. a collection error that still exits 0, or
+          # a rootdir/path misconfiguration that makes pytest silently collect 0 tests from the
+          # wrong location) is also caught.
+          #
+          # round 5 (MAJOR-G2 fix): the old version of this check trusted the JUnit testsuite's own
+          # `tests` attribute, which -- as the reproduction above shows -- counts an xfailed-but-
+          # actually-failing testcase as a normal "ran" test. This version parses the XML
+          # STRUCTURALLY instead: iterate every `<testcase>` and fail outright if ANY of them
+          # carries a `<skipped>`, `<failure>` or `<error>` CHILD ELEMENT (this file must have zero
+          # of all three, always -- it is the binding enforcement for CLAUDE.md section 3.6), then
+          # separately require `passed = tests - skipped - failures - errors >= minimum` as a
+          # second, independent guard. 178 is the exact test count in
+          # tests/test_order_code_audit.py as of the fourth T6 guardrail review's fix
+          # (fix/guardrail-round5) -- bump this number in the SAME commit/PR whenever a new test is
+          # added to that file; never lower it.
+          uv run python -c "
           import sys
           import xml.etree.ElementTree as ET
-          minimum = 147
-          suite = ET.parse('order_audit.xml').getroot().find('testsuite')
-          tests = int(suite.get('tests', '0')) if suite is not None else 0
-          if tests < minimum:
-              print(f'::error::order-code audit ran only {tests} tests, expected at least {minimum}')
+          minimum = 178
+          root = ET.parse('order_audit.xml').getroot()
+          suite = root.find('testsuite') if root.tag != 'testsuite' else root
+          testcases = suite.findall('testcase') if suite is not None else []
+          tests = len(testcases)
+          skipped = sum(1 for tc in testcases if tc.find('skipped') is not None)
+          failures = sum(1 for tc in testcases if tc.find('failure') is not None)
+          errors = sum(1 for tc in testcases if tc.find('error') is not None)
+          bad = skipped + failures + errors
+          if bad:
+              print(f'::error::order-code audit has {bad} skipped/failed/errored testcase(s) out of {tests} -- this must never happen (CLAUDE.md section 3.6 / SPEC D-052, D-055)')
               sys.exit(1)
-          print(f'order-code audit: {tests} tests ran (minimum {minimum})')
+          passed = tests - skipped - failures - errors
+          if passed < minimum:
+              print(f'::error::order-code audit ran only {passed} passing tests, expected at least {minimum}')
+              sys.exit(1)
+          print(f'order-code audit: {passed} tests passed (minimum {minimum})')
           "
 
       - name: Tests (pytest)

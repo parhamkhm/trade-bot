@@ -115,29 +115,82 @@ __all__ = [
 # NOT reopen the round-3 false positives: `api_client.get(...)` still fails to match `http:verb-call`
 # because `api` must be followed immediately by `.` (not `_client`), exactly like `client_cache.put`
 # before it.
+#
+# round 5 (MAJOR-G1, part 3): added `conn`/`sess`/`connection` to the alternation (reviewer repro:
+# `resp = self._conn.post(self._base + "/api/v1/order?" + qs, headers=h)` -- `self._conn` is just as
+# much an HTTP-client-shaped receiver as `self._api`/`self._rest`, and nothing stopped the
+# alternation from growing to cover it). The reviewer's suggestion to instead make `.post(`/`.delete(`
+# receiver-AGNOSTIC (matching ANY receiver, dropping `_RECEIVER_RE` for those two verbs) was
+# considered and rejected: `tests/test_order_code_audit.py`'s round-3 false positive
+# `ledger.post(entry)` (a ledger-write call, nothing to do with HTTP) would start matching
+# unconditionally the moment the receiver check is dropped -- there is no way to make `.post(`
+# receiver-agnostic without reopening that exact false positive, since "any receiver" by definition
+# includes "ledger". Keeping `http:verb-call` fully receiver-scoped (post/delete/put all go through
+# the same `_RECEIVER_RE`) and growing the word list instead is the only way to both catch the new
+# slip and keep every previously-fixed false positive (`ledger.post`, `client_cache.put`,
+# `session_store.put`, `requests_seen.put`, `transportation.post`, ...) passing. `.put(` was never a
+# candidate for receiver-agnostic matching regardless (`self._events.put(event)` / `await
+# queue.put(x)` are ordinary queue operations, not HTTP calls, and ARE in the repo today --
+# `src/tbot/data/tabdeal_recorder.py` has no `.put(`-shaped queue usage yet, but `await queue.put(x)`
+# is a known-safe snippet precisely because asyncio/multiprocessing queues are a realistic pattern in
+# this codebase's future `execution/oms.py`). Verified against the current tree (round 5): `grep -rnE
+# '\.post\s*\(|\.delete\s*\(|\.put\s*\('  src scripts deploy config` returns zero hits, so widening
+# the receiver list cannot regress anything that exists today -- it only closes the `_conn` gap for
+# whichever receiver name phase 5b's `TabdealBroker`/OMS ends up using.
 _RECEIVER_RE = (
-    r"(?<![A-Za-z0-9])_?(?:http|client|session|httpx|requests|api|rest|transport|aiohttp)"
-    r"(?:_?client|_?session)?"
+    r"(?<![A-Za-z0-9])_?(?:http|client|session|httpx|requests|api|rest|transport|aiohttp|"
+    r"conn|sess|connection)(?:_?client|_?session)?"
 )
 
-# `path:/order` (round 4, MAJOR-C fix): round 3's "`api` must also appear on the same line" proxy
-# was itself a bypass -- `ORDER_PATH = "/order"` on its own line has no `api` token anywhere near
-# it, so the round-3 pattern missed it outright, and the reviewer additionally found that an
-# f-string tail like `f"{prefix or self._write_prefix}/order"` never even reached the "same line"
-# check because the whole f-string got blanked first (see MINOR-5 / `_blank_fstring_braces` below).
-# Round 4 drops the `api`-same-line requirement and instead matches the *shape* of an endpoint
-# literal directly: a quoted literal whose content ends with `/order`/`/orders`, or contains
-# `/order/`/`/orders/` as a substring (so `"/order"`, `"/api/v1/orders"` and `"/order/oco"` all
-# match), plus the equivalent "f-string tail" shape -- text starting right after a blanked `{...}`
-# replacement field's closing `}` and ending the same way, since an f-string's literal portion is no
-# longer blanked away by the whitespace-exemption (round 4 fix #2). This still correctly rejects
-# round 3's false positives: `Path("data/orders.csv")` ends with `.csv`, not `/order`/`/orders`, and
-# `avg = total/orders` has no quotes (and no `/` immediately before `order` inside quotes) at all.
+# `path:/order` (round 4, MAJOR-C fix; round 5, MAJOR-G1 part 1 fix): round 3's "`api` must also
+# appear on the same line" proxy was itself a bypass -- `ORDER_PATH = "/order"` on its own line has
+# no `api` token anywhere near it, so the round-3 pattern missed it outright, and the reviewer
+# additionally found that an f-string tail like `f"{prefix or self._write_prefix}/order"` never even
+# reached the "same line" check because the whole f-string got blanked first (see MINOR-5 /
+# `_blank_fstring_braces` below). Round 4 dropped the `api`-same-line requirement and instead
+# matches the *shape* of an endpoint literal directly: a quoted literal whose content ends with
+# `/order`/`/orders`, or contains `/order/`/`/orders/` as a substring, plus the equivalent "f-string
+# tail" shape (text right after a blanked `{...}` replacement field's closing `}`).
+#
+# Round 4's quoted-literal alternative required the match to end EXACTLY at the closing quote or a
+# literal `/...` continuation -- `([\"'])[^\"'\s]*/orders?(?:/[^\"'\s]*)?\1` -- which a reviewer
+# found still misses two real shapes: a literal ending in a query string (`"/api/v1/order?"`) or a
+# literal built by string concatenation where the `/order` fragment is followed by more path/query
+# text before the closing quote (`"/api/v1/order?" + s`, i.e. `self._conn.get("/api/v1/order?symbol="
+# + s)`) -- in both cases the character right after `order`/`orders` is `?`, not `/` and not the
+# closing quote, so the old `(?:/[^\"'\s]*)?\1` alternative (which only accepts "another `/`-prefixed
+# segment, then immediately the closing quote") never matches. Round 5's fix replaces the trailing
+# shape with a lookahead for "whatever can legally follow a path segment inside a URL" --
+# `/`, `?`, `#`, `&`, `;`, or the closing quote itself -- then permits arbitrary further non-quote
+# text up to that same closing quote: `/orders?(?=[/?#&;]|\1)[^\"'\s]*\1`.
+#
+# Round 5 ALSO anchors the quoted-literal alternative so the matched `/order(s)` must sit on a
+# `/`-rooted path -- either the literal starts with `/` directly (`/order`, `/api/v1/orders`), or it
+# starts with an optional `scheme://host` prefix before the `/`-rooted path begins (`https://
+# api1.tabdeal.org/api/v1/order` -- the full-URL shape `http:verb-call`'s own true-positive repro,
+# `httpx.post("https://api1.tabdeal.org/api/v1/order")`, uses). Every real Tabdeal endpoint in this
+# codebase (CLAUDE.md section 6) is `/api/v1/...` or `/r/api/v1/...`, i.e. the quoted content is
+# EITHER a bare URL path OR a full URL whose path component starts with `/` right after the host --
+# never a relative filesystem path with no leading `/` at all. Dropping the "same line `api` token"
+# proxy in round 4 reopened a different false positive a reviewer found in round 5: a bare relative
+# filesystem path, `Path("data/orders")` (no extension, so round 3/4's ".csv doesn't end in
+# order(s)" escape hatch does not apply either) -- its quoted content is `data/orders`, which is
+# rooted at neither a leading `/` nor a `scheme://host`, yet it still literally ends in `/orders`
+# right before the closing quote. This anchor is the only distinguishing signal available at the
+# plain-regex level between "this whole literal is a URL (bare or absolute) path" and "this whole
+# literal is some other string that happens to end in `/order(s)`" -- and it is also exactly how
+# every real endpoint, every round-4 bypass repro (`ORDER_PATH = "/order"`, `BASE + "/order"`), and
+# the `httpx.post(...)` full-URL repro already look, so this anchor costs nothing on the
+# true-positive side. The f-string-tail alternative is deliberately NOT given the same anchor: its
+# anchor is the blanked `}` of a replacement field, not a quote character, precisely because the
+# literal text after a substitution (`f"{prefix}/openOrders"`) never starts at the string's own
+# opening quote (there is no scheme/host to optionally skip there either -- the prefix before the
+# `}` is always a Python expression, never literal URL text).
+#
 # A second, narrower alternative (`path:/order-bare`) covers the unquoted YAML/TOML shape
 # `order_path: /order` -- a bare scalar value with no quotes at all, which the quoted-literal
-# pattern cannot see. Every real Tabdeal endpoint in this codebase is `/api/v1/...` or
-# `/r/api/v1/...` (CLAUDE.md section 6); neither alternative requires the literal token `api`
-# anymore, since that requirement is exactly what round 3's bypass exploited.
+# pattern cannot see. Neither alternative requires the literal token `api` anymore, since that
+# requirement is exactly what round 3's bypass exploited.
 #
 # `literal:order` is scoped to a bare `"order"`/`"orders"` string literal passed as an argument to a
 # path-building call (`*.join(...)`, `*_url(...)`, `*urljoin(...)`) -- not a blanket
@@ -148,6 +201,22 @@ _RECEIVER_RE = (
 # M-3 repro) is still blocked -- via `http:verb-literal` matching the `"POST"` literal in the same
 # call, not via this pattern; see the regression test for that snippet.
 #
+# round 5 (MAJOR-G1 part 2): the call-context prefix used `\b(?:join|_url|urljoin)\w*` -- the
+# leading `\b` never fires before `self._write_url(`, `self._build_url(`, `self.url(`, or
+# `self._endpoint(` because the position right before `_url`/`url`/`endpoint` in those identifiers
+# has a WORD character on both sides (e.g. "...write" then "_url", both `\w`), so there is no
+# word-boundary transition there at all -- the hardcoded `_url` alternative only ever matched a
+# receiver-free, literally-underscore-prefixed `_url(` sitting right after a `.`/start-of-string
+# (`self._url(` works because `.` is non-word; `self._write_url(` does not, because `write` sits in
+# between with no boundary). The fix drops the `\b` anchor entirely (this prefix is deliberately a
+# plain substring match -- false positives are not a concern here because the alternation words
+# `join`/`url`/`endpoint` are not realistic receiver/variable names on their own, see the
+# true-positive list in the regression tests) and adds `endpoint` as a fourth call-name alternative
+# (`self._endpoint("order")` had no matching alternative at all before). It also widens
+# `[^()\n]*?` to `[^\n]*?` -- round 4's version could not see past a nested `(` such as the tuple
+# literal in `"/".join((p, "order"))`, since `()` were explicitly excluded from the "anything between
+# the call's open-paren and the string literal" class.
+#
 # `literal:withdraw` requires the quoted content to also contain a `/` (an endpoint-shaped literal
 # like `"/withdraw"` or `"/api/v1/withdraw"`) -- round 3's reviewer-found false positive
 # `WITHDRAWAL = "withdrawal"` (a ledger-entry-type constant, not a call to anything) has no `/` and
@@ -156,20 +225,36 @@ FORBIDDEN_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "path:/order",
         re.compile(
-            r"(?i)([\"'])[^\"'\s]*/orders?(?:/[^\"'\s]*)?\1"
+            r"(?i)([\"'])(?:[a-z][\w+.-]*://[^\"'\s/]*)?/[^\"'\s]*?orders?(?=[/?#&;]|\1)[^\"'\s]*\1"
             r"|\}[^\"'\s{}]*/orders?(?:/[^\"'\s]*)?\b"
         ),
     ),
     # round 4: the YAML/TOML shape -- a bare (unquoted) scalar value, e.g. `order_path: /order` --
     # which the quoted-literal alternative above cannot see at all (there are no quote characters
-    # on that line). Scoped to "right after a colon" so it does not fire on an unrelated division
-    # expression or a type-annotated assignment (`ratio: float = total/orders` has text between the
-    # colon and the `/`, which this pattern -- anchored at `:\s*` -- does not skip over).
-    ("path:/order-bare", re.compile(r"(?i):\s*[\"']?/[\w/]*orders?\b")),
+    # on that line).
+    #
+    # round 5 (m-5/m-6): re-anchored to a WHOLE `/orders?` path SEGMENT -- bounded by another `/`,
+    # end-of-line, a closing quote, `?`, or whitespace on the right, and either the leading `/`
+    # itself or a preceding `segment/` on the left -- instead of the old "any word ending in
+    # orders" `\b` match. The old `:\s*[\"']?/[\w/]*orders?\b` matched the YAML path value
+    # `manual_fills: /data/manual_orders.csv` because `\b` only checks the character AFTER the
+    # match, and `.` (start of `.csv`) is a word boundary just as much as `/` is -- `manual_orders`
+    # being a single compound word with "orders" as its tail was never distinguished from "orders"
+    # being its own path segment. The `(?:[\w-]+/)*` repetition requires every segment before
+    # `orders?` to end in `/` (i.e. actually be a separate path segment), so `manual_orders` (no `/`
+    # between `manual_` and `orders`) can never be consumed that way, and the lookahead
+    # `(?=[/\"'?\s]|$)` requires the segment to end at a real path/string/query boundary, not
+    # merely at a `\w`/non-`\w` transition. Also widened to accept a YAML list-item prefix (`- `)
+    # in addition to `key: `, since `- /api/v1/order` (m-6, a YAML sequence entry, not a mapping) has
+    # no colon anywhere on the line and the old pattern could not see it at all.
+    (
+        "path:/order-bare",
+        re.compile(r'(?i)(?:^\s*-\s*|:\s*)[\"\']?/(?:[\w-]+/)*orders?(?=[/\"\'?\s]|$)'),
+    ),
     ("path:order/", re.compile(r"(?i)\border/")),
     (
         "literal:order",
-        re.compile(r"(?i)\b(?:join|_url|urljoin)\w*\s*\([^()\n]*?([\"'])orders?\1"),
+        re.compile(r"(?i)(?:join|url|endpoint)\w*\s*\([^\n]*?([\"'])orders?\1"),
     ),
     ("endpoint:openOrders", re.compile(r"(?i)\bopenorders\b")),
     ("endpoint:allOrders", re.compile(r"(?i)\ballorders\b")),
@@ -205,10 +290,14 @@ FORBIDDEN_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     # NIT (round 3, documented, not fixed): a bare `op = "DELETE"` assignment with no receiver and
     # no exchange context at all also matches this pattern -- accepted as still-blocked-on-purpose:
     # nothing under src/scripts/deploy/config has a legitimate reason to assign the literal string
-    # "DELETE"/"POST"/"PUT" before phase 5b, and narrowing this pattern to require more context would
-    # reopen exactly the kind of receiver-free verb-literal bypass (`client.request("DELETE", ...)`)
-    # it exists to catch. See `test_known_safe_snippet_op_delete_is_accepted_as_still_blocked`.
-    ("http:verb-literal", re.compile(r"(?i)([\"'])(?:POST|DELETE|PUT)\1")),
+    # "DELETE"/"POST"/"PUT"/"PATCH" before phase 5b, and narrowing this pattern to require more
+    # context would reopen exactly the kind of receiver-free verb-literal bypass
+    # (`client.request("DELETE", ...)`) it exists to catch. See
+    # `test_known_safe_snippet_op_delete_is_accepted_as_still_blocked`.
+    # round 5 (m-6): added `PATCH` -- the string-literal spelling of the verb was missing it even
+    # though `http:verb-enum` right below already covers `HTTPMethod.PATCH`; `client.request("PATCH",
+    # url)` was an undetected gap of exactly the same shape as the POST/DELETE/PUT cases already here.
+    ("http:verb-literal", re.compile(r"(?i)([\"'])(?:POST|DELETE|PUT|PATCH)\1")),
     # round 4: a Binance-style SDK (or this codebase's own house style) can spell the verb as an
     # enum member instead of a string literal -- `HTTPMethod.POST`/`.DELETE`/`.PUT`/`.PATCH`
     # (`http.HTTPMethod` is stdlib since Python 3.11). `GET` is deliberately not in the
@@ -337,7 +426,8 @@ def _blank_allowlisted_string_literals(text: str) -> str:
        triple-quoted-string exclusion documented in the module docstring.
 
     round 4 (MAJOR-C): rule 2 above must NEVER apply to an f-string (a prefix containing ``f``/``F``,
-    e.g. ``f"..."``, ``rf"..."``, ``Rf"..."``). A reviewer found that the house-style read call
+    e.g. ``f"..."``, ``rf"..."``, ``Rf"..."``) by testing the WHOLE raw content for whitespace. A
+    reviewer found that the house-style read call
     ``self._get(f"{prefix or self._read_prefix}/openOrders", ...)`` was being allowed through
     *wholesale* by rule 2 -- the f-string's content as a whole contains spaces (inside the
     ``{prefix or self._read_prefix}`` expression), so the old code treated the entire literal,
@@ -345,11 +435,26 @@ def _blank_allowlisted_string_literals(text: str) -> str:
     backwards for an f-string: the *expression* part (inside ``{...}``) is the part that is never a
     literal endpoint fragment by itself (it is a Python expression, evaluated at runtime), while the
     *literal text* around it (``/openOrders`` here) is exactly the kind of fixed endpoint fragment
-    this guardrail exists to catch, whitespace inside the expression notwithstanding. Fix: for an
-    f-string, never blank for whitespace -- instead blank only the inside of each ``{...}``
-    replacement field (:func:`_blank_fstring_braces`) and leave every other character, including the
-    literal text immediately after a closing ``}``, visible to every pattern below exactly as if it
-    were a plain string with no internal whitespace at all.
+    this guardrail exists to catch, whitespace inside the expression notwithstanding.
+
+    round 5 (m-5): round 4's fix went too far the other way for a GENUINELY prose f-string --
+    ``log.info(f"wrote {fills}/orders")`` has real, human-written whitespace in its literal text
+    (``"wrote "``, before the ``{fills}`` substitution), not just whitespace trapped inside a
+    ``{...}`` expression, and round 4 left it fully exposed to ``path:/order`` because round 4 never
+    blanks an f-string for whitespace at all anymore. The fix: test for whitespace in the LITERAL
+    text only -- the raw content with every ``{...}`` expression span removed outright (not merely
+    blanked to spaces, which would hide real literal whitespace that happens to sit right next to a
+    substitution). If what remains, after removing every expression span, contains a whitespace
+    character, the literal text itself is prose and the WHOLE f-string is blanked wholesale, exactly
+    like a plain string under rule 2. If nothing remains (or nothing but non-whitespace), the
+    f-string is treated as endpoint-shaped exactly as round 4 did: only the replacement fields'
+    insides are blanked, and the literal text (including any tail right after a closing ``}``) stays
+    visible. This is a deliberate, documented half-measure for one remaining shape: a BARE
+    ``f"{x}/orders"`` with no literal whitespace anywhere (e.g. a dynamic filesystem path built
+    purely from a variable and a fixed suffix) is indistinguishable from a real endpoint fragment at
+    the plain-regex level and is therefore still blocked -- see
+    ``test_bare_fstring_path_tail_without_prose_whitespace_is_still_blocked``, which documents this
+    on purpose rather than treating it as a bug.
     """
 
     def repl(match: re.Match[str]) -> str:
@@ -358,6 +463,9 @@ def _blank_allowlisted_string_literals(text: str) -> str:
         else:
             prefix, content, quote = match.group("pfx_sq"), match.group("sq"), "'"
         if "f" in prefix.lower():
+            literal_text_only = _FSTRING_BRACE_RE.sub("", content)
+            if any(ch.isspace() for ch in literal_text_only):
+                return " " * len(match.group(0))
             return prefix + quote + _blank_fstring_braces(content) + quote
         if content in EXACT_STRING_ALLOWLIST or any(ch.isspace() for ch in content):
             return " " * len(match.group(0))

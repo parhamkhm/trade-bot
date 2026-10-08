@@ -249,6 +249,32 @@ def test_skip_predicate_never_skips_in_ci() -> None:
         # added for the same pattern shape.
         "def get_order(self, client_order_id: str) -> OrderStatus: ...\n",
         'class Broker(Protocol):\n    def get_order(self, client_order_id: str) -> OrderStatus: ...\n',
+        # --- round 5 (fourth T6 review: MAJOR-G1, m-5, m-6) false positives ----------------------
+        # MAJOR-G1 part 3: `.post(`/`.delete(` stay receiver-SCOPED (not made receiver-agnostic)
+        # specifically so this one keeps passing -- a receiver-agnostic match would catch ANY
+        # `.post(`, `ledger` included.
+        "ledger.post(entry)\n",
+        # m-5: a prose error message that happens to contain "order/cancel" and "{x}" -- the
+        # LITERAL text outside the `{x}` substitution ("no order/cancel path ...: ") has real
+        # whitespace, so round 5's f-string prose rule blanks the whole literal wholesale.
+        'raise ValueError(f"no order/cancel path ...: {x}")\n',
+        # m-5: same prose rule, a log line built from an f-string -- "wrote " (before `{fills}`) is
+        # real literal whitespace, not whitespace trapped inside a `{...}` expression.
+        'log.info(f"wrote {fills}/orders")\n',
+        # m-5: a bare relative filesystem path with NO leading `/` and no extension -- round 4's
+        # endpoint-shape match had no way to tell this apart from a real `/`-rooted endpoint
+        # fragment; round 5 anchors `path:/order` to a `/`-rooted (or `scheme://host`-rooted) path.
+        'from pathlib import Path\nPath("data/orders")\n',
+        # m-5: the YAML mapping-value shape, a path to a CSV file on disk, not an endpoint -- the
+        # old `path:/order-bare` matched any WORD ending in "orders" (`\b` fires at `.` too, just
+        # like at `/`), not only a whole path segment.
+        "manual_fills: /data/manual_orders.csv\n",
+        # MAJOR-G1 part 2: `literal:order`'s call-context prefix drops its `\b` anchor and matches
+        # "join"/"url"/"endpoint" as a plain substring now -- it must still require the argument to
+        # be EXACTLY the quoted literal "order"/"orders" (`(["'])orders?\1`), not merely contain
+        # "order" as a substring of a longer argument, so a call like `self._url("reorder")` (a
+        # different word, not the bare literal "order") stays unmatched.
+        'self._url("reorder")\n',
     ],
 )
 def test_known_safe_snippets_produce_no_matches(safe_snippet: str) -> None:
@@ -351,6 +377,42 @@ def test_known_safe_snippet_op_delete_is_accepted_as_still_blocked() -> None:
         ('self._client.cancel_replace(client_order_id)', "order-method"),
         # `.delete_order(` with a plain unprefixed receiver name, exactly as a reviewer wrote it.
         ('order_client.delete_order(coid)', "order-method"),
+        # --- round 5 (fourth T6 review: MAJOR-G1, m-5, m-6) true-positive regressions -------------
+        # MAJOR-G1 part 1: the quoted-literal `path:/order` alternative only matched when the
+        # closing quote or another `/`-segment followed `/order(s)` directly -- a query string
+        # tail (`?...`) slipped through entirely.
+        ('"/api/v1/order?"', "path:/order"),
+        ('self._conn.get("/api/v1/order?symbol=" + s)', "path:/order"),
+        # MAJOR-G1 part 1, the exact reviewer repro: a receiver round 4 did not recognize
+        # (`_conn`) PLUS the query-string-tail slip, combined in one call.
+        ('resp = self._conn.post(self._base + "/api/v1/order?" + qs, headers=h)', "path:/order"),
+        ('resp = self._conn.post(self._base + "/api/v1/order?" + qs, headers=h)', "verb-call"),
+        # The scheme-prefix allowance must not have broken the pre-existing full-URL true positive.
+        ('httpx.post("https://api1.tabdeal.org/api/v1/order")', "path:/order"),
+        # MAJOR-G1 part 3: `self._conn.post(...)` alone (no query-string slip) must also be caught
+        # now that `conn` is in `_RECEIVER_RE`.
+        ('self._conn.post(url, json=payload)', "verb-call"),
+        ('self._sess.delete(url)', "verb-call"),
+        ('self._connection.post(url)', "verb-call"),
+        # MAJOR-G1 part 2: the `literal:order` call-context prefix must catch every one of the
+        # reviewer's missed call shapes once the leading `\b` is dropped and `endpoint` is added.
+        ('self._write_url("order")', "order"),
+        ('self._build_url("order")', "order"),
+        ('self.url("order")', "order"),
+        ('self._endpoint("order")', "order"),
+        ('"/".join((p, "order"))', "order"),
+        # m-6: a YAML sequence (list) entry, not a mapping -- `path:/order-bare`'s old `:\s*...`
+        # anchor could not see this at all (there is no colon anywhere on the line).
+        ("- /api/v1/order", "path:/order-bare"),
+        # m-6: PATCH added to the string-literal verb alternation (it was already in verb-enum).
+        ('client.request("PATCH", url)', "verb-literal"),
+        ('client.request("patch", url)', "verb-literal"),
+        # m-5 (documented, intentionally NOT fixed): a bare `{x}/orders` f-string tail with no
+        # literal whitespace anywhere is indistinguishable from a real endpoint fragment at the
+        # plain-regex level and stays blocked on purpose -- see
+        # `test_bare_fstring_path_tail_without_prose_whitespace_is_still_blocked` below for the
+        # fuller explanation; this entry just keeps it covered by the parametrized sweep too.
+        ('f"{fills}/orders"', "path:/order"),
     ],
 )
 def test_known_unsafe_snippets_are_detected(unsafe_snippet: str, expected_pattern_substring: str) -> None:
@@ -438,6 +500,51 @@ def test_plain_non_fstring_whitespace_literal_is_still_blanked_wholesale() -> No
     masked = mask_text('print("verify NO withdrawal permission for /order endpoints")\n')
     assert "withdrawal" not in masked.lower()
     assert "/order" not in masked
+
+
+# ---------------------------------------------------------------------------
+# 2d. round 5 (fourth T6 review, m-5): the f-string "prose" rule -- real literal whitespace
+# OUTSIDE a `{...}` expression span blanks the whole f-string, exactly like a plain string; a
+# bare, whitespace-free `{x}/orders` tail does not and stays scanned (documented, on purpose).
+# ---------------------------------------------------------------------------
+
+
+def test_fstring_literal_prose_whitespace_blanks_whole_literal() -> None:
+    """``log.info(f"wrote {fills}/orders")`` -- the literal text "wrote " (outside the `{fills}`
+    expression) has a real space, so round 5 treats the whole f-string as prose and blanks it
+    wholesale, same as a plain string with a space in it."""
+    from order_code_patterns import mask_text
+
+    masked = mask_text('log.info(f"wrote {fills}/orders")\n')
+    assert "/orders" not in masked
+    assert "fills" not in masked
+    # length/line-count invariant still holds.
+    assert len(masked.splitlines()[0]) == len('log.info(f"wrote {fills}/orders")')
+
+
+def test_fstring_expression_internal_whitespace_alone_is_not_prose() -> None:
+    """Round 4's own fix, re-verified under round 5's refined rule: whitespace trapped INSIDE a
+    `{...}` expression (``{prefix or self._read_prefix}``, which has spaces around ``or``) must
+    NOT by itself make the f-string prose -- only literal text OUTSIDE the braces counts. If this
+    regressed, `/openOrders` would stop being detected again (round 4's whole point)."""
+    from order_code_patterns import mask_text
+
+    masked = mask_text('url = f"{prefix or self._read_prefix}/openOrders"\n')
+    assert "/openOrders" in masked
+    assert "self._read_prefix" not in masked
+
+
+def test_bare_fstring_path_tail_without_prose_whitespace_is_still_blocked() -> None:
+    """Documented, intentional limitation (m-5 decision): a BARE ``f"{x}/orders"`` with no literal
+    whitespace anywhere is indistinguishable from a real endpoint fragment built the same way
+    (``f"{prefix}/openOrders"``) at the plain-regex level this module uses, so it stays blocked --
+    this is NOT a bug, it is the documented trade-off `_blank_allowlisted_string_literals`'s
+    docstring (round 5 section) describes. Contrast with
+    `test_fstring_literal_prose_whitespace_blanks_whole_literal` above, which has real prose
+    whitespace and therefore passes."""
+    findings = find_matches('f"{fills}/orders"\n')
+    assert findings
+    assert any("path:/order" in name for name, _, _ in findings)
 
 
 # ---------------------------------------------------------------------------
@@ -1139,4 +1246,207 @@ def test_settings_json_hook_command_uses_dash_p() -> None:
     command = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
     assert re.search(r"\bpython\s+-P\b", command), (
         f"expected the hook command to invoke 'python -P ...', got: {command!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 6. round 5 (fourth T6 review, N-1): the hook's own module docstring must not claim `path:/order`
+# still needs an `api` token on the same line -- that requirement was dropped in round 4's
+# MAJOR-C fix, and the docstring saying otherwise is now simply wrong, not just stale prose.
+# ---------------------------------------------------------------------------
+
+
+def test_hook_docstring_does_not_claim_path_order_requires_api_token() -> None:
+    text = _HOOK_SCRIPT.read_text(encoding="utf-8")
+    assert "once ``api`` is also on the line" not in text, (
+        "N-1: the hook's module docstring still claims path:/order needs an 'api' token on the "
+        "line -- that requirement was dropped in round 4's MAJOR-C fix (see "
+        "order_code_patterns.py); the docstring must say so, not the opposite."
+    )
+    # The corrected docstring explicitly says the opposite, so this isn't just "the old phrase is
+    # gone" -- the replacement text is actually present and actually correct. Normalize
+    # whitespace/newlines first since the real docstring wraps this sentence across lines.
+    normalized = " ".join(text.split())
+    assert "no longer requires the literal token ``api``" in normalized
+
+
+# ---------------------------------------------------------------------------
+# 7. round 5 (fourth T6 review, MAJOR-G2): the CI "Order-code audit" step's own robustness.
+#
+# pyproject.toml's `[tool.pytest.ini_options]` sets `addopts = "-q ..."`; the pre-round-5 CI step
+# added its OWN `-q` on top, which pytest treats as `-qq` ("no summary line at all"). Combined with
+# a module-level `pytestmark = pytest.mark.xfail(strict=False)` dropped onto this very test file,
+# a REAL failure (e.g. this file's own `test_no_order_code_under_src_scripts_or_deploy` actually
+# detecting injected order code) was reported by pytest as XFAIL, which:
+#   1. printed NOTHING under `-qq` (no "N skipped/xfailed" line, no per-test "XFAIL" line) --
+#      the old `grep -Eq '[0-9]+ (deselected|xfailed|xpassed)'` check had nothing to match;
+#   2. is represented in the JUnit XML as a `<testcase>` with a `<skipped type="pytest.xfail">`
+#      CHILD element -- NOT a `<failure>` -- and the testsuite's own `tests` attribute still counts
+#      it, so the old `tests >= minimum` floor check also passed.
+# Net effect: the whole CI step exited 0 even though a real order-code violation was present and
+# "detected" by the test, just silently swallowed by the xfail marker. Locally reproduced (see this
+# PR's report) by copying this file into a scratch directory, replacing its skipif `pytestmark`
+# with an unstrict `xfail`, injecting an `httpx.post(".../api/v1/order")` call into a scanned file,
+# and running the exact pre-round-5 CI command end to end.
+#
+# The fix (`.github/workflows/ci.yml`): run with `-o addopts="" -o xfail_strict=true -rsxX` (so a
+# summary is actually printed and an unexpectedly-passing xfail is itself a hard failure when the
+# marker does not override it), and replace the `tests >= minimum` floor check with a STRUCTURAL
+# scan of every `<testcase>` in the JUnit XML: fail outright if ANY of them has a `<skipped>`,
+# `<failure>` or `<error>` child (this file must have zero of all three, always), and separately
+# require `passed = tests - skipped - failures - errors >= minimum` as a second, independent guard.
+# `_junit_structural_check` below is a line-for-line port of that inline `python -c` block, kept
+# here only so the ALGORITHM can be exercised against a real pytest run in this test file (the
+# actual enforcement is the workflow's own copy -- `test_ci_workflow_order_audit_step_shape` checks
+# the workflow text directly so the two copies cannot silently drift apart on the flags that matter).
+# ---------------------------------------------------------------------------
+
+
+def _junit_structural_check(xml_path: Path, minimum: int) -> tuple[bool, str]:
+    """Port of `.github/workflows/ci.yml`'s inline JUnit-XML check (round 5, MAJOR-G2).
+
+    Returns ``(ok, message)``. ``ok`` is ``False`` if any ``<testcase>`` has a ``<skipped>``,
+    ``<failure>`` or ``<error>`` child, OR if ``passed`` (tests minus those three) is below
+    ``minimum``.
+    """
+    import xml.etree.ElementTree as ET
+
+    root = ET.parse(xml_path).getroot()
+    suite = root.find("testsuite") if root.tag != "testsuite" else root
+    testcases = suite.findall("testcase") if suite is not None else []
+    tests = len(testcases)
+    skipped = sum(1 for tc in testcases if tc.find("skipped") is not None)
+    failures = sum(1 for tc in testcases if tc.find("failure") is not None)
+    errors = sum(1 for tc in testcases if tc.find("error") is not None)
+    bad = skipped + failures + errors
+    if bad:
+        return False, f"{bad} skipped/failed/errored testcase(s) out of {tests}"
+    passed = tests - skipped - failures - errors
+    if passed < minimum:
+        return False, f"only {passed} passing tests, expected at least {minimum}"
+    return True, f"{passed} tests passed (minimum {minimum})"
+
+
+def _run_pytest_with_ci_audit_flags(target: Path, junit_path: Path) -> subprocess.CompletedProcess[str]:
+    """Run pytest on ``target`` with the EXACT flag set `.github/workflows/ci.yml`'s audit step
+    uses (round 5), writing JUnit XML to ``junit_path``."""
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            str(target),
+            "--noconftest",
+            "-p",
+            "no:cacheprovider",
+            "-o",
+            "addopts=",
+            "-o",
+            "xfail_strict=true",
+            "-rsxX",
+            f"--junitxml={junit_path}",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+def test_junit_structural_check_fails_on_xfail_masked_real_failure(tmp_path: Path) -> None:
+    """The actual MAJOR-G2 proof: a real test failure hidden behind a module-level, unstrict
+    `xfail` marker (exactly the bypass shape a reviewer found) must make the structural check
+    fail, even though pytest's own exit code for the run is 0 and the JUnit `tests` COUNT is
+    unaffected."""
+    mod = tmp_path / "test_fake_audit.py"
+    mod.write_text(
+        "import pytest\n\n"
+        "pytestmark = pytest.mark.xfail(reason='pwned', strict=False)\n\n\n"
+        "def test_a_real_order_code_violation_that_should_fail() -> None:\n"
+        "    assert False, 'stand-in for a real injected order-code violation'\n\n\n"
+        "def test_b_ok() -> None:\n"
+        "    assert True\n",
+        encoding="utf-8",
+    )
+    xml_path = tmp_path / "order_audit.xml"
+    result = _run_pytest_with_ci_audit_flags(mod, xml_path)
+    # pytest itself exits 0 -- xfail(strict=False) on a failing test is not a pytest-level failure.
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    ok, message = _junit_structural_check(xml_path, minimum=2)
+    assert ok is False, f"expected the structural check to catch the xfail-masked failure: {message}"
+    assert "skipped/failed/errored" in message
+
+
+def test_junit_structural_check_passes_on_a_genuinely_clean_run(tmp_path: Path) -> None:
+    """Sanity counterpart: a run with no skips/xfails/failures at or above the floor passes."""
+    mod = tmp_path / "test_fake_audit_clean.py"
+    mod.write_text(
+        "def test_a_ok() -> None:\n    assert True\n\n\ndef test_b_ok() -> None:\n    assert True\n",
+        encoding="utf-8",
+    )
+    xml_path = tmp_path / "order_audit_clean.xml"
+    result = _run_pytest_with_ci_audit_flags(mod, xml_path)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    ok, message = _junit_structural_check(xml_path, minimum=2)
+    assert ok is True, message
+
+
+def test_junit_structural_check_fails_below_floor_even_with_zero_bad() -> None:
+    """The second, independent guard: an empty-but-"successful" run (e.g. a collection error that
+    still exits 0, or a rootdir misconfiguration silently collecting 0 tests) must fail the floor
+    check even though it has zero skipped/failed/errored testcases."""
+    xml_path_text = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<testsuites name="pytest tests">'
+        '<testsuite name="pytest" errors="0" failures="0" skipped="0" tests="0">'
+        "</testsuite></testsuites>"
+    )
+    import tempfile
+
+    with tempfile.NamedTemporaryFile("w", suffix=".xml", delete=False, encoding="utf-8") as fh:
+        fh.write(xml_path_text)
+        empty_xml = Path(fh.name)
+    try:
+        ok, message = _junit_structural_check(empty_xml, minimum=147)
+        assert ok is False
+        assert "only 0 passing tests" in message
+    finally:
+        empty_xml.unlink(missing_ok=True)
+
+
+def test_ci_workflow_order_audit_step_shape() -> None:
+    """Static check on `.github/workflows/ci.yml` itself: the audit step must actually carry the
+    round-5 flags/structure this test file's algorithm assumes, so the inline script and this
+    file's port of it (`_junit_structural_check`) cannot silently drift apart. Also guards against
+    reintroducing the double `-q` (MAJOR-G2's root cause): the step must not pass a bare `-q` of
+    its own now that it resets addopts."""
+    text = (_REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    audit_start = text.index("Order-code audit")
+    audit_end = text.index("- name: Tests (pytest)", audit_start)
+    audit_section = text[audit_start:audit_end]
+
+    assert 'addopts=""' in audit_section, "expected -o addopts=\"\" to reset pyproject's own -q"
+    assert "xfail_strict=true" in audit_section
+    assert "-rsxX" in audit_section
+    assert "--noconftest" in audit_section
+    assert "no:cacheprovider" in audit_section
+    assert "--junitxml" in audit_section
+    assert "uv run python -c" in audit_section, "must use 'uv run python', not a bare interpreter"
+    # the structural per-testcase check: all three failure-shaped child element names must appear.
+    assert "skipped" in audit_section
+    assert "failure" in audit_section
+    assert "error" in audit_section
+    assert "testcase" in audit_section
+
+    # The double-`-q` regression guard (MAJOR-G2's actual root cause): find the `uv run pytest ...`
+    # invocation (it may span multiple lines up to the `| tee`) and confirm it carries no bare `-q`
+    # flag of its own -- pyproject.toml's addopts is reset to "" for this one invocation precisely
+    # so this step owns its flags outright instead of stacking a second `-q` onto the ini's own.
+    pipeline_start = audit_section.index("uv run pytest")
+    pipeline_end = audit_section.index("| tee", pipeline_start)
+    pytest_invocation = audit_section[pipeline_start:pipeline_end]
+    flag_tokens = pytest_invocation.replace("\\\n", " ").split()
+    assert "-q" not in flag_tokens and "-qq" not in flag_tokens, (
+        "the audit step's pytest invocation must not pass a bare -q -- combined with pyproject's "
+        f"own addopts (reset here via -o addopts=\"\", but easy to forget) that is exactly the "
+        f"double -q (-qq, no summary line) that caused MAJOR-G2. tokens={flag_tokens!r}"
     )

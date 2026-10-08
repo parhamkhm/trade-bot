@@ -75,11 +75,13 @@ Phase 7a (manual live, CLAUDE.md section 9) needs a *read-only* signed query -- 
 Parham placed by hand on the Tabdeal UI is actually resting on the book, via signed GET
 ``/r/api/v1/openOrders`` (and possibly ``/r/api/v1/allOrders`` for a closed/filled stop) -- before
 any order-*placement* or order-*cancellation* code exists (that is still phase 5b). This guardrail
-does **not** allow that today: ``endpoint:openOrders`` / ``endpoint:allOrders`` (and ``path:/order``
-once ``api`` is also on the line) block it exactly like a real order-placement call, with no
-distinction for "read-only" vs "write" -- correctly, since this regex-based tool cannot verify a
-call site is actually a GET (see the module's masking limitations) and a wrong allow-list entry
-would quietly reopen the order-write surface it exists to close.
+does **not** allow that today: ``endpoint:openOrders`` / ``endpoint:allOrders`` / ``path:/order``
+block it exactly like a real order-placement call, with no distinction for "read-only" vs "write"
+-- correctly, since this regex-based tool cannot verify a call site is actually a GET (see the
+module's masking limitations) and a wrong allow-list entry would quietly reopen the order-write
+surface it exists to close. (N-1, round 5: ``path:/order`` no longer requires the literal token
+``api`` to also appear on the line -- that requirement was itself a round-3 bypass, dropped in
+round 4's MAJOR-C fix; see ``order_code_patterns.py``'s comment above the pattern.)
 Round 3 (this review) deliberately does **not** add that allow-list: it would need (a) a pattern
 that matches *only* a signed GET to exactly ``/r/api/v1/openOrders``/``/r/api/v1/allOrders`` and
 nothing else shaped like it, and (b) a reviewed, narrow reconciliation module to use it in (neither
