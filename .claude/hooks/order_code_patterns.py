@@ -106,21 +106,38 @@ __all__ = [
 # `http:verb-call`, false positives here are not a concern because the method names themselves
 # (`new_order`, `cancel_all_orders`, `new_oco_order`, ...) are not realistic names for anything other
 # than placing/cancelling exchange orders.
-_RECEIVER_RE = r"(?<![A-Za-z0-9])_?(?:http|client|session|httpx|requests)(?:_?client|_?session)?"
+#
+# round 4: widened the base-word alternation to also cover `api`, `rest`, `transport` and
+# `aiohttp` receivers (reviewer repro: `self._api.post(...)`, `self._rest.post(...)`,
+# `transport.post(...)`, `self._aiohttp.post(...)` -- a house-style receiver name that is not
+# literally `http`/`client`/`session`/`httpx`/`requests` but is just as much an HTTP client).
+# Same negative-lookbehind + "must be followed immediately by `.`" shape as before, so this does
+# NOT reopen the round-3 false positives: `api_client.get(...)` still fails to match `http:verb-call`
+# because `api` must be followed immediately by `.` (not `_client`), exactly like `client_cache.put`
+# before it.
+_RECEIVER_RE = (
+    r"(?<![A-Za-z0-9])_?(?:http|client|session|httpx|requests|api|rest|transport|aiohttp)"
+    r"(?:_?client|_?session)?"
+)
 
-# `path:/order` additionally requires the literal token `api` to appear somewhere on the same
-# (masked) line (case-insensitive, word-bounded) -- round 3's reviewer-found false positives
-# `Path("data/orders.csv")` and `avg = total/orders` both contain a bare `/order(s)` substring with
-# the SAME word-boundary shape as a real endpoint (`/api/v1/orders`), so the boundary check alone
-# (round 2's fix) cannot tell a URL path apart from a local file path or a division expression.
-# Every real Tabdeal endpoint in this codebase is reached through `/api/v1/...` or `/r/api/v1/...`
-# (CLAUDE.md section 6 / `config/default.yaml`'s `read_prefix`/`write_prefix`) -- "the line also says
-# api somewhere" is therefore a cheap, well-justified proxy for "this is a URL path, not a local file
-# path or an arithmetic expression". Accepted gap (documented, same category as the module
-# docstring's others): an endpoint literally split across `BASE = "https://api1.tabdeal.org"` on one
-# line and `PATH = "/v1/order"` on another, with no `api` token on the second line, would bypass this
-# specific pattern -- `http:verb-call`/`http:verb-literal`/`sdk:order-method-call` still catch the
-# call itself once those two pieces are actually used to make a request.
+# `path:/order` (round 4, MAJOR-C fix): round 3's "`api` must also appear on the same line" proxy
+# was itself a bypass -- `ORDER_PATH = "/order"` on its own line has no `api` token anywhere near
+# it, so the round-3 pattern missed it outright, and the reviewer additionally found that an
+# f-string tail like `f"{prefix or self._write_prefix}/order"` never even reached the "same line"
+# check because the whole f-string got blanked first (see MINOR-5 / `_blank_fstring_braces` below).
+# Round 4 drops the `api`-same-line requirement and instead matches the *shape* of an endpoint
+# literal directly: a quoted literal whose content ends with `/order`/`/orders`, or contains
+# `/order/`/`/orders/` as a substring (so `"/order"`, `"/api/v1/orders"` and `"/order/oco"` all
+# match), plus the equivalent "f-string tail" shape -- text starting right after a blanked `{...}`
+# replacement field's closing `}` and ending the same way, since an f-string's literal portion is no
+# longer blanked away by the whitespace-exemption (round 4 fix #2). This still correctly rejects
+# round 3's false positives: `Path("data/orders.csv")` ends with `.csv`, not `/order`/`/orders`, and
+# `avg = total/orders` has no quotes (and no `/` immediately before `order` inside quotes) at all.
+# A second, narrower alternative (`path:/order-bare`) covers the unquoted YAML/TOML shape
+# `order_path: /order` -- a bare scalar value with no quotes at all, which the quoted-literal
+# pattern cannot see. Every real Tabdeal endpoint in this codebase is `/api/v1/...` or
+# `/r/api/v1/...` (CLAUDE.md section 6); neither alternative requires the literal token `api`
+# anymore, since that requirement is exactly what round 3's bypass exploited.
 #
 # `literal:order` is scoped to a bare `"order"`/`"orders"` string literal passed as an argument to a
 # path-building call (`*.join(...)`, `*_url(...)`, `*urljoin(...)`) -- not a blanket
@@ -136,7 +153,19 @@ _RECEIVER_RE = r"(?<![A-Za-z0-9])_?(?:http|client|session|httpx|requests)(?:_?cl
 # `WITHDRAWAL = "withdrawal"` (a ledger-entry-type constant, not a call to anything) has no `/` and
 # so no longer matches.
 FORBIDDEN_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("path:/order", re.compile(r"(?i)^(?=.*\bapi\b)(?=.*/orders?(?:/|\b)).*$")),
+    (
+        "path:/order",
+        re.compile(
+            r"(?i)([\"'])[^\"'\s]*/orders?(?:/[^\"'\s]*)?\1"
+            r"|\}[^\"'\s{}]*/orders?(?:/[^\"'\s]*)?\b"
+        ),
+    ),
+    # round 4: the YAML/TOML shape -- a bare (unquoted) scalar value, e.g. `order_path: /order` --
+    # which the quoted-literal alternative above cannot see at all (there are no quote characters
+    # on that line). Scoped to "right after a colon" so it does not fire on an unrelated division
+    # expression or a type-annotated assignment (`ratio: float = total/orders` has text between the
+    # colon and the `/`, which this pattern -- anchored at `:\s*` -- does not skip over).
+    ("path:/order-bare", re.compile(r"(?i):\s*[\"']?/[\w/]*orders?\b")),
     ("path:order/", re.compile(r"(?i)\border/")),
     (
         "literal:order",
@@ -165,24 +194,41 @@ FORBIDDEN_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         re.compile(rf"(?i){_RECEIVER_RE}\.withdraw\w*\s*\("),
     ),
     ("http:method-kwarg", re.compile(r'(?i)method\s*=\s*["\'](?:post|delete|put)["\']')),
-    # Case-SENSITIVE by design (no `(?i)`): a bare quoted HTTP-verb literal passed positionally,
-    # e.g. `client.request("POST", ORDER_PATH)` or `client.stream("POST", url)`. Exact uppercase
-    # only, matching how Binance-style exchange APIs spell the verb; "GET" is deliberately not in
-    # the alternation (`tabdeal_client.py` uses `method="GET"` throughout and must stay allowed).
+    # A bare quoted HTTP-verb literal passed positionally, e.g. `client.request("POST", ORDER_PATH)`,
+    # `client.stream("POST", url)` or `client.request("post", url)`. Round 3 made this
+    # case-SENSITIVE (uppercase only) specifically so "GET" could never match -- but a reviewer
+    # found that was over-tight: it also meant a lowercase/mixed-case positional verb literal
+    # (`client.request("post", url)`) was never caught at all. Round 4 makes the match
+    # case-INSENSITIVE instead (matching every other pattern in this module); "GET" still can
+    # never match because it is simply not one of the three alternatives, in any case -- the
+    # original safety property came from the alternation's contents, not from case-sensitivity.
     # NIT (round 3, documented, not fixed): a bare `op = "DELETE"` assignment with no receiver and
     # no exchange context at all also matches this pattern -- accepted as still-blocked-on-purpose:
     # nothing under src/scripts/deploy/config has a legitimate reason to assign the literal string
     # "DELETE"/"POST"/"PUT" before phase 5b, and narrowing this pattern to require more context would
     # reopen exactly the kind of receiver-free verb-literal bypass (`client.request("DELETE", ...)`)
     # it exists to catch. See `test_known_safe_snippet_op_delete_is_accepted_as_still_blocked`.
-    ("http:verb-literal", re.compile(r"([\"'])(?:POST|DELETE|PUT)\1")),
+    ("http:verb-literal", re.compile(r"(?i)([\"'])(?:POST|DELETE|PUT)\1")),
+    # round 4: a Binance-style SDK (or this codebase's own house style) can spell the verb as an
+    # enum member instead of a string literal -- `HTTPMethod.POST`/`.DELETE`/`.PUT`/`.PATCH`
+    # (`http.HTTPMethod` is stdlib since Python 3.11). `GET` is deliberately not in the
+    # alternation, same reasoning as `http:verb-literal` above.
+    ("http:verb-enum", re.compile(r"\bHTTPMethod\.(?:POST|DELETE|PUT|PATCH)\b")),
     (
         "sdk:order-method-call",
         re.compile(
             r"(?i)\.(?:new_order|create_order|cancel_order|cancel_all_orders|cancel_open_orders|"
-            r"place_order|new_oco_order|create_\w*_order|withdraw)\s*\("
+            r"place_order|new_oco_order|create_\w*_order|withdraw|delete_order|cancel_replace)\s*\("
         ),
     ),
+    # round 4: `delete_order`/`cancel_replace` added above (reviewer-found missed SDK method
+    # names). Deliberately did NOT add `get_order` or `query_order`: `src/tbot/core/types.py`'s
+    # `Broker` protocol already defines `get_order(self, client_order_id: str) -> OrderStatus`
+    # (a *read*, not a placement/cancellation -- CLAUDE.md section 5) -- adding it here would
+    # make the guardrail block its own pre-approved contract. `query_order` was checked
+    # (`grep -rn` over src/scripts/deploy/config) and does not appear anywhere today; it is left
+    # out rather than guessed at, consistent with this module's "add a pattern when a concrete
+    # bypass is found, not speculatively" approach (see the module docstring's closing paragraph).
     ("param:newClientOrderId", re.compile(r"(?i)newclientorderid")),
     ("param:origClientOrderId", re.compile(r"(?i)origclientorderid")),
     ("param:listClientOrderId", re.compile(r"(?i)listclientorderid")),
@@ -209,9 +255,36 @@ EXACT_STRING_ALLOWLIST: frozenset[str] = frozenset({"canWithdraw", "WITHDRAW", "
 # ---------------------------------------------------------------------------
 
 _TRIPLE_QUOTED_RE = re.compile(r'"""(?:.|\n)*?"""|\'\'\'(?:.|\n)*?\'\'\'')
+# round 4 (MAJOR-C, part 2): the prefix group (0-2 letters, e.g. `f`, `F`, `rf`, `Rf`) is captured
+# so `repl` below can tell an f-string literal apart from a plain one -- see
+# `_blank_allowlisted_string_literals`. It only captures when those letters sit *immediately*
+# before the quote with nothing in between (how every real string prefix in Python source looks);
+# `foo("bar")` cannot accidentally have "oo" read as a prefix for `"bar"` because the `(` between
+# them breaks that adjacency, and `re.finditer`'s normal leftmost-first scanning still finds the
+# correct (empty-prefix) match starting at the quote itself.
 _QUOTED_STRING_RE = re.compile(
-    r'"([^"\\\n]*(?:\\.[^"\\\n]*)*)"' r"|'([^'\\\n]*(?:\\.[^'\\\n]*)*)'"
+    r'(?P<pfx_dq>[A-Za-z]{0,2})"(?P<dq>[^"\\\n]*(?:\\.[^"\\\n]*)*)"'
+    r"|(?P<pfx_sq>[A-Za-z]{0,2})'(?P<sq>[^'\\\n]*(?:\\.[^'\\\n]*)*)'"
 )
+
+# round 4: matches one *non-nested* `{...}` replacement field inside an f-string's content. Nested
+# braces (a dict literal inside an f-string expression, e.g. `f"{ {1: 2} }"`) are not handled --
+# same "forgiving regex, not a parser" trade-off as the rest of this module (see the module
+# docstring); nothing in src/scripts/deploy/config does this today.
+_FSTRING_BRACE_RE = re.compile(r"\{[^{}\n]*\}")
+
+
+def _blank_fstring_braces(content: str) -> str:
+    """Blank the inside of every ``{...}`` replacement field in f-string ``content``, keeping the
+    braces themselves and all literal text outside them untouched (same length in, same length
+    out, so the overall match length -- and therefore line positions -- never changes).
+    """
+
+    def _r(m: re.Match[str]) -> str:
+        inner = m.group(0)
+        return "{" + " " * (len(inner) - 2) + "}"
+
+    return _FSTRING_BRACE_RE.sub(_r, content)
 
 
 def _blank_preserving_newlines(match: re.Match[str]) -> str:
@@ -248,7 +321,7 @@ def _strip_line_comments(text: str) -> str:
 def _blank_allowlisted_string_literals(text: str) -> str:
     """Blank quoted string-literal content that cannot be exchange code.
 
-    Two independent reasons a quoted literal is allowed through unscanned:
+    Two independent reasons a *plain* (non-f) quoted literal is allowed through unscanned:
 
     1. Exact match against :data:`EXACT_STRING_ALLOWLIST` (specific known-safe field/value names,
        see its docstring).
@@ -262,10 +335,30 @@ def _blank_allowlisted_string_literals(text: str) -> str:
        Accepted trade-off: a deliberately space-padded fake endpoint (``"/api/v1/ order"``) would
        also be allowed through; this is the same category of intentional-evasion gap as the
        triple-quoted-string exclusion documented in the module docstring.
+
+    round 4 (MAJOR-C): rule 2 above must NEVER apply to an f-string (a prefix containing ``f``/``F``,
+    e.g. ``f"..."``, ``rf"..."``, ``Rf"..."``). A reviewer found that the house-style read call
+    ``self._get(f"{prefix or self._read_prefix}/openOrders", ...)`` was being allowed through
+    *wholesale* by rule 2 -- the f-string's content as a whole contains spaces (inside the
+    ``{prefix or self._read_prefix}`` expression), so the old code treated the entire literal,
+    ``/openOrders`` tail included, as "a human-readable message" and blanked it completely. That is
+    backwards for an f-string: the *expression* part (inside ``{...}``) is the part that is never a
+    literal endpoint fragment by itself (it is a Python expression, evaluated at runtime), while the
+    *literal text* around it (``/openOrders`` here) is exactly the kind of fixed endpoint fragment
+    this guardrail exists to catch, whitespace inside the expression notwithstanding. Fix: for an
+    f-string, never blank for whitespace -- instead blank only the inside of each ``{...}``
+    replacement field (:func:`_blank_fstring_braces`) and leave every other character, including the
+    literal text immediately after a closing ``}``, visible to every pattern below exactly as if it
+    were a plain string with no internal whitespace at all.
     """
 
     def repl(match: re.Match[str]) -> str:
-        content = match.group(1) if match.group(1) is not None else match.group(2)
+        if match.group("dq") is not None:
+            prefix, content, quote = match.group("pfx_dq"), match.group("dq"), '"'
+        else:
+            prefix, content, quote = match.group("pfx_sq"), match.group("sq"), "'"
+        if "f" in prefix.lower():
+            return prefix + quote + _blank_fstring_braces(content) + quote
         if content in EXACT_STRING_ALLOWLIST or any(ch.isspace() for ch in content):
             return " " * len(match.group(0))
         return match.group(0)

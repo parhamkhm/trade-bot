@@ -218,6 +218,37 @@ def test_skip_predicate_never_skips_in_ci() -> None:
         "client_cache.put(k, v)\n",
         "session_store.put(x, y)\n",
         "requests_seen.put(rid)\n",
+        # --- round 4 (MAJOR-C fix + m-c/m-e review): false positives the round-4 fix set must
+        # NOT reopen ------------------------------------------------------------------------------
+        # `path:/order` dropped the "api on the same line" requirement; re-verify its round-3
+        # false positives still pass under the new endpoint-shaped-literal pattern.
+        'from pathlib import Path\nPath("data/orders.csv")\n',
+        'avg = total/orders\n',
+        'df.sort_values("order")\n',
+        'table = "orders"\n',
+        # `path:/order-bare` (new, YAML/TOML-shaped) must not fire on a type-annotated assignment
+        # or a bare division expression that merely happens to contain a colon elsewhere.
+        'ratio: float = total/orders\n',
+        # The real `tabdeal_client.py` house-style f-string reads -- round 4 stops blanking an
+        # f-string's literal text for "contains whitespace" (that whitespace lives inside the
+        # `{...}` expression, not the literal tail), so these must stay clean on their own merit,
+        # not because the whole string got blanked.
+        'self._get(f"{prefix or self._read_prefix}/trades", lambda: {"symbol": symbol})\n',
+        'return self._get(f"{prefix or self._read_prefix}/depth", lambda: {"symbol": symbol})\n',
+        'return self._get(f"{prefix or self._read_prefix}/exchangeInfo", lambda: {})\n',
+        'return self._get(f"{prefix or self._read_prefix}/ping", lambda: {})\n',
+        'return self._get(f"{prefix or self._read_prefix}/time", lambda: {})\n',
+        'return self._get(f"{prefix or self._read_prefix}/account", _build, signed=True)\n',
+        # The widened `_RECEIVER_RE` (round 4 adds api/rest/transport/aiohttp) must not reopen the
+        # round-3 "receiver that merely starts with a base word" gap for the new words either.
+        "api_client.get(x)\n",
+        "rest_store.put(x, y)\n",
+        "transportation.post(x)\n",
+        # `get_order` (core/types.py's Broker protocol) must still pass -- round 4 deliberately did
+        # NOT add it to `sdk:order-method-call` even though `delete_order`/`cancel_replace` were
+        # added for the same pattern shape.
+        "def get_order(self, client_order_id: str) -> OrderStatus: ...\n",
+        'class Broker(Protocol):\n    def get_order(self, client_order_id: str) -> OrderStatus: ...\n',
     ],
 )
 def test_known_safe_snippets_produce_no_matches(safe_snippet: str) -> None:
@@ -281,6 +312,45 @@ def test_known_safe_snippet_op_delete_is_accepted_as_still_blocked() -> None:
         ('self.place_order(req)', "order-method"),
         ('client.new_oco_order(**params)', "order-method"),
         ('client.create_stop_limit_order(**params)', "order-method"),
+        # --- round 4 additions (MAJOR-C fix + m-c/m-e review) ------------------------------------
+        # `path:/order` regression: a bare module-level constant with no `api` token anywhere on
+        # the line (round 3's bypass).
+        ('ORDER_PATH = "/order"', "path:/order"),
+        ('BASE = "https://api1.tabdeal.org"\nurl = BASE + "/order"', "path:/order"),
+        # The YAML/TOML-shaped bare (unquoted) path value.
+        ('order_path: /order', "path:/order-bare"),
+        # f-string masking regression: round 3's whitespace-exemption blanked the WHOLE f-string
+        # (including the literal `/openOrders`/`/order` tail) just because the `{...}` expression
+        # contained spaces.
+        (
+            'self._get(f"{prefix or self._read_prefix}/openOrders", lambda: {})',
+            "openOrders",
+        ),
+        (
+            'return self._request(HTTPMethod.DELETE, f"{prefix or self._write_prefix}/order", '
+            'lambda: {"symbol": symbol, "orderId": order_id}, signed=True)',
+            "path:/order",
+        ),
+        # `HTTPMethod.POST`/`.DELETE`/`.PUT`/`.PATCH` enum-member verb spelling.
+        ('self._request(HTTPMethod.DELETE, url)', "verb-enum"),
+        ('self._request(HTTPMethod.POST, url)', "verb-enum"),
+        ('self._request(HTTPMethod.PUT, url)', "verb-enum"),
+        ('self._request(HTTPMethod.PATCH, url)', "verb-enum"),
+        # Lowercase/mixed-case positional verb literal (round 3 made `http:verb-literal`
+        # case-sensitive-uppercase-only, which missed this).
+        ('client.request("post", url)', "verb-literal"),
+        ('client.request("Post", url)', "verb-literal"),
+        ('client.stream("delete", url)', "verb-literal"),
+        # Widened receivers: `_api`, `_rest`, `transport`, `_aiohttp`.
+        ('self._api.post(url, json=payload)', "verb-call"),
+        ('self._rest.post(url)', "verb-call"),
+        ('transport.post(url)', "verb-call"),
+        ('self._aiohttp.post(url)', "verb-call"),
+        # New SDK method names.
+        ('self.delete_order(client_order_id)', "order-method"),
+        ('self._client.cancel_replace(client_order_id)', "order-method"),
+        # `.delete_order(` with a plain unprefixed receiver name, exactly as a reviewer wrote it.
+        ('order_client.delete_order(coid)', "order-method"),
     ],
 )
 def test_known_unsafe_snippets_are_detected(unsafe_snippet: str, expected_pattern_substring: str) -> None:
@@ -290,6 +360,84 @@ def test_known_unsafe_snippets_are_detected(unsafe_snippet: str, expected_patter
         f"expected a finding whose pattern name mentions {expected_pattern_substring!r}, "
         f"got {[n for n, _, _ in findings]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 2b. round 4 (MAJOR-C): the two exact reviewer-reported regression snippets, verbatim.
+# ---------------------------------------------------------------------------
+
+# Exactly as the third T6 review reported it: a bare path constant with no `api` token nearby,
+# then a receiver (`self._api`) round 3's `_RECEIVER_RE` did not recognize at all.
+_SNIPPET_B = (
+    'ORDER_PATH = "/order"\n'
+    "resp = self._api.post(self._prefix + ORDER_PATH, data={\"symbol\": symbol, \"side\": \"BUY\", "
+    '"type": "MARKET", "quantity": qty})\n'
+)
+
+# Exactly as the third T6 review reported it: `tabdeal_client.py`'s own house style
+# (`self._request(HTTPMethod.<VERB>, f"{prefix or self._write_prefix}/order", ...)`), which round
+# 3 missed in both rounds because the f-string's `/order` tail was blanked wholesale (MINOR-5
+# whitespace exemption) and the verb was an enum member, not a string literal.
+_SNIPPET_A = (
+    "request = self._http.build_request(method, target, params=build())\n"
+    'return self._request(HTTPMethod.DELETE, f"{prefix or self._write_prefix}/order", '
+    'lambda: {"symbol": symbol, "orderId": order_id}, signed=True)\n'
+    'return self._request(HTTPMethod.POST, f"{prefix or self._write_prefix}/order", '
+    'lambda: {"quoteOrderQty": q}, signed=True)\n'
+)
+
+
+def test_snippet_b_receiver_and_bare_path_constant_is_blocked() -> None:
+    findings = find_matches(_SNIPPET_B)
+    names = {name for name, _, _ in findings}
+    assert "path:/order" in names, findings
+    assert any("verb-call" in name for name in names), findings
+
+
+def test_snippet_a_house_style_http_method_enum_and_fstring_tail_is_blocked() -> None:
+    findings = find_matches(_SNIPPET_A)
+    names = {name for name, _, _ in findings}
+    assert "path:/order" in names, findings
+    assert any("verb-enum" in name for name in names), findings
+
+
+def test_snippet_a_and_b_hook_subprocess_blocks_write() -> None:
+    """End-to-end (not just the shared pattern module): the real hook, run as a subprocess against
+    a synthetic Write payload, blocks both exact regression snippets."""
+    for snippet in (_SNIPPET_A, _SNIPPET_B):
+        payload = {
+            "tool_name": "Write",
+            "tool_input": {"file_path": "src/tbot/execution/evil.py", "content": snippet},
+        }
+        result = _run_hook(payload, project_dir=_REPO_ROOT)
+        assert result.returncode == 2, (snippet, result.stdout, result.stderr)
+
+
+# ---------------------------------------------------------------------------
+# 2c. round 4: unit coverage for the new f-string-aware masking mechanism itself.
+# ---------------------------------------------------------------------------
+
+
+def test_fstring_brace_content_is_blanked_but_literal_tail_survives() -> None:
+    from order_code_patterns import mask_text
+
+    masked = mask_text('url = f"{prefix or self._read_prefix}/openOrders"\n')
+    # the expression content must be gone...
+    assert "self._read_prefix" not in masked
+    # ...but the literal tail must survive untouched.
+    assert "/openOrders" in masked
+    # and the overall line length (hence every later line-number computation) is unchanged.
+    assert len(masked.splitlines()[0]) == len('url = f"{prefix or self._read_prefix}/openOrders"')
+
+
+def test_plain_non_fstring_whitespace_literal_is_still_blanked_wholesale() -> None:
+    """The round-4 fix is scoped to f-strings only -- a PLAIN string with a space in it (a log
+    line, a CLI warning) must still be blanked wholesale, exactly as before round 4."""
+    from order_code_patterns import mask_text
+
+    masked = mask_text('print("verify NO withdrawal permission for /order endpoints")\n')
+    assert "withdrawal" not in masked.lower()
+    assert "/order" not in masked
 
 
 # ---------------------------------------------------------------------------

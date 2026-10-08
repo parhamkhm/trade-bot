@@ -22,15 +22,15 @@ Only two things ever get blocked:
    lookup: it has to survive being edited from a different worktree, a differently-cased drive
    letter, or a Git-Bash-style path, not just the one shape a payload "should" arrive in.
 2. **Order-code patterns** (see ``order_code_patterns.py``) newly introduced into a file whose
-   normalized path has ``src``, ``scripts`` or ``deploy`` as one of its directory segments (see
-   ``is_in_scope``). "Newly introduced" matters for ``Edit``/``MultiEdit``: the new text
+   normalized path has ``src``, ``scripts``, ``deploy`` or ``config`` as one of its directory
+   segments (see ``is_in_scope``). "Newly introduced" matters for ``Edit``/``MultiEdit``: the new text
    (``new_string``) is compared against the old text (``old_string``) for the same edit, and only
    a match that is NOT already present in the old text blocks the call -- editing an unrelated
    line of a file is never blocked by pre-existing text (there is none today; see the audit test).
    ``Write`` and ``NotebookEdit`` have no "old" counterpart in the payload, so their full new
    content is scanned directly.
 
-Everything else -- a path with none of those three segments, a tool other than
+Everything else -- a path with none of those four segments, a tool other than
 ``Write``/``Edit``/``MultiEdit``/``NotebookEdit``, or ``TBOT_ALLOW_ORDER_CODE=1`` for a
 non-self-protected path -- is allowed (exit 0).
 
@@ -108,9 +108,19 @@ sys.dont_write_bytecode = True
 
 # Importable whether invoked as `python block_order_code.py` (script dir on sys.path by default)
 # or from an odd cwd -- make sure the sibling module is reachable either way.
+# round 4 (docstring/CI review, m-c): `append`, never `insert(0, ...)` -- `.claude/settings.json`
+# invokes this script with `python -P`, which already stops CPython from prepending the script's
+# own directory to `sys.path` at startup (see the audit test's round-3 section 5,
+# `test_hook_command_with_dash_p_defeats_json_shadow_attack`, for the attack `-P` defeats). Putting
+# `_HOOK_DIR` at the FRONT of `sys.path` here would silently reintroduce the same shadowing risk
+# `-P` exists to close for every import this module makes AFTER this line (not just the stdlib
+# `json` imported above it) -- a malicious sibling module under `.claude/hooks/` would then be
+# found before the real one even with `-P` on the command line. Appending instead means a sibling
+# module only shadows something if nothing earlier on `sys.path` (the real stdlib/site-packages)
+# already provides it -- exactly the posture `-P` establishes for the rest of the interpreter.
 _HOOK_DIR = Path(__file__).resolve().parent
 if str(_HOOK_DIR) not in sys.path:
-    sys.path.insert(0, str(_HOOK_DIR))
+    sys.path.append(str(_HOOK_DIR))
 
 from order_code_patterns import Finding, find_matches  # noqa: E402
 
@@ -160,7 +170,7 @@ _EXTENDED_LENGTH_PREFIX = "\\\\?\\"
 _MSYS_ABS_RE = re.compile(r"^/([A-Za-z])(/.*)?$")
 _DRIVE_RE = re.compile(r"^[A-Za-z]:/")
 
-_GUARDRAIL_REFERENCE = "CLAUDE.md section 3.6 / SPEC D-052"
+_GUARDRAIL_REFERENCE = "CLAUDE.md section 3.6 / SPEC D-052, D-055"
 
 
 def _to_posix(path: str) -> str:
@@ -328,6 +338,28 @@ def is_self_protected(full_path: str) -> bool:
        even though ``notatests`` is a different directory from ``tests``. Requiring the character
        immediately before the suffix to be a ``/`` (or the suffix to be the entire path) fixes
        that boundary.
+
+    Round 4 (documented, NOT fixed -- accepted adversarial limitation, same category as the
+    module docstring's "fail-closed policy" gaps): Windows' legacy 8.3 short-name aliasing can
+    give a directory or file a second, auto-generated short name -- e.g. ``.claude`` could be
+    addressed as ``CLAUD~1`` on an NTFS volume with 8.3 name generation enabled (it is disabled by
+    default on modern Windows Server/Ubuntu-hosted volumes, but not guaranteed off on every
+    developer machine or externally-mounted drive). This hook does zero OS-level path resolution
+    by design (see ``normalize_path``'s docstring: purely lexical, never a symlink/short-name
+    lookup), so a payload naming ``.claude/hooks/block_order_code.py`` via its 8.3 short-name
+    equivalent would not casefold-match any entry in ``_PROTECTED_SUFFIXES`` nor trip
+    ``_is_under_hooks_dir``, and would therefore NOT be recognized as self-protected by this
+    function. Resolving 8.3 short names correctly needs a real Windows API call
+    (``GetLongPathNameW`` or equivalent) -- out of scope for a dependency-free, cross-platform
+    (Windows/Linux CI/Ubuntu server) stdlib-only hook, and the kind of call Claude Code's own
+    sandboxed hook execution may not even permit. Mitigations that still apply regardless of this
+    gap: (a) the pytest audit test (``tests/test_order_code_audit.py``) plus the CI step are the
+    *binding* enforcement per the module docstring -- they scan real file content on disk by its
+    real path, not a path string handed in by a tool-call payload, so a short-name-addressed edit
+    that actually lands on ``block_order_code.py``/``order_code_patterns.py`` still shows up as a
+    diff to a protected file in code review; (b) CLAUDE.md section 9/12 keeps Parham in the loop
+    for every change under ``risk/``/``execution/`` and before phase 5b regardless of what this
+    hook alone can catch.
     """
     cf_path = full_path.casefold()
     for suffix in _PROTECTED_SUFFIXES:

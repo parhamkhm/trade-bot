@@ -35,20 +35,54 @@ jobs:
       - name: Types (mypy; strict on core/risk/execution)
         run: uv run mypy
 
-      - name: Order-code audit (CLAUDE.md section 3.6 / SPEC D-052)
+      - name: Order-code audit (CLAUDE.md section 3.6 / SPEC D-052, D-055)
         run: |
           set -o pipefail
-          env -u TBOT_ALLOW_ORDER_CODE uv run pytest tests/test_order_code_audit.py -q -rs | tee order_audit.log
+          # round 4 (m-e review): `--noconftest` so a future conftest.py change (a marker-based
+          # skip, a collection hook, an autouse fixture that happens to deselect something) cannot
+          # silently shrink what this binding-enforcement step actually runs -- verified against
+          # this repo's tests/conftest.py: the audit tests manage their own TBOT_ALLOW_ORDER_CODE
+          # env var explicitly (see `_run_hook`) and touch neither the real-network guard nor the
+          # holdout-log redirect conftest.py installs, so skipping conftest.py here changes
+          # nothing about what they actually verify. `-p no:cacheprovider` avoids writing/reading
+          # .pytest_cache across CI runs for this one-off step. `pyproject.toml`'s
+          # `[tool.pytest.ini_options]` (testpaths/addopts/markers) is an ini file, not a
+          # conftest.py, so `--noconftest` does not affect it.
+          env -u TBOT_ALLOW_ORDER_CODE uv run pytest tests/test_order_code_audit.py \
+            --noconftest -p no:cacheprovider -q -rs --junitxml=order_audit.xml | tee order_audit.log
           # NIT (round 3): a plain `grep -qi "skipped"` would also fire on any incidental line
           # that happens to contain the substring "skipped" (e.g. a future test name or docstring
           # excerpt pytest echoes back) with no real skip having occurred -- a false alarm that
           # would fail CI for the wrong reason. Match only pytest's actual skip-report shapes: a
           # per-test "SKIPPED [...]" line (`-rs`) at the start of a line, or the run summary's
           # "N skipped" count.
-          if grep -Eq '^SKIPPED|[0-9]+ skipped' order_audit.log; then
-            echo "::error::order-code audit test(s) were skipped in CI -- this must never happen (CLAUDE.md section 3.6 / SPEC D-052)"
+          # round 4 (m-e review): a deselected, xfailed or xpassed test is the same kind of
+          # silent-shrinkage risk as a skipped one -- none of them fail the pytest exit code on
+          # their own, so without this check a future `-k`/`--deselect`/`@pytest.mark.xfail` added
+          # to this file (by accident or otherwise) would quietly reduce the binding enforcement
+          # while CI still goes green.
+          if grep -Eq '^SKIPPED|[0-9]+ skipped' order_audit.log || grep -Eq '[0-9]+ (deselected|xfailed|xpassed)' order_audit.log; then
+            echo "::error::order-code audit test(s) were skipped/deselected/xfailed/xpassed in CI -- this must never happen (CLAUDE.md section 3.6 / SPEC D-052, D-055)"
             exit 1
           fi
+          # round 4 (m-e review): a minimum-passed-tests floor via the JUnit XML's own `tests`
+          # count -- independent of exit-code/grep-based checks, so an empty-but-"successful" run
+          # (e.g. a collection error that still exits 0, or a rootdir/path misconfiguration that
+          # makes pytest silently collect 0 tests from the wrong location) is also caught. 147 is
+          # the exact test count in tests/test_order_code_audit.py as of this fix
+          # (fix/guardrail-round4, round 4 of the T6 guardrail review) -- bump this number in the
+          # SAME commit/PR whenever a new test is added to that file; never lower it.
+          python -c "
+          import sys
+          import xml.etree.ElementTree as ET
+          minimum = 147
+          suite = ET.parse('order_audit.xml').getroot().find('testsuite')
+          tests = int(suite.get('tests', '0')) if suite is not None else 0
+          if tests < minimum:
+              print(f'::error::order-code audit ran only {tests} tests, expected at least {minimum}')
+              sys.exit(1)
+          print(f'order-code audit: {tests} tests ran (minimum {minimum})')
+          "
 
       - name: Tests (pytest)
         run: uv run pytest
