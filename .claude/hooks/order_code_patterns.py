@@ -82,16 +82,66 @@ __all__ = [
 # would flag every `Protocol` base class in the codebase.
 #
 # `http:verb-call` / `http:withdraw-call` are deliberately scoped to receivers that *look* like an
-# HTTP client (`http...`, `client...`, `session...`, `httpx...`, `requests...`, `_http...`) so that
-# `self._events.put(event)`, `await queue.put(x)`, `ledger.post(entry)` and
-# `portfolio.record_withdrawal(...)` all pass -- none of those receivers matches the prefix list.
-# Coverage for a *generic* verb-call regardless of receiver name (e.g. `client.request("POST", ...)`,
-# `posixpath.join(prefix, "order")`, a bare `"/api/v1/orders"` path string) comes from the
-# receiver-agnostic patterns below instead (`http:verb-literal`, `literal:order`, `path:/order`).
+# HTTP client (`http`, `client`, `session`, `httpx`, `requests`, optionally prefixed with `_` and/or
+# suffixed with exactly `_client`/`_session` -- e.g. `client`, `_client`, `http_client`, `httpx`,
+# `self._session`, `_http`) so that `self._events.put(event)`, `await queue.put(x)`,
+# `ledger.post(entry)`, `portfolio.record_withdrawal(...)` AND round-3's reviewer-found false
+# positives `client_cache.put(k, v)`, `session_store.put(...)`, `requests_seen.put(...)` all pass --
+# none of those receivers is an exact `client`/`_client`/`http_client`/... token, they just happen to
+# start with one as a substring. See `_RECEIVER_RE` below for why a plain `\b...\w*\.` prefix (the
+# round-2 fix) is not tight enough: `\b` does not fire before `self._client.post(` because `_` is a
+# word character, so only the explicitly-hardcoded `_http` alternative in round 2 ever matched a
+# leading-underscore receiver -- `self._client.post(`, `self._session.delete(` and
+# `self._client.withdraw(` all slipped through. The fix is a negative lookbehind for "preceding char
+# is alphanumeric" (so a `.` or `_` or start-of-string immediately before the receiver is fine, but a
+# receiver that is itself a *suffix* of a longer identifier, e.g. the `client` inside `fooclient`, is
+# not) PLUS restricting what may follow the base word to exactly `_client`/`_session` (not an
+# arbitrary `\w*`), which is what excludes `client_cache`/`session_store`/`requests_seen`.
+#
+# Coverage for a *generic* verb-call regardless of receiver name (e.g. `client.request("POST", ...)`)
+# comes from `http:verb-literal` instead. SDK-style method calls that do not go through a
+# post/delete/put verb at all (e.g. `client.new_order(...)`, `exchange.create_order(...)`,
+# `cancel_order(...)`) are covered by `sdk:order-method-call`, which is deliberately receiver-agnostic
+# (phase 5b's real `TabdealBroker`/OMS can call these through any object name) -- unlike
+# `http:verb-call`, false positives here are not a concern because the method names themselves
+# (`new_order`, `cancel_all_orders`, `new_oco_order`, ...) are not realistic names for anything other
+# than placing/cancelling exchange orders.
+_RECEIVER_RE = r"(?<![A-Za-z0-9])_?(?:http|client|session|httpx|requests)(?:_?client|_?session)?"
+
+# `path:/order` additionally requires the literal token `api` to appear somewhere on the same
+# (masked) line (case-insensitive, word-bounded) -- round 3's reviewer-found false positives
+# `Path("data/orders.csv")` and `avg = total/orders` both contain a bare `/order(s)` substring with
+# the SAME word-boundary shape as a real endpoint (`/api/v1/orders`), so the boundary check alone
+# (round 2's fix) cannot tell a URL path apart from a local file path or a division expression.
+# Every real Tabdeal endpoint in this codebase is reached through `/api/v1/...` or `/r/api/v1/...`
+# (CLAUDE.md section 6 / `config/default.yaml`'s `read_prefix`/`write_prefix`) -- "the line also says
+# api somewhere" is therefore a cheap, well-justified proxy for "this is a URL path, not a local file
+# path or an arithmetic expression". Accepted gap (documented, same category as the module
+# docstring's others): an endpoint literally split across `BASE = "https://api1.tabdeal.org"` on one
+# line and `PATH = "/v1/order"` on another, with no `api` token on the second line, would bypass this
+# specific pattern -- `http:verb-call`/`http:verb-literal`/`sdk:order-method-call` still catch the
+# call itself once those two pieces are actually used to make a request.
+#
+# `literal:order` is scoped to a bare `"order"`/`"orders"` string literal passed as an argument to a
+# path-building call (`*.join(...)`, `*_url(...)`, `*urljoin(...)`) -- not a blanket
+# quote-order-quote match (round 2's version) -- because `df.sort_values("order")`,
+# `table = "orders"` and the `"order"` inside `Path("data/orders.csv")` are indistinguishable from a
+# real endpoint fragment at the plain-substring level; only the *call context* (joining it onto a
+# path/URL) tells them apart. `self._http.build_request("POST", self._url("order"))` (the original
+# M-3 repro) is still blocked -- via `http:verb-literal` matching the `"POST"` literal in the same
+# call, not via this pattern; see the regression test for that snippet.
+#
+# `literal:withdraw` requires the quoted content to also contain a `/` (an endpoint-shaped literal
+# like `"/withdraw"` or `"/api/v1/withdraw"`) -- round 3's reviewer-found false positive
+# `WITHDRAWAL = "withdrawal"` (a ledger-entry-type constant, not a call to anything) has no `/` and
+# so no longer matches.
 FORBIDDEN_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("path:/order", re.compile(r"(?i)/orders?(?:/|\b)")),
+    ("path:/order", re.compile(r"(?i)^(?=.*\bapi\b)(?=.*/orders?(?:/|\b)).*$")),
     ("path:order/", re.compile(r"(?i)\border/")),
-    ("literal:order", re.compile(r"(?i)([\"'])orders?\1")),
+    (
+        "literal:order",
+        re.compile(r"(?i)\b(?:join|_url|urljoin)\w*\s*\([^()\n]*?([\"'])orders?\1"),
+    ),
     ("endpoint:openOrders", re.compile(r"(?i)\bopenorders\b")),
     ("endpoint:allOrders", re.compile(r"(?i)\ballorders\b")),
     ("endpoint:orderList", re.compile(r"(?i)\borderlist\b")),
@@ -100,23 +150,39 @@ FORBIDDEN_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("endpoint:oco", re.compile(r"(?i)\boco\b")),
     ("path:/margin", re.compile(r"(?i)/margin\b")),
     ("path:/withdraw", re.compile(r"(?i)/withdraw")),
-    ("literal:withdraw", re.compile(r"(?i)([\"'])withdraw\w*\1")),
+    (
+        "literal:withdraw",
+        re.compile(r'(?i)([\"\'])(?=[^"\'\n]*/)[^"\'\n]*withdraw\w*[^"\'\n]*\1'),
+    ),
     ("stream:userDataStream", re.compile(r"(?i)userdatastream")),
     ("stream:listenKey", re.compile(r"(?i)listenkey")),
     (
         "http:verb-call",
-        re.compile(r"(?i)\b(?:http|client|session|httpx|requests|_http)\w*\.(?:post|delete|put)\s*\("),
+        re.compile(rf"(?i){_RECEIVER_RE}\.(?:post|delete|put)\s*\("),
     ),
     (
         "http:withdraw-call",
-        re.compile(r"(?i)\b(?:http|client|session|httpx|requests|_http)\w*\.withdraw\w*\s*\("),
+        re.compile(rf"(?i){_RECEIVER_RE}\.withdraw\w*\s*\("),
     ),
     ("http:method-kwarg", re.compile(r'(?i)method\s*=\s*["\'](?:post|delete|put)["\']')),
     # Case-SENSITIVE by design (no `(?i)`): a bare quoted HTTP-verb literal passed positionally,
     # e.g. `client.request("POST", ORDER_PATH)` or `client.stream("POST", url)`. Exact uppercase
     # only, matching how Binance-style exchange APIs spell the verb; "GET" is deliberately not in
     # the alternation (`tabdeal_client.py` uses `method="GET"` throughout and must stay allowed).
+    # NIT (round 3, documented, not fixed): a bare `op = "DELETE"` assignment with no receiver and
+    # no exchange context at all also matches this pattern -- accepted as still-blocked-on-purpose:
+    # nothing under src/scripts/deploy/config has a legitimate reason to assign the literal string
+    # "DELETE"/"POST"/"PUT" before phase 5b, and narrowing this pattern to require more context would
+    # reopen exactly the kind of receiver-free verb-literal bypass (`client.request("DELETE", ...)`)
+    # it exists to catch. See `test_known_safe_snippet_op_delete_is_accepted_as_still_blocked`.
     ("http:verb-literal", re.compile(r"([\"'])(?:POST|DELETE|PUT)\1")),
+    (
+        "sdk:order-method-call",
+        re.compile(
+            r"(?i)\.(?:new_order|create_order|cancel_order|cancel_all_orders|cancel_open_orders|"
+            r"place_order|new_oco_order|create_\w*_order|withdraw)\s*\("
+        ),
+    ),
     ("param:newClientOrderId", re.compile(r"(?i)newclientorderid")),
     ("param:origClientOrderId", re.compile(r"(?i)origclientorderid")),
     ("param:listClientOrderId", re.compile(r"(?i)listclientorderid")),

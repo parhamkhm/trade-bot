@@ -70,6 +70,24 @@ explicit allow-list of the specific, reviewed files phase 5b adds (e.g.
 wholesale via ``TBOT_ALLOW_ORDER_CODE=1`` -- that env var is a blunt, temporary unlock for Parham's
 own local iteration, not the intended steady state once order code is a permanent, reviewed part
 of the codebase. No allow-list exists yet; this paragraph is a note for whoever does that work.
+
+Phase 7a (manual live, CLAUDE.md section 9) needs a *read-only* signed query -- confirming a stop
+Parham placed by hand on the Tabdeal UI is actually resting on the book, via signed GET
+``/r/api/v1/openOrders`` (and possibly ``/r/api/v1/allOrders`` for a closed/filled stop) -- before
+any order-*placement* or order-*cancellation* code exists (that is still phase 5b). This guardrail
+does **not** allow that today: ``endpoint:openOrders`` / ``endpoint:allOrders`` (and ``path:/order``
+once ``api`` is also on the line) block it exactly like a real order-placement call, with no
+distinction for "read-only" vs "write" -- correctly, since this regex-based tool cannot verify a
+call site is actually a GET (see the module's masking limitations) and a wrong allow-list entry
+would quietly reopen the order-write surface it exists to close.
+Round 3 (this review) deliberately does **not** add that allow-list: it would need (a) a pattern
+that matches *only* a signed GET to exactly ``/r/api/v1/openOrders``/``/r/api/v1/allOrders`` and
+nothing else shaped like it, and (b) a reviewed, narrow reconciliation module to use it in (neither
+exists yet, and inventing the shape of either before the module exists risks over-fitting the
+allow-list to guesses). The intended steady state is a short-lived, explicitly reviewed allow-list
+entry added here by Parham, by hand, immediately before phase 7a starts -- scoped to the specific
+reconciliation call site(s) that need it, not a blanket unblock of the ``openOrders``/``allOrders``
+patterns.
 """
 
 from __future__ import annotations
@@ -100,6 +118,11 @@ from order_code_patterns import Finding, find_matches  # noqa: E402
 # SUFFIX match (see `is_self_protected`), not an exact relative-path lookup, so every worktree /
 # differently-cased-drive / Git-Bash-style copy of these paths is covered, not just the one the
 # repo root happens to resolve to in this process's own CLAUDE_PROJECT_DIR.
+#
+# round 3: kept explicitly (even though `_is_under_hooks_dir` below already covers the two
+# ``.claude/hooks/...`` entries as a side effect of protecting the whole directory) as the
+# documented, reviewed list of exactly-why-each-one-matters; `is_self_protected` ORs this suffix
+# check with the whole-directory check, not one or the other.
 _PROTECTED_SUFFIXES: tuple[str, ...] = (
     ".claude/settings.json",
     ".claude/settings.local.json",
@@ -109,16 +132,29 @@ _PROTECTED_SUFFIXES: tuple[str, ...] = (
     ".github/workflows/ci.yml",
 )
 
+# round 3 (MINOR): protect every file under `.claude/hooks/`, not just the two named above.
+# Concretely, this closes the ``.claude/hooks/json.py`` shadowing bypass a reviewer found (see
+# ``main``'s `-P` note below) -- a NEW file dropped into this directory under any name is just as
+# capable of subverting the hook (shadow a stdlib module it imports, or simply replace its behavior
+# outright if Claude Code's hook invocation ever changes) as editing the two files named above
+# directly. ``_HOOKS_DIR_SEGMENTS`` is checked as two *consecutive* path segments (not two
+# independent substring checks), so a coincidentally-named `.claude/hooksarchive/x.py` (a different
+# directory) is not caught by accident.
+_HOOKS_DIR_SEGMENTS: tuple[str, str] = (".claude", "hooks")
+
 # M-1/MINOR-2: "in scope" is "this path has one of these as a directory segment, anywhere" -- not
 # "this path starts with one of these prefixes relative to CLAUDE_PROJECT_DIR". A prefix check is
 # exactly what a sibling worktree (`trade-bot-design/src/...` "starts with" `trade-bot` only by
 # string-literal accident, not by actually being under this project) defeats; a segment check does
 # not care where the repo root is, only that *some* ancestor directory in the normalized path is
-# named one of these three. Audit test (`tests/test_order_code_audit.py`) scans the same three
+# named one of these four. Audit test (`tests/test_order_code_audit.py`) scans the same four
 # directories for the same extensions (MINOR-2): the hook additionally treats any file under them
 # as in-scope regardless of extension, since a single edited file's extension is already known and
 # there is no "glob a tree" cost to worry about the way there is for the audit.
-_IN_SCOPE_SEGMENTS: frozenset[str] = frozenset({"src", "scripts", "deploy"})
+# round 3: `config` was added -- `config/default.yaml` already holds the Tabdeal endpoint prefixes
+# (`read_prefix`/`write_prefix`) and could grow an order-shaped value (a reviewer-found gap: neither
+# this hook nor the audit test looked at it before).
+_IN_SCOPE_SEGMENTS: frozenset[str] = frozenset({"src", "scripts", "deploy", "config"})
 
 _EXTENDED_LENGTH_PREFIX = "\\\\?\\"
 _MSYS_ABS_RE = re.compile(r"^/([A-Za-z])(/.*)?$")
@@ -163,14 +199,48 @@ def _is_drive_path(path: str) -> bool:
     return bool(_DRIVE_RE.match(path))
 
 
+def _clean_windows_segment(segment: str) -> str:
+    """Strip an NTFS alternate-data-stream suffix and trailing dot/space cruft from one Windows
+    path segment (round 3, MINOR).
+
+    Windows silently collapses a trailing ``.``/`` `` (one or more, any mix) off a file or
+    directory name when resolving it -- ``settings.json.`` and ``settings.json `` both name the
+    exact same file as ``settings.json`` on disk, and ``src./`` / ``src /`` both name the same
+    directory as ``src``. It separately lets a filename carry a ``:streamname`` (or the default
+    ``::$DATA``) alternate-data-stream suffix that still refers to the *same base file* for every
+    purpose this guardrail cares about (self-protection, in-scope-ness). Neither of these is
+    POSIX/Linux filesystem behaviour (a trailing dot or a literal ``:`` is just an ordinary,
+    distinct character in a filename there), which is why this is applied only to a path already
+    identified as a Windows drive-letter path, not to a genuine POSIX path -- same asymmetry as
+    the whole-path casefold a few lines below in ``normalize_path``.
+
+    ``.`` and ``..`` are passed through unchanged: they are resolved as relative-path operators
+    by the caller, not cleaned as filename cruft (a bare ``.`` has no trailing dot to strip once
+    the single dot itself is the whole segment, and ``..``'s dots are not "trailing" cruft either).
+    """
+    if segment in (".", ".."):
+        return segment
+    colon = segment.find(":")
+    if colon != -1:
+        segment = segment[:colon]
+    return segment.rstrip(". ")
+
+
 def _normpath_posix(path: str) -> str:
     """``posixpath.normpath`` equivalent that treats the string purely as POSIX, no OS lookup."""
     is_abs = path.startswith("/")
     drive = ""
-    if _DRIVE_RE.match(path):
+    is_windows = bool(_DRIVE_RE.match(path))
+    if is_windows:
         drive, path = path[:2], path[2:]
         is_abs = True
     parts = [p for p in path.split("/") if p not in ("", ".")]
+    if is_windows:
+        # round 3: Windows-only segment cleanup (trailing dot/space, ADS suffix) -- see
+        # `_clean_windows_segment`. Re-filter afterwards: a segment that was ONLY cruft (e.g. a
+        # lone trailing space, rare but possible) can collapse to "" and must drop out exactly
+        # like an original "" or "." segment does above.
+        parts = [p for p in (_clean_windows_segment(p) for p in parts) if p not in ("", ".")]
     resolved: list[str] = []
     for part in parts:
         if part == "..":
@@ -237,8 +307,16 @@ def is_in_scope(full_path: str) -> bool:
     return any(segment in _IN_SCOPE_SEGMENTS for segment in _path_segments(full_path))
 
 
+def _is_under_hooks_dir(full_path: str) -> bool:
+    """True if ``.claude`` and ``hooks`` appear as two consecutive segments, anywhere (round 3)."""
+    segments = [s.casefold() for s in _path_segments(full_path)]
+    target = tuple(s.casefold() for s in _HOOKS_DIR_SEGMENTS)
+    return any(tuple(segments[i : i + 2]) == target for i in range(len(segments) - 1))
+
+
 def is_self_protected(full_path: str) -> bool:
-    """Casefolded path-segment SUFFIX match against ``_PROTECTED_SUFFIXES`` (M-1/M-2).
+    """Casefolded path-segment SUFFIX match against ``_PROTECTED_SUFFIXES`` (M-1/M-2), OR anywhere
+    under ``.claude/hooks/`` (round 3, see ``_HOOKS_DIR_SEGMENTS``).
 
     A plain ``str.endswith`` on an un-casefolded path is NOT enough here for two reasons:
 
@@ -256,7 +334,7 @@ def is_self_protected(full_path: str) -> bool:
         cf_suffix = suffix.casefold()
         if cf_path == cf_suffix or cf_path.endswith("/" + cf_suffix):
             return True
-    return False
+    return _is_under_hooks_dir(full_path)
 
 
 def _extract_text_pairs(tool_name: str, tool_input: dict[str, object]) -> list[tuple[str, str]]:

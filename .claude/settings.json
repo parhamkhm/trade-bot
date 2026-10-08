@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PYTHONDONTWRITEBYTECODE=1 uv run --no-project --quiet --offline --python 3.12 python \"$CLAUDE_PROJECT_DIR/.claude/hooks/block_order_code.py\" || exit 2",
+            "command": "PYTHONDONTWRITEBYTECODE=1 uv run --no-project --quiet --offline --python 3.12 python -P \"$CLAUDE_PROJECT_DIR/.claude/hooks/block_order_code.py\" || exit 2",
             "timeout": 60
           }
         ]

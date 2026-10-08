@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -66,24 +67,44 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-_SCANNED_DIRS: tuple[str, ...] = ("src", "scripts", "deploy")
-_SCANNED_GLOBS: tuple[str, ...] = ("*.py", "*.sh", "*.yml", "*.yaml")
+_SCANNED_DIRS: tuple[str, ...] = ("src", "scripts", "deploy", "config")
+# round 3 (NIT): added Dockerfile (and a `Dockerfile.*` variant, e.g. a future
+# `Dockerfile.recorder`), `*.service`/`*.timer` (systemd units -- `deploy/systemd/` ships a
+# `.service` today and could grow a `.timer`), `*.ipynb` (research notebooks can land under
+# `scripts/`) and `*.toml` (a tool config under `config/` or `deploy/`). None of these were
+# scanned before even though the hook's `is_in_scope` treats ANY file under `src/scripts/deploy`
+# (now also `config`) as in-scope regardless of extension -- the audit's extension list was
+# narrower than the hook's real scope, which is exactly the kind of drift section 3.6 says the
+# audit must not have relative to the hook.
+_SCANNED_GLOBS: tuple[str, ...] = (
+    "*.py",
+    "*.sh",
+    "*.yml",
+    "*.yaml",
+    "*.toml",
+    "*.ipynb",
+    "*.service",
+    "*.timer",
+    "Dockerfile",
+    "Dockerfile.*",
+)
 
 
 def _scanned_files() -> list[Path]:
-    """MINOR-2: exact twin of the hook's directory scope (`src/`, `scripts/`, `deploy/`).
+    """MINOR-2: exact twin of the hook's directory scope (`src/`, `scripts/`, `deploy/`,
+    `config/`).
 
-    The hook treats ANY file under those three directories as in-scope (it only ever looks at the
+    The hook treats ANY file under those four directories as in-scope (it only ever looks at the
     one file a single Write/Edit/MultiEdit/NotebookEdit call names, so there is no tree-glob cost
     to worry about); this audit has to enumerate actual files on disk, so it is restricted to the
-    extensions the pattern module understands text-scanning for.
+    extensions/filenames the pattern module understands text-scanning for (see `_SCANNED_GLOBS`).
     """
     files: list[Path] = []
     for sub in _SCANNED_DIRS:
         base = _REPO_ROOT / sub
         for glob in _SCANNED_GLOBS:
             files.extend(sorted(base.rglob(glob)))
-    return files
+    return sorted(set(files))
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +145,9 @@ def test_scanned_tree_covers_known_safe_modules() -> None:
         "scripts/tabdeal_probe.py",
         "deploy/docker-compose.yml",
         "deploy/healthcheck.py",
+        "deploy/Dockerfile",
+        "deploy/systemd/tbot-recorder.service",
+        "config/default.yaml",
     ):
         assert expected in relnames, f"expected {expected} to be scanned by the order-code audit"
 
@@ -170,10 +194,52 @@ def test_skip_predicate_never_skips_in_ci() -> None:
         # triple-quoted text is blanked wholesale, line comments are stripped.
         '"""\nThis explains the withdraw process and order/ handling in prose.\n"""\n',
         '# see the withdraw and order/ sections of the docs for background\nx = 1\n',
+        # --- round 3 (reviewer-verified false positives of the round-2 pattern set) ---------------
+        # `literal:withdraw` (round 2) matched any quote-withdraw*-quote, including a plain
+        # ledger-entry-type constant with no "/" and nothing exchange-shaped about it at all.
+        'WITHDRAWAL = "withdrawal"\n',
+        # `literal:order` (round 2) matched any quote-order(s)-quote; all three of these are a
+        # pandas sort key, a local SQL/variable table name, and a local CSV path -- none of them
+        # calls anything or builds a URL. Round 3's `literal:order` only fires when the literal is
+        # an argument to a `*.join(`/`*_url(`/`*urljoin(` call (see `order_code_patterns.py`).
+        'df.sort_values("order")\n',
+        'table = "orders"\n',
+        # `path:/order` (round 2) matched a bare `/orders?` word-boundary regardless of context, so
+        # a local file path and a division expression both tripped it just because the substring
+        # "/order" happens to share the same boundary shape as a real endpoint. Round 3 additionally
+        # requires the literal token `api` on the same line (every real Tabdeal endpoint in this
+        # codebase is `/api/v1/...` or `/r/api/v1/...`; see CLAUDE.md section 6).
+        'from pathlib import Path\nPath("data/orders.csv")\n',
+        'avg = total/orders\n',
+        # `http:verb-call`/`http:withdraw-call` (round 2) used `\b(?:http|client|session|httpx|\n`
+        # `requests|_http)\w*\.` as the receiver prefix -- `\w*` after the base word let a RECEIVER
+        # that merely *starts with* one of those words (but means something unrelated) through:
+        # a cache/store/queue keyed by client/session/request objects, not an HTTP client itself.
+        "client_cache.put(k, v)\n",
+        "session_store.put(x, y)\n",
+        "requests_seen.put(rid)\n",
     ],
 )
 def test_known_safe_snippets_produce_no_matches(safe_snippet: str) -> None:
     assert find_matches(safe_snippet) == []
+
+
+def test_known_safe_snippet_op_delete_is_accepted_as_still_blocked() -> None:
+    """Round 3 (reviewer-verified, deliberately NOT fixed): a bare ``op = "DELETE"`` assignment,
+    with no receiver and no other exchange context at all, still matches ``http:verb-literal``.
+
+    Decision (documented, not a bug): nothing under ``src/``, ``scripts/``, ``deploy/`` or
+    ``config/`` has a legitimate reason to assign the literal string ``"DELETE"``/``"POST"``/
+    ``"PUT"`` before phase 5b, and narrowing `http:verb-literal` to require more surrounding
+    context (e.g. a nearby call) would reopen the receiver-free verb-literal bypass it exists to
+    catch in the first place (`client.request("DELETE", ...)`, `client.stream("POST", url)` --
+    see `test_known_unsafe_snippets_are_detected`). If a genuinely unrelated, legitimate use of a
+    bare ``"DELETE"``/``"POST"``/``"PUT"`` literal shows up before phase 5b, Parham decides then
+    whether to narrow this pattern or just use ``TBOT_ALLOW_ORDER_CODE=1`` for that one edit.
+    """
+    findings = find_matches('op = "DELETE"\n')
+    assert findings
+    assert any("verb-literal" in name for name, _, _ in findings)
 
 
 @pytest.mark.parametrize(
@@ -198,6 +264,23 @@ def test_known_safe_snippets_produce_no_matches(safe_snippet: str) -> None:
         ('posixpath.join(prefix, "order")', "order"),
         ('path = "/api/v1/orders"', "order"),
         ('self._http.withdraw(amount)', "withdraw"),
+        # --- round 3 additions ------------------------------------------------------------------
+        # Receiver-prefix gap: `\b` does not fire before `self._client.post(` etc. because `_` is
+        # a word character -- only the hardcoded `_http` alternative matched a leading underscore
+        # receiver before. See `order_code_patterns.py`'s `_RECEIVER_RE`.
+        ('self._client.post(url, json=payload)', "verb-call"),
+        ('self._session.delete(url)', "verb-call"),
+        ('self._client.withdraw(amount)', "withdraw-call"),
+        # SDK-style method calls with no post/delete/put verb and no http-ish receiver at all --
+        # the pre-round-3 pattern set matched nothing for any of these.
+        ('client.new_order(symbol="BTCUSDT", side="BUY")', "order-method"),
+        ('exchange.create_order(symbol, qty)', "order-method"),
+        ('self.cancel_order(client_order_id)', "order-method"),
+        ('self._client.cancel_all_orders(symbol="BTCUSDT")', "order-method"),
+        ('self.cancel_open_orders(symbol)', "order-method"),
+        ('self.place_order(req)', "order-method"),
+        ('client.new_oco_order(**params)', "order-method"),
+        ('client.create_stop_limit_order(**params)', "order-method"),
     ],
 )
 def test_known_unsafe_snippets_are_detected(unsafe_snippet: str, expected_pattern_substring: str) -> None:
@@ -634,6 +717,130 @@ def test_hook_self_protection_suffix_does_not_match_unrelated_dir_name() -> None
     assert result.returncode == 0
 
 
+# --- round 3: config/ joins the in-scope set ------------------------------------------------
+
+
+def test_hook_config_dir_is_in_scope() -> None:
+    """``config/default.yaml`` already holds the Tabdeal endpoint prefixes (CLAUDE.md section 6)
+    -- round 3 adds `config` to `_IN_SCOPE_SEGMENTS` so an edit introducing an order-shaped value
+    there is caught the same way `src/scripts/deploy` already are."""
+    payload = {
+        "tool_name": "Edit",
+        "tool_input": {
+            "file_path": "config/default.yaml",
+            "old_string": "exchange:",
+            "new_string": 'exchange:\n  order_endpoint: "/api/v1/order"',
+        },
+    }
+    result = _run_hook(payload, project_dir=_REPO_ROOT)
+    assert result.returncode == 2
+
+
+# --- round 3: whole-`.claude/hooks/` self-protection (not just the two named files) -----------
+
+
+def test_hook_blocks_edit_of_any_new_file_under_hooks_dir() -> None:
+    """A brand-new file under ``.claude/hooks/`` (not one of the two explicitly named in
+    ``_PROTECTED_SUFFIXES``) must still be self-protected -- round 3 protects the whole
+    directory, closing the ``.claude/hooks/json.py`` stdlib-shadowing gap a reviewer found (see
+    ``test_hook_command_with_dash_p_defeats_json_shadow_attack`` below) and any similar future
+    sibling-module trick."""
+    payload = {
+        "tool_name": "Write",
+        "tool_input": {"file_path": ".claude/hooks/helpers.py", "content": "x = 1\n"},
+    }
+    result = _run_hook(payload, project_dir=_REPO_ROOT)
+    assert result.returncode == 2
+
+
+def test_hook_does_not_protect_unrelated_dir_named_hooksy() -> None:
+    """``.claude/hooksy/x.py`` is a different directory from ``.claude/hooks/`` -- the
+    consecutive-segment check must not fire on a mere prefix match."""
+    payload = {
+        "tool_name": "Write",
+        "tool_input": {"file_path": ".claude/hooksy/x.py", "content": "x = 1\n"},
+    }
+    result = _run_hook(payload, project_dir=_REPO_ROOT)
+    # Not self-protected, and not in scope either (no src/scripts/deploy/config segment).
+    assert result.returncode == 0
+
+
+# --- round 3: Windows trailing dot/space and NTFS alternate-data-stream path forms ------------
+
+
+def test_hook_settings_json_trailing_dot_is_self_protected() -> None:
+    """Windows collapses a trailing ``.`` when resolving a filename -- ``settings.json.`` IS
+    ``settings.json`` on disk."""
+    payload = {
+        "tool_name": "Write",
+        "tool_input": {"file_path": "F:\\projects\\trade-bot\\.claude\\settings.json.", "content": "{}"},
+    }
+    result = _run_hook(payload, project_dir=Path("F:\\projects\\trade-bot"))
+    assert result.returncode == 2
+
+
+def test_hook_settings_json_trailing_space_is_self_protected() -> None:
+    """Windows also collapses a trailing space -- ``settings.json `` IS ``settings.json``."""
+    payload = {
+        "tool_name": "Write",
+        "tool_input": {"file_path": "F:\\projects\\trade-bot\\.claude\\settings.json ", "content": "{}"},
+    }
+    result = _run_hook(payload, project_dir=Path("F:\\projects\\trade-bot"))
+    assert result.returncode == 2
+
+
+def test_hook_settings_json_ads_suffix_is_self_protected() -> None:
+    """An NTFS alternate-data-stream suffix (``::$DATA`` is the default, unnamed stream) still
+    names the same base file for every purpose this guardrail cares about."""
+    payload = {
+        "tool_name": "Write",
+        "tool_input": {
+            "file_path": "F:\\projects\\trade-bot\\.claude\\settings.json::$DATA",
+            "content": "{}",
+        },
+    }
+    result = _run_hook(payload, project_dir=Path("F:\\projects\\trade-bot"))
+    assert result.returncode == 2
+
+
+def test_hook_src_trailing_dot_segment_is_in_scope() -> None:
+    payload = {
+        "tool_name": "Write",
+        "tool_input": {
+            "file_path": "F:\\projects\\trade-bot\\src.\\tbot\\x.py",
+            "content": 'httpx.post("https://api1.tabdeal.org/api/v1/order")',
+        },
+    }
+    result = _run_hook(payload, project_dir=Path("F:\\projects\\trade-bot"))
+    assert result.returncode == 2
+
+
+def test_hook_src_trailing_space_segment_is_in_scope() -> None:
+    payload = {
+        "tool_name": "Write",
+        "tool_input": {
+            "file_path": "F:\\projects\\trade-bot\\src \\tbot\\x.py",
+            "content": 'httpx.post("https://api1.tabdeal.org/api/v1/order")',
+        },
+    }
+    result = _run_hook(payload, project_dir=Path("F:\\projects\\trade-bot"))
+    assert result.returncode == 2
+
+
+def test_hook_posix_path_trailing_dot_is_not_cleaned() -> None:
+    """The Windows trailing-dot/space/ADS cleanup must NOT apply to a genuine POSIX path (the
+    real case on the Ubuntu server and in Linux CI) -- a literal trailing dot or colon is just an
+    ordinary character in a filename there, not cruft to strip."""
+    payload = {
+        "tool_name": "Write",
+        "tool_input": {"file_path": "/home/parham/trade-bot/notes.txt.", "content": "hello\n"},
+    }
+    result = _run_hook(payload, project_dir=Path("/home/parham/trade-bot"))
+    # Not self-protected, not in scope -- allowed, and specifically NOT because "notes.txt." got
+    # cleaned to something that coincidentally matched; it is simply an ordinary out-of-scope file.
+    assert result.returncode == 0
+
+
 # ---------------------------------------------------------------------------
 # 4. Exact-settings-command subprocess test (NIT): the literal command line from settings.json.
 # ---------------------------------------------------------------------------
@@ -679,3 +886,109 @@ def test_settings_json_hook_command_blocks_and_allows_end_to_end() -> None:
         ["bash", "-c", command], input=allowed_payload, capture_output=True, text=True, env=env, timeout=60
     )
     assert result.returncode == 0, result.stderr
+
+
+# ---------------------------------------------------------------------------
+# 5. round 3 (M-2 bypass): `.claude/hooks/json.py` shadowing stdlib `json`, and the `-P` fix.
+# ---------------------------------------------------------------------------
+#
+# A reviewer found that `block_order_code.py`'s own directory sits first on `sys.path` for a
+# plain `python block_order_code.py` invocation (CPython prepends the script's directory). A
+# `.claude/hooks/json.py` dropped next to the hook -- itself writable via a Write/Edit call
+# BEFORE round 3 (see `test_hook_blocks_edit_of_any_new_file_under_hooks_dir` above for that half
+# of the fix) -- would shadow the stdlib `json` module the hook's `import json` resolves, letting
+# a malicious sibling module make `json.loads` return anything (e.g. an empty payload, which
+# `handle_payload` treats as "not a recognized tool" and allows unconditionally). Python's `-P`
+# flag ("safe path") stops the interpreter from prepending the script's own directory to
+# `sys.path` at startup, so the hook's `import json` (at the very top of the module, before its
+# own `sys.path.insert` for `order_code_patterns`) resolves the real stdlib module regardless of
+# what sits next to it on disk. `.claude/settings.json`'s hook command now runs
+# `python -P ...block_order_code.py`.
+
+
+def _make_hooks_copy_with_malicious_json(tmp_path: Path) -> Path:
+    """Copy the real `.claude/hooks/` dir into `tmp_path` and drop in a `json.py` that defeats
+    JSON parsing (so a shadowed `import json` would make the hook allow everything)."""
+    copy_dir = tmp_path / "hooks"
+    shutil.copytree(_HOOKS_DIR, copy_dir)
+    (copy_dir / "json.py").write_text(
+        "def loads(*_args, **_kwargs):\n"
+        "    return {}\n"  # no tool_name -> handle_payload treats it as unrecognized -> allow (0)
+        "\n"
+        "def dumps(*_args, **_kwargs):\n"
+        "    return '{}'\n",
+        encoding="utf-8",
+    )
+    return copy_dir / "block_order_code.py"
+
+
+@pytest.mark.skipif(sys.version_info < (3, 11), reason="python -P requires 3.11+")
+def test_hook_command_with_dash_p_defeats_json_shadow_attack(tmp_path: Path) -> None:
+    """With `-P`, a malicious sibling `json.py` next to the hook does NOT shadow stdlib `json` --
+    the hook still blocks real order code even with the malicious module present."""
+    hook_copy = _make_hooks_copy_with_malicious_json(tmp_path)
+    env = dict(os.environ)
+    env["CLAUDE_PROJECT_DIR"] = str(_REPO_ROOT)
+    env.pop("TBOT_ALLOW_ORDER_CODE", None)
+    payload = json.dumps(
+        {
+            "tool_name": "Write",
+            "tool_input": {
+                "file_path": "src/tbot/execution/evil.py",
+                "content": 'httpx.post("https://api1.tabdeal.org/api/v1/order")',
+            },
+        }
+    )
+    result = subprocess.run(
+        [sys.executable, "-P", str(hook_copy)],
+        input=payload,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+    )
+    assert result.returncode == 2, (
+        f"expected -P to defeat the json.py shadow and still block; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+
+def test_hook_command_without_dash_p_is_vulnerable_to_json_shadow_attack(tmp_path: Path) -> None:
+    """Documents the actual vulnerability `-P` fixes: WITHOUT `-P`, the same malicious sibling
+    `json.py` DOES shadow stdlib `json` and the hook allows the order-code write through (exit 0)
+    -- this is exactly why `.claude/settings.json` must invoke `python -P`, not plain `python`."""
+    hook_copy = _make_hooks_copy_with_malicious_json(tmp_path)
+    env = dict(os.environ)
+    env["CLAUDE_PROJECT_DIR"] = str(_REPO_ROOT)
+    env.pop("TBOT_ALLOW_ORDER_CODE", None)
+    payload = json.dumps(
+        {
+            "tool_name": "Write",
+            "tool_input": {
+                "file_path": "src/tbot/execution/evil.py",
+                "content": 'httpx.post("https://api1.tabdeal.org/api/v1/order")',
+            },
+        }
+    )
+    result = subprocess.run(
+        [sys.executable, str(hook_copy)],
+        input=payload,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+    )
+    assert result.returncode == 0, (
+        "expected the json.py shadow to defeat the hook WITHOUT -P (documenting the bug -P "
+        f"fixes); stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+
+def test_settings_json_hook_command_uses_dash_p() -> None:
+    """`.claude/settings.json`'s PreToolUse command must invoke `python -P` (not plain `python`)
+    -- the actual fix for the json.py-shadow attack the two tests above demonstrate."""
+    settings = json.loads(_SETTINGS_PATH.read_text(encoding="utf-8"))
+    command = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    assert re.search(r"\bpython\s+-P\b", command), (
+        f"expected the hook command to invoke 'python -P ...', got: {command!r}"
+    )

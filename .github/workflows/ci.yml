@@ -39,7 +39,13 @@ jobs:
         run: |
           set -o pipefail
           env -u TBOT_ALLOW_ORDER_CODE uv run pytest tests/test_order_code_audit.py -q -rs | tee order_audit.log
-          if grep -qi "skipped" order_audit.log; then
+          # NIT (round 3): a plain `grep -qi "skipped"` would also fire on any incidental line
+          # that happens to contain the substring "skipped" (e.g. a future test name or docstring
+          # excerpt pytest echoes back) with no real skip having occurred -- a false alarm that
+          # would fail CI for the wrong reason. Match only pytest's actual skip-report shapes: a
+          # per-test "SKIPPED [...]" line (`-rs`) at the start of a line, or the run summary's
+          # "N skipped" count.
+          if grep -Eq '^SKIPPED|[0-9]+ skipped' order_audit.log; then
             echo "::error::order-code audit test(s) were skipped in CI -- this must never happen (CLAUDE.md section 3.6 / SPEC D-052)"
             exit 1
           fi
