@@ -289,10 +289,9 @@ fees and slippage appear in the ledger and reduce returns by the expected amount
 `Sharpe ≥ 0.80 × Sharpe(buy-and-hold)`, `PBO < 0.30`, Deflated Sharpe > 0 at the 95 % level using the trial
 count from `research/EXPERIMENTS.md`; neighbouring parameter sets (±1 grid step) keep ≥ 70 % of the Sharpe
 (no knife-edge optimum); ETH/USDT Sharpe > 0 with the same rules. *For S0* (one pre-registered configuration,
-never selected) PBO is not applicable, and the neighbour test is fixed in advance as six one-at-a-time variants —
-channel lookbacks N × 0.8 and N × 1.25 (rounded: {16, 44, 80} and {25, 69, 125}, exits ⌊N/2⌋), σ̂ span 20 and
-40, vol target 0.15 and 0.25 — each logged as a sensitivity run (not a trial) and each keeping ≥ 70 % of S0's
-Sharpe. *For S1* (no parameters of its own) PBO and the neighbour test are not applicable; every member must
+never selected) PBO is not applicable, and the neighbour test is the six robustness variants fixed in §7.1
+(SMA 50/75/150/200; vol target 0.20/0.40), each logged as a sensitivity run (not a trial) and each keeping
+≥ 70 % of S0's Sharpe. *For S1* (no parameters of its own) PBO and the neighbour test are not applicable; every member must
 have passed them; fees and slippage ×2 (i.e. 20 bps taker fee per side plus twice the slippage measured by
 the LBank G0 probe, D-060) keep the strategy profitable net of costs. Every phase-3 report states annual turnover and the
 annual cost drag (fees + slippage, % of equity per year) next to the returns.
@@ -336,59 +335,83 @@ capital scales only by a written rule.
 Fixed before any phase-3 result. Nothing in this section may be tuned after results are seen; every
 parameter below is a fixed number.
 
-**S0 — locked default.** One strategy, fully specified here, locked on Parham's approval and never tuned on
-phase-3 results. *Proposed (pending Parham):* `donchian_ens_1d`, BTCUSDT, 1d bars (close = 00:00 UTC).
+**S0 — locked default.** One strategy, fully specified here, never tuned on phase-3 results.
+**LOCKED by Parham on 2026-10-10 (D-062).** The lock commit is recorded in `research/EXPERIMENTS.md`. Every
+number below is fixed.
 
-- *Sub-signals.* Three channels with entry lookback N ∈ {20, 55, 100} and exit lookback M = ⌊N/2⌋ ∈ {10, 27, 50}.
-  At the close of bar t, sub-signal i becomes **long** if `close_t > max(high_{t−N} … high_{t−1})` (bar t
-  excluded), and becomes **flat** if `close_t < min(low_{t−M} … low_{t−1})`; otherwise it keeps its state.
-- *Anchored replay (the state has memory).* "Keeps its state" is hysteresis: the sub-signal state depends on the
-  whole history, not on a fixed window. So the state is defined by **replay from a fixed anchor**: every
-  sub-signal starts flat at `history_start` (2018-01-01 00:00 UTC; close #1 is the first bar opening there, which closes at 2018-01-02 00:00 UTC — a bar's `ts` is its close) and is updated on every
-  Binance 1d bar from the first bar on which its channel can be evaluated (bar N+1). The backtest, **every**
-  walk-forward fold (folds never restart the strategy; they only slice the replayed series) and the paper/live
-  runner all replay every Binance 1d bar from that anchor up to bar t (≈ 3,000 bars; cheap). The same rule
-  applies to **every** stateful strategy. In walk-forward with per-fold parameters, each fold's parameter set is
-  replayed from the anchor; the jump from the previous fold's position to the new fold's position at the
-  boundary is charged as a trade (fees + slippage). This — not
-  `warmup_bars` — is what makes backtest and live agree on the same bars (G5).
-- *Raw weight* `w_raw = (number of long sub-signals) / 3`.
-- *Volatility (finite kernel, start-independent).* `r_t = ln(close_t / close_{t−1})`. With α = 2/31 (span 30) and
-  K = 150: `σ̂_t = sqrt( Σ_{k=0}^{K−1} (1−α)^k · r_{t−k}² / Σ_{k=0}^{K−1} (1−α)^k ) × sqrt(365)` — the last 150
-  returns up to and including t, exponentially weighted and renormalised. Because the kernel is finite, σ̂_t
-  depends only on the last 151 closes, so the §6 warm-up test holds exactly for σ̂. `warmup_bars = 151` is the
-  minimum before any trade: the weight is 0 until close #151 counted from `history_start` (close #1), i.e. the
-  first tradable close is 2018-06-01 00:00 UTC. Sub-signal states are not covered by `warmup_bars`; they come
-  from the anchored replay above.
-- *Target.* `w_target = min(1, w_raw × min(1, 0.20 / σ̂_t))`.
+`sma100_1d`, BTCUSDT, Binance 1d bars (a bar's `ts` is its close, 00:00 UTC).
+
+- *Indicators (all finite and start-independent; a value at close t uses closes up to and including t).*
+  - `SMA100_t` = the mean of `close_{t−99} … close_t`.
+  - `ATR20_t` = the **simple** mean of the last 20 true ranges up to and including t,
+    `TR_k = max(high_k − low_k, |high_k − close_{k−1}|, |low_k − close_{k−1}|)`. This is **not** Wilder's
+    ATR, whose memory is infinite.
+  - `σ̂_t` = the finite 150-return kernel of D-056: `r_t = ln(close_t / close_{t−1})`, α = 2/31 (span 30),
+    K = 150, `σ̂_t = sqrt( Σ_{k=0}^{K−1} (1−α)^k · r_{t−k}² / Σ_{k=0}^{K−1} (1−α)^k ) × sqrt(365)`.
+- *State machine.* The state is FLAT, LONG or STOPPED, updated on every Binance 1d bar by **anchored replay**
+  (below).
+  - **FLAT → LONG** at close t if `close_t > SMA100_t` and t is a tradable close (warm-up below).
+  - **LONG → FLAT** at close t if `close_t ≤ SMA100_t`.
+  - **LONG → STOPPED** on bar u (u ≥ t+1, *including the entry bar t+1*) if `low_u ≤ stop`. The stop-out
+    happens inside bar u, before its close is evaluated.
+  - **STOPPED → FLAT** at the first close `≤ SMA100`. This includes the close of the stop-out bar u itself:
+    the close comes after the intraday stop.
+  - **Re-entry after a stop-out** therefore needs a close `≤ SMA100` and then a fresh close `> SMA100`. A
+    trend that never dips back to the SMA is not re-entered.
+  - If the stop and an exit signal fall on the same bar, the stop comes first, then the close moves the state
+    to FLAT. The final state is the same either way.
+- *Protective stop (Q1: FIXED, not trailing; D-050).*
+  - **Level:** `stop = P_ref − 3 × ATR20_t`, where t is the entry signal bar and `P_ref` = the **Binance open of
+    bar t+1**, i.e. the next-open entry price before slippage. The stop stays fixed for the whole position.
+    If `P_ref − 3 × ATR20_t < 0.01`, the stop is 0.01.
+  - **Why `P_ref` and not each model's own fill price (clarifies Parham's "entry fill price").** In the
+    next-open model the two differ only by the entry slippage, a few bps. Using `P_ref` makes the stop level,
+    and therefore the stop-out state, identical in backtest, paper and live, whatever the fill model, the
+    slippage or the real LBank fill (G5 parity).
+  - **Daily stop fill (next-open model).** On bar u with `low_u ≤ stop`, the fill is `min(open_u, stop)` minus
+    adverse slippage. A gap below the stop fills at the open, and the fill is never better than the stop.
+  - **Manual-delay variant (D-051).** The stop level is the same. It is active from the delayed entry fill
+    and is checked on 1h bars from that hour on: the first 1h bar h with `low_h ≤ stop` fills at
+    `min(open_h, stop)` minus slippage. The stop-out **state** is still defined only by the daily rule above.
+    Execution never feeds back into the state:
+    - if the state is STOPPED but the delayed position was not stopped (e.g. the daily low came before the
+      delayed fill), the target is 0 and the position exits 6 h after the close of the stop-out bar;
+    - if the 1h execution stopped out while the state is still LONG, the position stays flat until the
+      state's next FLAT → LONG transition (the engine's re-arm rule).
+  - **Live parity requirement (phase 5).** The backtest fills stops at the stop level intraday. Live must
+    therefore either keep an exchange-side stop resting on LBank or watch the price intraday (≤ 1 min) and
+    send a market sell. Checking only at the daily close would fill far worse than the backtest assumes.
+    Whether LBank spot offers stop orders is verified when the private API is in use. Until then the bot
+    plans for intraday monitoring.
+- *Sizing.* `w_target = min(1, 0.30 / σ̂_t)` while the state is LONG, otherwise 0. At BTC's usual σ̂ (0.6–0.8)
+  this is ≈ 0.375–0.5 of equity.
 - *Rebalance rule.* Let `w_now` be the actual (drifted) weight at the close of t.
-  1. If the number of long sub-signals changed at t, trade to `w_target` (always; this includes every exit to 0
-     and every new entry).
-  2. Otherwise, **only if `w_now > 0`**, trade if `|w_target − w_now| ≥ 0.25 × max(w_target, w_now)` (25 %
-     relative band; vol-driven resizing only). Rule 2 never opens a position from flat: after an execution-only
-     stop-out (manual-delay 1h model or a real Tabdeal fill) while the signal state is still long, or when the
-     live runner starts mid-trend, the position stays flat until rule 1 fires (the next change in the number of
-     long sub-signals). Rule 1 then trades to `w_target`, so even a partial exit signal (3 → 2 long
-     sub-signals) re-enters at the 2/3 target from flat — deterministic, and identical in backtest and live.
+  1. Entries (FLAT → LONG) and exits (to FLAT or STOPPED) **always** trade.
+  2. Vol-driven resizing trades only while in a position (`w_now > 0`), and only if
+     `|w_target − w_now| ≥ 0.25 × max(w_target, w_now)` (25 % relative band).
   3. A RiskManager-forced reduction or exit, and a stop-out, are never blocked by the band.
-- *Protective stop.* `stop_price` = `min(low_{t−M} … low_{t−1})` of the **longest-lookback long** sub-signal (the
-  lowest active exit level, i.e. where the whole position would go flat anyway). It raises `ValueError` when no
-  sub-signal is long (there is no position to protect). Backtest stop model: the stop computed at the close of t
-  triggers on bar t+1 if `low_{t+1} ≤ stop`, filling at `min(open_{t+1}, stop)` minus slippage. After a
-  stop-out **all** sub-signals reset to flat and each needs a fresh breakout to re-enter. The stop-out (and so the
-  reset) is defined **only** by this **daily** Binance-bar rule in every variant — the manual-delay 1h stop model
-  below and real Tabdeal fills affect execution and P&L only, never the state — so the replayed state is the
-  same in backtest, paper and live even when the Binance–Tabdeal basis makes the hand-placed stop fill
-  differently; a real fill that disagrees is logged as an execution difference (G6a), not fed back into the
-  signal.
-  *Under the manual-delay variant (D-051)* the stop is only active once the position exists: from the delayed
-  fill hour it triggers on the first 1h bar h after that point with `low_h ≤ stop`, filling at
-  `min(open_h, stop)` with the adverse depth-at-size slippage; a new stop level computed at the close of t
-  becomes effective 6 h after that close (the time Parham needs to move the hand-placed stop).
-- *Fills.* Signal at the close of t, fill at the open of t+1 (and the manual-delay variant, D-051).
+- *Fills.* A signal at the close of t fills at the open of t+1 plus slippage. The manual-delay variant (D-051,
+  6 h) fills at the open of the Binance 1h bar that starts 6 h after the close of t.
+- *Warm-up and anchored replay.* `warmup_bars = 151` (σ̂ needs 151 closes; SMA100 needs 100; ATR20 needs 21).
+  The first tradable close is close #151 counted from `history_start`, i.e. 2018-06-01 00:00 UTC. Close #1 is
+  the bar opening at 2018-01-01 00:00 UTC.
+  - The state has memory (STOPPED, and the fixed stop of an open position), so it is defined by **replay from
+    the anchor** `history_start` = 2018-01-01. The state starts FLAT and every Binance 1d bar up to t is
+    replayed.
+  - The backtest, **every** walk-forward fold, and the paper/live runner do this identically. Folds never
+    restart the strategy; they only slice the replayed series. This, not `warmup_bars`, is what makes
+    backtest and live agree on the same bars (G5).
+  - The same replay rule applies to **every** stateful strategy. In walk-forward with per-fold parameters,
+    each fold's parameter set is replayed from the anchor. The jump at a fold boundary is charged as a trade
+    (fees + slippage).
+- *Robustness (sensitivity runs, not trials; fixed now).* Six one-at-a-time variants:
+  - SMA 50, 75, 150 and 200, at vol target 0.30;
+  - vol target 0.20 and 0.40, at SMA 100.
 
-These are textbook parameters with no search, so S0 counts as **one trial**. At BTC's usual σ̂ (0.6–0.9) the
-target is ≈ 0.22–0.33 of equity when fully long: S0 is deliberately a low-exposure, low-turnover strategy.
+  Each must keep **≥ 70 % of S0's Sharpe** (pooled OOS, manual-delay fills). In every variant the ATR period
+  stays at 20 (Q3), the multiplier at 3, and the re-entry rule, the band and σ̂ are unchanged.
+
+These are textbook parameters with no search, so S0 counts as **one trial** (N = 1 in its DSR).
 
 **S1 — equal-weight blend.** Equal-weight average of the target weights of every strategy that passed G3 (S0
 included if it passed), netted into one position, with S0's rebalance rule (relative 25 % band; transitions
@@ -399,9 +422,20 @@ same trial count as every other non-S0 contender (see "Deflated Sharpe" below).
 over the evaluation window = the **paper and live days after the challenger's lock date** — the commit date of
 the challenger's frozen entry in `research/EXPERIMENTS.md` — (historical
 walk-forward days all predate the lock and do not count), minimum 365 days:
-(a) its DSR exceeds the champion's by **≥ 0.10** in DSR probability units (fixed, not a default), every variant
-counted. Accepted consequence: once the champion's DSR is ≥ 0.90, no challenger can replace it — a strong
-champion is never swapped out on paper/live evidence alone;
+(a) **Sharpe-difference test (D-063, replaces the fixed 0.10 DSR margin).** A one-sided Ledoit–Wolf (2008)
+test of `H0: SR_challenger − SR_champion ≤ 0` on the two daily net return series over **the same days**:
+  - the series are paper returns for the challenger, and the champion's realised returns (paper or live, after
+    all costs);
+  - `z = (SR̂_c − SR̂_ch) / se`, where `se` comes from the delta method on the joint first and second moments
+    of the two series;
+  - the HAC covariance uses a **Parzen** kernel with **Andrews (1991)** automatic bandwidth (AR(1) plug-in),
+    fixed;
+  - the challenger replaces the champion only if `z ≥ 1.645` (p ≤ 0.05).
+
+  When m > 1 challengers are tested against the same champion over overlapping windows, the threshold is the
+  one-sided Bonferroni value `z ≥ Φ⁻¹(1 − 0.05 / m)`. Every challenger tested is logged in
+  `research/EXPERIMENTS.md`, so m is honest. Unlike the old margin, a strong champion can still be replaced by
+  a significantly better challenger;
 (b) it tripped no risk tripwire (REDUCING/HALTED, stop breach, drawdown halt) in the window;
 (c) Sharpe > 0 after costs in at least 2 of 3 regime buckets — terciles of `σ̂` (the S0 estimator) with the two
 cut-points computed **once** on the 2018-01-01 … holdout_start research data and frozen.
