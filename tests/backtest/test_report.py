@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -18,7 +19,14 @@ from tbot.core.config import CostConfig
 from tbot.core.types import Bar, Timeframe
 from tests.backtest.helpers import Scripted, make_config
 from tests.backtest.test_engine import five_bars
-from tests.sim_helpers import SYMBOL, bars_from_closes, lbank_like_filters, make_bar
+from tests.sim_helpers import (
+    SYMBOL,
+    T_START,
+    bars_from_closes,
+    hour_bars_for_day,
+    lbank_like_filters,
+    make_bar,
+)
 
 
 def test_report_dict_is_json_serialisable_and_complete() -> None:
@@ -149,3 +157,44 @@ def test_cli_exits_zero_on_a_clean_run(monkeypatch: pytest.MonkeyPatch) -> None:
     closes = [100.0 + (i % 7) * 3 + i for i in range(40)]
     monkeypatch.setattr(cli, "load_bars", lambda *_a, **_k: bars_from_closes(closes))
     assert cli.main(["--strategy", "buy_and_hold"]) == 0
+
+
+# ---------------------------------------------------------------------------------------------
+# MINOR 9 / 10 (review round 2): resize and gap-fill counts actually reach the report
+# ---------------------------------------------------------------------------------------------
+
+
+def test_report_health_counts_a_resize() -> None:
+    """Reuses the BLOCKER repro (rising market during a 6h delay): one BUY is resized down at fill
+    time, and that must show up in the report's health counters, not just in ``result.resizes``."""
+    day0 = make_bar(0, "100", "100")
+    day1 = make_bar(0, "100", "104.8", start=day0.ts)
+    hours = hour_bars_for_day(day1, [str(Decimal("100") + Decimal("0.2") * h) for h in range(24)])
+    cfg = make_config(
+        fee="50", slip="100", buffer="0", fill_delay=timedelta(hours=6), exec_timeframe=Timeframe.H1
+    )
+    res = run_backtest(BacktestFeed([day0, day1]), Scripted([1.0, 1.0]), cfg, exec_feed=BacktestFeed(hours))
+    assert len(res.resizes) == 1
+    report = build_report(res)
+    assert report["health"]["resizes"] == 1
+    assert "resizes 1" in render_markdown(report)
+
+
+def test_report_health_counts_a_gap_fill() -> None:
+    """A delayed fill that lands later than ``created_ts + fill_delay`` because the exec feed has a gap
+    must be counted in the report, not only visible on the individual ``FillRecord``."""
+    day0 = make_bar(0, "100", "100")
+    day1 = make_bar(0, "100", "100", start=day0.ts)
+    # hourly bars for day1, but hours 5 and 6 are missing: the deadline (close(day0) + 6h) falls in the
+    # gap, so the first eligible bar is hour 7, later than the configured delay.
+    all_hours = hour_bars_for_day(day1, [str(100 + h) for h in range(24)])
+    gapped_hours = [b for b in all_hours if b.open_ts not in (T_START + timedelta(days=1, hours=5),
+                                                               T_START + timedelta(days=1, hours=6))]
+    cfg = make_config(fee="0", slip="0", fill_delay=timedelta(hours=6), exec_timeframe=Timeframe.H1)
+    res = run_backtest(
+        BacktestFeed([day0, day1]), Scripted([1.0, 1.0]), cfg, exec_feed=BacktestFeed(gapped_hours)
+    )
+    assert len(res.fills) == 1 and res.fills[0].gap_fill is True
+    report = build_report(res)
+    assert report["health"]["gap_fills"] == 1
+    assert "gap fills 1" in render_markdown(report)
