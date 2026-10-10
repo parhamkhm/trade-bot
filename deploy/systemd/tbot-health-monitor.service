@@ -5,16 +5,21 @@
 # live in one process, a slow `docker inspect` can never overlap itself, and Restart=always brings it
 # back after any crash. See deploy/SERVER_SETUP.md section 19.
 #
+# Runs from its own pinned, root-owned copy, /opt/tbot/monitor-run (same pattern as the LBank
+# recorder's /opt/tbot/lbank-run, see section 18.1): pulling `main` into the main checkout must never
+# change what this unit runs underneath it without a deliberate, reviewed update step.
+#
 # Install (root):
-#   install -m 0644 deploy/systemd/tbot-health-monitor.service /etc/systemd/system/
-#   install -m 0600 -o root -g root deploy/health_monitor.env.example /opt/tbot/health-monitor.env  # then edit
+#   cp -r /opt/tbot/trade-bot /opt/tbot/monitor-run   # first time only; see SERVER_SETUP.md 19.0
+#   install -m 0644 /opt/tbot/monitor-run/deploy/systemd/tbot-health-monitor.service /etc/systemd/system/
+#   install -m 0600 -o root -g root /opt/tbot/monitor-run/deploy/health_monitor.env.example \
+#       /opt/tbot/health-monitor.env   # then edit
 #   systemctl daemon-reload && systemctl enable --now tbot-health-monitor
 #
-# Runs the stdlib-only monitor with the system python3 straight from the main checkout; it needs
-# neither uv nor a virtualenv.
+# Runs the stdlib-only monitor with the system python3; it needs neither uv nor a virtualenv.
 [Unit]
 Description=tbot health monitor (Telegram health alerts, send-only)
-Documentation=file:///opt/tbot/trade-bot/deploy/SERVER_SETUP.md
+Documentation=file:///opt/tbot/monitor-run/deploy/SERVER_SETUP.md
 After=network-online.target docker.service
 Wants=network-online.target
 # Deliberately no Requires=docker.service: the monitor must keep running, and alert, when docker is down.
@@ -25,10 +30,10 @@ Type=simple
 # the rest of the filesystem read-only and the process unable to gain privileges.
 User=root
 EnvironmentFile=/opt/tbot/health-monitor.env
-Environment=PYTHONPATH=/opt/tbot/trade-bot/src
+Environment=PYTHONPATH=/opt/tbot/monitor-run/src
 Environment=PYTHONUNBUFFERED=1
-WorkingDirectory=/opt/tbot/trade-bot
-ExecStart=/usr/bin/python3 /opt/tbot/trade-bot/scripts/run_health_monitor.py
+WorkingDirectory=/opt/tbot/monitor-run
+ExecStart=/usr/bin/python3 /opt/tbot/monitor-run/scripts/run_health_monitor.py
 Restart=always
 RestartSec=10
 # Exit status 2 = missing/invalid token or chat id: restarting every 10 s cannot fix that.
@@ -45,9 +50,17 @@ ProtectHome=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+PrivateDevices=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+UMask=0077
 MemoryMax=128M
 
 [Install]

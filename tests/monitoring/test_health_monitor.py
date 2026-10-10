@@ -396,6 +396,42 @@ def test_lbank_integrity_null_is_not_an_alert(host: Host, settings: Settings) ->
     assert lbank(host, settings) == []
 
 
+def test_lbank_in_progress_within_the_grace_period_is_quiet(host: Host, settings: Settings) -> None:
+    """The writer sets in_progress=true, ok=false, exit_code=null at the START of every run (so a
+    killed run never leaves last night's OK behind); a normal run must not alert while it works."""
+    host.lbank_status(
+        in_progress=True,
+        ok=False,
+        exit_code=None,
+        integrity_ok=None,
+        ts=iso(NOW - timedelta(minutes=5)),
+        started_ts=iso(NOW - timedelta(minutes=5)),
+    )
+    assert lbank(host, settings) == []
+
+
+def test_lbank_in_progress_past_one_hour_alerts_as_stuck(host: Host, settings: Settings) -> None:
+    host.lbank_status(
+        in_progress=True,
+        ok=False,
+        exit_code=None,
+        integrity_ok=None,
+        ts=iso(NOW - timedelta(hours=2)),
+        started_ts=iso(NOW - timedelta(hours=2)),
+    )
+    found = lbank(host, settings)
+    assert keys(found) == {"backup:lbank"}
+    assert "in_progress" in found[0].summary
+    assert "2.0 h" in found[0].summary
+    assert "killed or is stuck" in found[0].summary
+
+
+def test_lbank_old_status_without_in_progress_field_behaves_as_before(host: Host, settings: Settings) -> None:
+    """Status files written before the in_progress/started_ts fields existed must not be misread."""
+    host.lbank_status()  # no 'in_progress' key at all
+    assert lbank(host, settings) == []
+
+
 def test_lbank_status_older_than_36h_alerts(host: Host, settings: Settings) -> None:
     host.lbank_status(ts=iso(NOW - timedelta(hours=37)))
     found = lbank(host, settings)
@@ -1196,12 +1232,29 @@ def test_systemd_unit_is_hardened_and_uses_the_root_only_env_file() -> None:
         "Restart=always",
         "RestartSec=10",
         "WantedBy=multi-user.target",
+        # pinned, root-owned copy (same pattern as /opt/tbot/lbank-run) -- never the branch-switched
+        # main checkout
+        "Environment=PYTHONPATH=/opt/tbot/monitor-run/src",
+        "WorkingDirectory=/opt/tbot/monitor-run",
+        "ExecStart=/usr/bin/python3 /opt/tbot/monitor-run/scripts/run_health_monitor.py",
+        # extra hardening (review MINOR 5)
+        "CapabilityBoundingSet=CAP_DAC_READ_SEARCH",
+        "SystemCallFilter=@system-service",
+        "PrivateDevices=yes",
+        "RestrictNamespaces=yes",
+        "ProtectKernelLogs=yes",
+        "ProtectClock=yes",
+        "MemoryDenyWriteExecute=yes",
+        "UMask=0077",
     ]
     active = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
     for line in required:
         assert line in active
     assert "docker.sock" not in text
     assert "Requires=docker.service" not in active  # must keep running (and alert) when docker is down
+    # must run from the pinned copy, not the branch-switched main checkout (comments may still mention
+    # /opt/tbot/trade-bot as the one-time copy source)
+    assert not any("/opt/tbot/trade-bot" in ln for ln in active)
 
 
 def test_run_script_delegates_to_main(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1224,3 +1277,7 @@ def test_default_targets_match_the_compose_container_names() -> None:
     assert LBANK.container == "tbot-lbank-recorder"
     compose = (REPO / "deploy" / "docker-compose.yml").read_text(encoding="utf-8")
     assert "container_name: tbot-recorder" in compose
+    assert f"name: {TABDEAL.volume}" in compose
+    lbank_compose = (REPO / "deploy" / "docker-compose.lbank.yml").read_text(encoding="utf-8")
+    assert f"container_name: {LBANK.container}" in lbank_compose
+    assert f"name: {LBANK.volume}" in lbank_compose

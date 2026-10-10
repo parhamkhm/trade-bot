@@ -66,6 +66,23 @@ def test_missing_token_exits_2_and_does_not_call_telegram() -> None:
     assert hm.ENV_TOKEN in err
 
 
+def test_malformed_token_exits_2_and_does_not_call_telegram_or_echo_it() -> None:
+    def fetch(token: str) -> dict[str, Any]:
+        raise AssertionError("must not be called")
+
+    code, _, err = run({hm.ENV_TOKEN: "not-a-real-token"}, fetch)
+    assert code == 2
+    assert "not-a-real-token" not in err
+    assert "does not look like a Telegram bot token" in err
+
+
+def test_output_warns_the_bot_is_public() -> None:
+    envelope = updates({"id": 424242, "type": "private", "first_name": "Parham"})
+    _, out, _ = run(ENV, lambda _token: envelope)
+    assert "public" in out
+    assert "Check that the name=" in out
+
+
 def test_telegram_error_is_reported_without_the_token() -> None:
     def fetch(token: str) -> dict[str, Any]:
         raise hm.TelegramError("http error", 401)

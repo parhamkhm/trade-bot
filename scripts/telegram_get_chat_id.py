@@ -1,14 +1,18 @@
 """Print the chat id(s) of chats that have messaged your bot (one getUpdates call, read-only).
 
 Setup: create the bot in BotFather, open a chat with it in Telegram and send it any message
-(press Start), then run, on the server:
+(press Start), then run, on the server, in a subshell so the token is not left exported in your
+shell afterwards:
 
-    set -a; . /opt/tbot/health-monitor.env; set +a
-    python3 scripts/telegram_get_chat_id.py
+    ( set -a; . /opt/tbot/health-monitor.env; python3 scripts/telegram_get_chat_id.py )
 
 The bot token is read from the environment variable TBOT_TELEGRAM_BOT_TOKEN only (never argv)
 and is never printed. Only chat id, type and a title/username are shown. No offset is passed, so
 the pending updates are not acknowledged and nothing is consumed.
+
+Bot usernames are public: anyone who knows (or guesses) it can start a chat with your bot and show
+up in this list. Check that each printed `name=` is actually you (or your intended group/channel)
+before copying its `chat_id` into TBOT_TELEGRAM_CHAT_ID.
 """
 
 from __future__ import annotations
@@ -20,10 +24,24 @@ from pathlib import Path
 from typing import Any, TextIO
 
 try:
-    from tbot.monitoring.health_monitor import ENV_TOKEN, TelegramError, redact, register_secret, telegram_get
+    from tbot.monitoring.health_monitor import (
+        ENV_TOKEN,
+        TelegramError,
+        is_valid_token,
+        redact,
+        register_secret,
+        telegram_get,
+    )
 except ImportError:  # started straight from a checkout, without uv / PYTHONPATH
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-    from tbot.monitoring.health_monitor import ENV_TOKEN, TelegramError, redact, register_secret, telegram_get
+    from tbot.monitoring.health_monitor import (
+        ENV_TOKEN,
+        TelegramError,
+        is_valid_token,
+        redact,
+        register_secret,
+        telegram_get,
+    )
 
 Fetch = Callable[[str], dict[str, Any]]
 
@@ -70,6 +88,9 @@ def main(
         print(f"{ENV_TOKEN} is not set in the environment (see deploy/health_monitor.env.example).", file=err)
         return 2
     register_secret(token)
+    if not is_valid_token(token):
+        print(f"{ENV_TOKEN} does not look like a Telegram bot token (<digits>:<letters/digits>).", file=err)
+        return 2
     try:
         envelope = (fetch or _fetch_updates)(token)
     except TelegramError as exc:
@@ -84,6 +105,11 @@ def main(
     print("Chats that messaged this bot (use the id as TBOT_TELEGRAM_CHAT_ID):", file=out)
     for chat_id, (chat_type, label) in sorted(chats.items()):
         print(f"  chat_id={chat_id}  type={chat_type}  name={label or '-'}", file=out)
+    print(
+        "\nThe bot's username is public, so anyone who found it could be in this list too.\n"
+        "Check that the name= above is really you before copying its chat_id.",
+        file=out,
+    )
     return 0
 
 

@@ -647,15 +647,21 @@ def check_recorders(settings: Settings, probes: Probes) -> list[Problem]:
 # ---------------------------------------------------------------------------------------------
 
 
+IN_PROGRESS_GRACE_HOURS = 1.0  # a run writes in_progress=true at the start; longer than this is stuck
+
+
 def evaluate_lbank_status(
     raw: str | None, now: datetime, max_age_hours: float, *, error: str = ""
 ) -> list[Problem]:
     """Class 2 for the LBank backup status file (contract: see module docstring / task brief).
 
     ``raw`` is the file's text, or ``None`` with ``error`` naming why it could not be read.
-    Alerts on: unreadable / corrupt file, ``ok=false``, ``integrity_ok=false`` or a timestamp
-    older than ``max_age_hours``. A file that does not exist yet is NOT handled here (see
-    ``check_lbank_backup``: it has a grace period).
+    Alerts on: unreadable / corrupt file, ``ok=false``, ``integrity_ok=false``, a timestamp older
+    than ``max_age_hours``, or ``in_progress=true`` for more than ``IN_PROGRESS_GRACE_HOURS`` (the
+    writer sets this at the start of every run; still true after the grace period means the run was
+    killed or is stuck -- see ``deploy/backup_lbank.py``). A missing ``in_progress`` (older status
+    files, before that field existed) is treated as ``false``. A file that does not exist yet is NOT
+    handled here (see ``check_lbank_backup``: it has a grace period).
     """
     key = "backup:lbank"
     if raw is None:
@@ -669,6 +675,16 @@ def evaluate_lbank_status(
     ts = parse_iso(data.get("ts"))
     if ts is None:
         return [Problem(key, "LBank backup status file is corrupt (bad 'ts')")]
+    if data.get("in_progress") is True:
+        started = parse_iso(data.get("started_ts")) or ts
+        running_h = (now - started).total_seconds() / 3600.0
+        if running_h <= IN_PROGRESS_GRACE_HOURS:
+            return []  # a normal run under way; not stuck yet
+        summary = (
+            f"LBank backup has been 'in_progress' for {running_h:.1f} h"
+            f" (limit {IN_PROGRESS_GRACE_HOURS:g} h): the run was killed or is stuck"
+        )
+        return [Problem(key, summary)]
     issues: list[str] = []
     if data["ok"] is False:
         message = short(str(data.get("message", "")), 160)
