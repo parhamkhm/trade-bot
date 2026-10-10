@@ -17,10 +17,20 @@ Non-negotiables (CLAUDE.md §3.8, Parham 2026-10-10):
   failing endpoint never delays another (LBank answers in 1-8 s from the Turkey server).
 
 Trade ids are UUID strings, not increasing integers, so continuity is checked by **time**: a poll is
-continuous if its oldest trade is at or before the newest trade already stored by this process;
-otherwise the poll is logged with ``gap = 1``. Duplicates within a day file are dropped by the
-primary key; a trade received on both sides of midnight UTC can appear in two day files and is
-de-duplicated downstream by id.
+continuous if its oldest trade is at or before the newest trade already stored; otherwise the poll is
+logged with ``gap = 1``. That cursor (the newest trade time) is persisted in the ``trade_cursor`` table
+of the day file every poll writes to and reloaded on start-up from today's file, or from the newest
+earlier day file, so a restart (also one across midnight UTC) still flags the hole it caused.
+Duplicates within a day file are dropped by the primary key; a trade received on both sides of
+midnight UTC can appear in two day files and is de-duplicated downstream by id.
+
+Trade items that cannot be parsed are never dropped silently: their raw JSON goes to
+``trades_unparsed``, the poll row carries ``n_bad``, an error is logged with a sample, a poll in which
+no item at all parsed counts as a failed poll, and the heartbeat exposes ``unparsed_total``,
+``consecutive_bad_polls`` and ``last_new_rows_ms`` for the healthcheck.
+
+Schema changes are additive and idempotent (``CREATE TABLE IF NOT EXISTS`` plus a guarded
+``ALTER TABLE ADD COLUMN``), so day files written by older versions keep working unchanged.
 
 Snapshot tables (depth, trade polls, funding) use a rowid key, never ``recv_ms``: two polls in the same
 millisecond or a wall-clock step backwards must never drop a raw row.
@@ -48,19 +58,22 @@ __all__ = [
     "SPOT_BASE_URL",
     "DayStore",
     "LBankRecorder",
+    "ParsedTrades",
     "RecorderConfig",
     "StreamStatus",
+    "load_trade_cursor",
     "parse_depth",
     "parse_funding",
     "parse_klines",
     "parse_trades",
+    "parse_trades_checked",
 ]
 
 logger = structlog.get_logger(__name__)
 
 SPOT_BASE_URL = "https://api.lbkex.com"
 PERP_BASE_URL = "https://lbkperp.lbank.com"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS depth_snapshots (
@@ -125,7 +138,21 @@ CREATE TABLE IF NOT EXISTS errors (
     stream TEXT NOT NULL,
     message TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS trade_cursor (
+    stream TEXT PRIMARY KEY,
+    max_ts_ms INTEGER NOT NULL,
+    recv_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS trades_unparsed (
+    id INTEGER PRIMARY KEY,
+    recv_ms INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    raw TEXT NOT NULL
+);
 """
+
+# Idempotent column additions for day files created by an older schema (see ``_migrate``).
+_ADDED_COLUMNS = (("trade_polls", "n_bad", "INTEGER NOT NULL DEFAULT 0"),)
 
 _INSERT_DEPTH = (
     "INSERT INTO depth_snapshots (recv_ms, server_ms, symbol, bids, asks, latency_ms)"
@@ -133,8 +160,15 @@ _INSERT_DEPTH = (
 )
 _INSERT_POLL = (
     "INSERT INTO trade_polls (recv_ms, n_items, n_inserted, min_ts_ms, max_ts_ms, prev_max_ts_ms, gap,"
-    " latency_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    " latency_ms, n_bad) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
 )
+_UPSERT_CURSOR = (
+    "INSERT INTO trade_cursor (stream, max_ts_ms, recv_ms) VALUES ('trades', ?, ?)"
+    " ON CONFLICT(stream) DO UPDATE SET max_ts_ms = excluded.max_ts_ms, recv_ms = excluded.recv_ms"
+)
+_INSERT_UNPARSED = "INSERT INTO trades_unparsed (recv_ms, reason, raw) VALUES (?, ?, ?)"
+_RAW_MAX_CHARS = 4000
+_CURSOR_LOOKBACK_DAYS = 7
 _INSERT_FUNDING = (
     "INSERT INTO funding (recv_ms, symbol, funding_rate, next_fee_time_ms, fee_interval_s, marked_price,"
     " index_price, last_price, raw) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -179,28 +213,64 @@ def parse_depth(payload: Any) -> tuple[list[list[str]], list[list[str]], int | N
     return bids, asks, int(server) if server is not None else None
 
 
-def parse_trades(payload: Any) -> list[tuple[str, int, str, str, str | None, int | None]]:
-    """Rows ``(trade_id, ts_ms, price, qty, quote_qty, is_buyer_maker)``; malformed items skipped."""
+TradeRow = tuple[str, int, str, str, str | None, int | None]
+
+
+@dataclass(frozen=True)
+class ParsedTrades:
+    """Result of parsing one trades response: good rows plus the raw text of every rejected item."""
+
+    rows: list[TradeRow]
+    unparsed: list[tuple[str, str]]  # (reason, raw item as JSON text, capped)
+    n_items: int
+
+
+def _raw_text(item: Any) -> str:
+    try:
+        text = json.dumps(item, default=str)
+    except (TypeError, ValueError):
+        text = repr(item)
+    return text[:_RAW_MAX_CHARS]
+
+
+def _parse_trade_item(item: Any) -> TradeRow:
+    if not isinstance(item, dict):
+        raise TypeError(f"item is {type(item).__name__}, not an object")
+    maker = item.get("isBuyerMaker")
+    trade_id = str(item["id"])
+    if not trade_id:
+        raise ValueError("empty trade id")
+    return (
+        trade_id,
+        int(item["time"]),
+        str(item["price"]),
+        str(item["qty"]),
+        str(item["quoteQty"]) if item.get("quoteQty") is not None else None,
+        int(maker) if isinstance(maker, bool) else None,
+    )
+
+
+def parse_trades_checked(payload: Any) -> ParsedTrades:
+    """Parse a trades response; malformed items are returned in ``unparsed``, never silently dropped."""
     data = _ok_payload(payload)
     if not isinstance(data, list):
         raise ValueError("trades data is not a list")
-    rows = []
+    rows: list[TradeRow] = []
+    unparsed: list[tuple[str, str]] = []
     for item in data:
         try:
-            maker = item.get("isBuyerMaker")
-            rows.append(
-                (
-                    str(item["id"]),
-                    int(item["time"]),
-                    str(item["price"]),
-                    str(item["qty"]),
-                    str(item["quoteQty"]) if item.get("quoteQty") is not None else None,
-                    int(maker) if isinstance(maker, bool) else None,
-                )
-            )
-        except (KeyError, TypeError, ValueError, AttributeError):
-            continue
-    return rows
+            rows.append(_parse_trade_item(item))
+        except (KeyError, TypeError, ValueError, AttributeError, ArithmeticError) as exc:
+            unparsed.append((f"{type(exc).__name__}: {exc}"[:200], _raw_text(item)))
+    return ParsedTrades(rows, unparsed, len(data))
+
+
+def parse_trades(payload: Any) -> list[TradeRow]:
+    """Rows ``(trade_id, ts_ms, price, qty, quote_qty, is_buyer_maker)``; malformed items skipped.
+
+    Convenience wrapper; the recorder uses :func:`parse_trades_checked` so rejected items are kept.
+    """
+    return parse_trades_checked(payload).rows
 
 
 def parse_klines(payload: Any, interval: str, recv_ms: int) -> list[tuple[Any, ...]]:
@@ -235,6 +305,46 @@ def _utc_day(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=UTC).strftime("%Y-%m-%d")
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Bring a day file written by an older schema up to date; additive and idempotent, never lossy."""
+    for table, column, ddl in _ADDED_COLUMNS:
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+
+def _read_cursor(path: Path) -> int | None:
+    """Newest trade timestamp recorded in one day file, or ``None`` (works on pre-cursor files too)."""
+    conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=30.0)
+    try:
+        try:
+            row = conn.execute("SELECT max_ts_ms FROM trade_cursor WHERE stream = 'trades'").fetchone()
+            if row is not None:
+                return int(row[0])
+        except sqlite3.OperationalError:
+            pass  # file written before the cursor table existed
+        row = conn.execute("SELECT MAX(max_ts_ms) FROM trade_polls").fetchone()
+        return int(row[0]) if row is not None and row[0] is not None else None
+    finally:
+        conn.close()
+
+
+def load_trade_cursor(data_dir: Path, now_ms: int) -> int | None:
+    """The persisted trade cursor: newest trade time seen before this process started.
+
+    Looks at today's day file first, then walks back up to a week, so a restart just after midnight
+    still finds the cursor written into yesterday's file. ``None`` means nothing was ever recorded.
+    """
+    for back in range(_CURSOR_LOOKBACK_DAYS + 1):
+        path = data_dir / f"lbank-{_utc_day(now_ms - back * 86_400_000)}.sqlite"
+        if not path.exists():
+            continue
+        cursor = _read_cursor(path)
+        if cursor is not None:
+            return cursor
+    return None
+
+
 class DayStore:
     """One SQLite connection for one thread, switching to a new day file at midnight UTC."""
 
@@ -256,6 +366,7 @@ class DayStore:
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA busy_timeout=30000")
             conn.executescript(_SCHEMA)
+            _migrate(conn)
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             self._conn, self._day = conn, day
         return self._conn
@@ -299,6 +410,10 @@ class StreamStatus:
     consecutive_errors: int = 0
     rows_total: int = 0
     last_error: str | None = None
+    # trades stream only (zero / None elsewhere): parse failures and idle detection (M3)
+    unparsed_total: int = 0
+    consecutive_bad_polls: int = 0  # polls with unparseable items or no items at all
+    last_new_rows_ms: int | None = None  # last time a poll stored at least one new trade
 
 
 @dataclass(frozen=True)
@@ -331,6 +446,8 @@ class LBankRecorder:
         self._lock = threading.Lock()
         self.status: dict[str, StreamStatus] = {}
         self._prev_trade_max_ms: int | None = None
+        self._cursor_loaded = False
+        self._started_ms = _now_ms()
         self._threads: list[threading.Thread] = []
 
     # -- lifecycle --
@@ -443,25 +560,61 @@ class LBankRecorder:
             f"{SPOT_BASE_URL}/v2/supplement/trades.do",
             {"symbol": self._cfg.symbol, "size": self._cfg.trades_size},
         )
-        rows = parse_trades(payload)
+        parsed = parse_trades_checked(payload)
+        rows = parsed.rows
         times = [r[1] for r in rows]
         lo, hi = (min(times), max(times)) if times else (None, None)
-        prev = self._prev_trade_max_ms
+        prev = self._trade_cursor(recv)
         gap = 1 if (prev is not None and lo is not None and lo > prev) else 0
+        cursor = hi if prev is None else (prev if hi is None else max(prev, hi))
         trade_rows = [(*r, recv) for r in rows]
+        n_bad = len(parsed.unparsed)
         with store.transaction(recv) as conn:
             before = conn.total_changes
             conn.executemany("INSERT OR IGNORE INTO trades VALUES (?, ?, ?, ?, ?, ?, ?)", trade_rows)
             changed = conn.total_changes - before
-            conn.execute(
-                _INSERT_POLL,
-                (recv, len(rows), changed, lo, hi, prev, gap, latency),
-            )
-        if hi is not None:
-            self._prev_trade_max_ms = hi if prev is None else max(prev, hi)
+            conn.execute(_INSERT_POLL, (recv, parsed.n_items, changed, lo, hi, prev, gap, latency, n_bad))
+            conn.executemany(_INSERT_UNPARSED, [(recv, reason, raw) for reason, raw in parsed.unparsed])
+            if cursor is not None:  # persisted in the day file the poll lands in, so it survives restarts
+                conn.execute(_UPSERT_CURSOR, (cursor, recv))
+        self._prev_trade_max_ms = cursor
         if gap:
             logger.warning("lbank_recorder.trade_gap", prev_max_ms=prev, min_ms=lo)
+        self._note_trade_poll(parsed, changed, recv)
         return changed
+
+    def _trade_cursor(self, recv_ms: int) -> int | None:
+        """In-memory cursor, loaded once from the day files so a restart does not hide a gap."""
+        if not self._cursor_loaded:
+            try:
+                self._prev_trade_max_ms = load_trade_cursor(self._cfg.data_dir, recv_ms)
+                self._cursor_loaded = True
+            except (sqlite3.Error, OSError):
+                logger.exception("lbank_recorder.cursor_load_failed")  # ingestion goes on without it
+        return self._prev_trade_max_ms
+
+    def _note_trade_poll(self, parsed: ParsedTrades, changed: int, recv_ms: int) -> None:
+        """Account for parse failures and empty polls; raises when a poll that had items saved none."""
+        status = self.status.get("trades")
+        n_bad = len(parsed.unparsed)
+        if status is not None:
+            with self._lock:
+                status.unparsed_total += n_bad
+                bad = n_bad > 0 or parsed.n_items == 0
+                status.consecutive_bad_polls = status.consecutive_bad_polls + 1 if bad else 0
+                if changed > 0:
+                    status.last_new_rows_ms = recv_ms
+        if n_bad:
+            logger.error(
+                "lbank_recorder.trades_unparsed",
+                n_bad=n_bad,
+                n_items=parsed.n_items,
+                sample=parsed.unparsed[0][1][:300],
+                reason=parsed.unparsed[0][0],
+            )
+        if parsed.n_items > 0 and not parsed.rows:
+            # nothing was saved as a trade: never report this poll as a success
+            raise ValueError(f"all {parsed.n_items} trade items unparseable: {parsed.unparsed[0][0]}")
 
     def _make_kline_job(self, interval: str) -> Callable[[httpx.Client, DayStore], int]:
         def job(client: httpx.Client, store: DayStore) -> int:
@@ -525,10 +678,13 @@ class LBankRecorder:
                     "consecutive_errors": s.consecutive_errors,
                     "rows_total": s.rows_total,
                     "last_error": s.last_error,
+                    "unparsed_total": s.unparsed_total,
+                    "consecutive_bad_polls": s.consecutive_bad_polls,
+                    "last_new_rows_ms": s.last_new_rows_ms,
                 }
                 for name, s in self.status.items()
             }
-        return {"written_ms": _now_ms(), "streams": streams}
+        return {"written_ms": _now_ms(), "started_ms": self._started_ms, "streams": streams}
 
     def write_heartbeat(self) -> None:
         path = self._cfg.data_dir / "heartbeat.json"
