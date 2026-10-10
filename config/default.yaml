@@ -18,6 +18,9 @@ costs:
   # PROVISIONAL placeholder: spread and slippage must come from the LBank G0 probe (order-book
   # snapshots from the Turkey server), not from an assumption. Replace before any phase-3 result.
   slippage_bps: "5"
+  # While true, every backtest report is headed "PROVISIONAL SLIPPAGE" and no gate (G2 excepted) may be
+  # decided on its numbers. Set to false only together with the measured depth-at-size model (D-060).
+  slippage_provisional: true
 
 data:
   parquet_root: data/parquet

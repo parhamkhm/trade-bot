@@ -56,6 +56,9 @@ class CostConfig(_Base):
     taker_fee_bps: Decimal = Decimal("10")  # LBank spot VIP 0, verified 2026-10-10, D-060
     maker_fee_bps: Decimal = Decimal("10")
     slippage_bps: Decimal = Decimal("5")  # provisional until the LBank G0 probe measures it (D-060)
+    # True until the measured depth-at-size model replaces the placeholder: reports must say so and no
+    # phase-3 gate may be decided on provisional slippage (D-060)
+    slippage_provisional: bool = True
 
     @field_validator("taker_fee_bps", "maker_fee_bps", "slippage_bps")
     @classmethod
