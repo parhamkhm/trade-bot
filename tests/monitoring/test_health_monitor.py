@@ -83,6 +83,8 @@ class Host:
             "tbot-recorder": container_state(),
             "tbot-lbank-recorder": container_state(),
         }
+        self.restarts: dict[str, int] = {}
+        self.memory = hm.Memory()
         self.mounts = {"tbot-data": "/v/tbot-data", "tbot-lbank-data": "/v/tbot-lbank-data"}
         self.files: dict[Path, str | Exception | Callable[[], str]] = {}
         self.dirs: dict[Path, list[str] | Exception] = {}
@@ -147,7 +149,10 @@ class Host:
             state = self.states.get(argv[-1])
             if state is None:
                 return CmdResult(1, "", f"Error: No such object: {argv[-1]}")
-            return CmdResult(0, state if isinstance(state, str) else json.dumps(state), "")
+            if isinstance(state, str):  # raw, possibly garbage, output
+                return CmdResult(0, state, "")
+            doc = {"state": state, "restarts": self.restarts.get(argv[-1], 0)}
+            return CmdResult(0, json.dumps(doc), "")
         if argv[:3] == ("docker", "volume", "inspect"):
             mount = self.mounts.get(argv[3])
             return CmdResult(0, f"{mount}\n", "") if mount else CmdResult(1, "", "no such volume")
@@ -174,7 +179,12 @@ class Host:
 
     def probes(self) -> Probes:
         return Probes(
-            now=self.clock, run=self.run, read_text=self.read_text, list_names=self.list_names, disk=self.disk
+            now=self.clock,
+            run=self.run,
+            read_text=self.read_text,
+            list_names=self.list_names,
+            disk=self.disk,
+            memory=self.memory,
         )
 
 
@@ -254,9 +264,11 @@ def test_disk_reports_one_problem_per_filesystem(host: Host, settings: Settings)
     assert keys(hm.check_disks(settings, host.probes())) == {"disk:" + str(ROOT)}
 
 
-def test_disk_path_that_cannot_be_read_is_skipped(host: Host, settings: Settings) -> None:
+def test_disk_path_that_cannot_be_read_raises_no_alert_but_is_unknown(host: Host, settings: Settings) -> None:
     host.disks[DOCKER_DIR] = None
-    assert hm.check_disks(settings, host.probes()) == []
+    found = hm.check_disks(settings, host.probes())
+    assert [(p.key, p.silent) for p in found] == [("disk:" + str(DOCKER_DIR), True)]
+    assert hm.collect(settings, host.probes()).problems == {}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -278,20 +290,20 @@ def test_container_not_running_alerts(
 ) -> None:
     host.states["tbot-recorder"] = state
     found = hm.check_recorders(settings, host.probes())
-    assert keys(found) == {"container:tabdeal"}
+    assert keys(found) == {"recorder:tabdeal"}
     assert needle in found[0].summary
 
 
 def test_missing_container_alerts(host: Host, settings: Settings) -> None:
     del host.states["tbot-lbank-recorder"]
     found = hm.check_recorders(settings, host.probes())
-    assert keys(found) == {"container:lbank"}
+    assert keys(found) == {"recorder:lbank"}
     assert "does not exist" in found[0].summary
 
 
 def test_unreadable_docker_state_alerts(host: Host, settings: Settings) -> None:
     host.states["tbot-recorder"] = "this is not json"
-    assert keys(hm.check_recorders(settings, host.probes())) == {"container:tabdeal"}
+    assert keys(hm.check_recorders(settings, host.probes())) == {"recorder:tabdeal"}
 
 
 def test_unhealthy_container_is_a_stream_problem_with_reason(host: Host, settings: Settings) -> None:
@@ -299,7 +311,7 @@ def test_unhealthy_container_is_a_stream_problem_with_reason(host: Host, setting
         Health={"Status": "unhealthy", "Log": [{"Output": "book stream stale: 412s"}]}
     )
     found = hm.check_recorders(settings, host.probes())
-    assert keys(found) == {"stream:lbank"}
+    assert keys(found) == {"recorder:lbank"}
     assert "book stream stale: 412s" in found[0].summary
 
 
@@ -309,12 +321,12 @@ def test_starting_health_is_tolerated_only_for_the_grace_period(host: Host, sett
     assert hm.check_recorders(settings, host.probes()) == []
     old = iso(NOW - timedelta(minutes=30))
     host.states["tbot-recorder"] = container_state(StartedAt=old, Health={"Status": "starting"})
-    assert keys(hm.check_recorders(settings, host.probes())) == {"stream:tabdeal"}
+    assert keys(hm.check_recorders(settings, host.probes())) == {"recorder:tabdeal"}
 
 
 def test_container_without_healthcheck_status_alerts(host: Host, settings: Settings) -> None:
     host.states["tbot-recorder"] = container_state(Health=None)
-    assert keys(hm.check_recorders(settings, host.probes())) == {"stream:tabdeal"}
+    assert keys(hm.check_recorders(settings, host.probes())) == {"recorder:tabdeal"}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -325,7 +337,7 @@ def test_container_without_healthcheck_status_alerts(host: Host, settings: Setti
 def test_stale_heartbeat_alerts_for_both_formats(host: Host, settings: Settings) -> None:
     host.heartbeat_ok(age_s=900)
     found = hm.check_recorders(settings, host.probes())
-    assert keys(found) == {"stream:tabdeal", "stream:lbank"}
+    assert keys(found) == {"recorder:tabdeal", "recorder:lbank"}
     assert all("900s old" in p.summary for p in found)
 
 
@@ -337,16 +349,16 @@ def test_heartbeat_just_inside_limit_is_fine(host: Host, settings: Settings) -> 
 def test_unreadable_or_invalid_heartbeat_alerts(host: Host, settings: Settings) -> None:
     host.files[Path("/v/tbot-data") / "tabdeal/heartbeat.json"] = "{not json"
     host.files[Path("/v/tbot-lbank-data") / "lbank/heartbeat.json"] = json.dumps({"written_ms": "yesterday"})
-    assert keys(hm.check_recorders(settings, host.probes())) == {"stream:tabdeal", "stream:lbank"}
+    assert keys(hm.check_recorders(settings, host.probes())) == {"recorder:tabdeal", "recorder:lbank"}
     del host.files[Path("/v/tbot-data") / "tabdeal/heartbeat.json"]
     host.files[Path("/v/tbot-lbank-data") / "lbank/heartbeat.json"] = PermissionError("denied")
-    assert keys(hm.check_recorders(settings, host.probes())) == {"stream:tabdeal", "stream:lbank"}
+    assert keys(hm.check_recorders(settings, host.probes())) == {"recorder:tabdeal", "recorder:lbank"}
 
 
 def test_unknown_docker_volume_alerts(host: Host, settings: Settings) -> None:
     del host.mounts["tbot-data"]
     found = hm.check_recorders(settings, host.probes())
-    assert keys(found) == {"stream:tabdeal"}
+    assert keys(found) == {"recorder:tabdeal"}
     assert "tbot-data" in found[0].summary
 
 
@@ -410,11 +422,64 @@ def test_lbank_corrupt_status_alerts(host: Host, settings: Settings, content: st
     assert "corrupt" in found[0].summary
 
 
-def test_lbank_missing_or_unreadable_status_alerts(host: Host, settings: Settings) -> None:
-    del host.files[hm.LBANK_STATUS_FILE]
-    assert "unreadable (FileNotFoundError)" in lbank(host, settings)[0].summary
+def test_lbank_unreadable_status_alerts_under_its_own_key(host: Host, settings: Settings) -> None:
     host.files[hm.LBANK_STATUS_FILE] = PermissionError("denied")
-    assert "unreadable (PermissionError)" in lbank(host, settings)[0].summary
+    found = lbank(host, settings)
+    assert keys(found) == {"backup:lbank:unreadable"}
+    assert "unreadable (PermissionError)" in found[0].summary
+
+
+def test_lbank_status_not_created_yet_is_quiet_during_the_grace_period(
+    host: Host, settings: Settings, clock: Clock
+) -> None:
+    """The writer may not be deployed yet: no alert at once (and never an 'unreadable' alert)..."""
+    del host.files[hm.LBANK_STATUS_FILE]
+    assert lbank(host, settings) == []  # first sighting starts the clock
+    clock.advance(hours=35)
+    assert lbank(host, settings) == []
+
+
+def test_lbank_status_never_appearing_alerts_after_the_max_age(
+    host: Host, settings: Settings, clock: Clock
+) -> None:
+    """...but a backup that never reports must not pass silently either."""
+    del host.files[hm.LBANK_STATUS_FILE]
+    lbank(host, settings)
+    clock.advance(hours=37)
+    found = lbank(host, settings)
+    assert keys(found) == {"backup:lbank:nostatus"}
+    assert "never reported" in found[0].summary
+    assert "37 h" in found[0].summary
+
+
+def test_lbank_status_that_vanishes_is_measured_from_the_last_time_it_was_seen(
+    host: Host, settings: Settings, clock: Clock
+) -> None:
+    assert lbank(host, settings) == []  # status present: remembered
+    del host.files[hm.LBANK_STATUS_FILE]
+    clock.advance(hours=30)
+    assert lbank(host, settings) == []
+    clock.advance(hours=7)
+    assert keys(lbank(host, settings)) == {"backup:lbank:nostatus"}
+    host.lbank_status()  # the writer runs again with a fresh status
+    assert lbank(host, settings) == []
+
+
+def test_lbank_real_failure_after_the_nostatus_alert_is_a_new_alert_not_a_reminder(
+    host: Host, tmp_path: Path, clock: Clock
+) -> None:
+    out = Outbox()
+    monitor = make_monitor(make_settings(tmp_path), host, out)
+    del host.files[hm.LBANK_STATUS_FILE]
+    monitor.run_cycle()
+    clock.advance(hours=37)
+    host.trades_backup()  # keep the unrelated trades backup fresh
+    assert [(e.kind, e.key) for e in monitor.run_cycle()] == [("alert", "backup:lbank:nostatus")]
+    clock.advance(minutes=1)
+    host.lbank_status(ok=False, exit_code=1, message="disk full")  # the writer finally runs, and fails
+    assert [(e.kind, e.key) for e in monitor.run_cycle()] == [("alert", "backup:lbank")]
+    assert "ALERT backup:lbank\n" in out.sent[-1]
+    assert "disk full" in out.sent[-1]
 
 
 def test_trades_backup_fresh_ok_and_stale_alerts(host: Host, settings: Settings) -> None:
@@ -539,9 +604,9 @@ def test_reminder_every_repeat_hours_not_before(host: Host, settings: Settings, 
     assert len(out.sent) == 3
 
 
-def test_resolved_after_the_problem_clears(host: Host, settings: Settings, clock: Clock) -> None:
+def test_resolved_after_the_problem_clears(host: Host, tmp_path: Path, clock: Clock) -> None:
     out = Outbox()
-    monitor = make_monitor(settings, host, out)
+    monitor = make_monitor(make_settings(tmp_path, confirm_cycles=1), host, out)
     host.disks[BACKUP_DIR] = DiskUsage(90 * GIB, 10 * GIB, 2)
     monitor.run_cycle()
     host.disks[BACKUP_DIR] = DiskUsage(10 * GIB, 90 * GIB, 2)
@@ -556,9 +621,9 @@ def test_resolved_after_the_problem_clears(host: Host, settings: Settings, clock
     assert len(out.sent) == 2
 
 
-def test_flapping_problem_does_not_resolve_or_realert(host: Host, settings: Settings, clock: Clock) -> None:
+def test_flapping_problem_does_not_resolve_or_realert(host: Host, tmp_path: Path, clock: Clock) -> None:
     out = Outbox()
-    monitor = make_monitor(settings, host, out)
+    monitor = make_monitor(make_settings(tmp_path, confirm_cycles=1), host, out)
     bad, good = DiskUsage(90 * GIB, 10 * GIB, 2), DiskUsage(10 * GIB, 90 * GIB, 2)
     host.disks[BACKUP_DIR] = bad
     monitor.run_cycle()
@@ -601,7 +666,7 @@ def test_at_most_eight_messages_per_cycle(host: Host, tmp_path: Path, clock: Clo
     paths = tuple(Path(f"/mnt/d{i}") for i in range(12))
     for i, path in enumerate(paths):
         host.disks[path] = DiskUsage(99 * GIB, 1 * GIB, 100 + i)
-    settings = make_settings(tmp_path, disk_paths=paths)
+    settings = make_settings(tmp_path, disk_paths=paths, confirm_cycles=1)
     out = Outbox()
     monitor = make_monitor(settings, host, out)
     assert len(monitor.run_cycle()) == 8

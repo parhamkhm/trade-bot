@@ -28,12 +28,23 @@ Design notes
 * **Never crash the loop.** Each check is wrapped (a crash becomes a ``monitor:<check>`` problem), a
   Telegram failure only logs and backs off, and a missing ``docker`` / ``systemctl`` binary is itself
   reported as an alert.
+* **Unknown is not clear.** When a check fails as a whole (docker down, check crashed) the alerts it
+  owns stay open: it names the key prefixes to freeze (``Problem.freeze``) and the dedupe logic neither
+  counts those keys towards RESOLVED nor resets them. One recorder is one key (``recorder:<name>``), so
+  its container state and its stream state can never clear each other.
+* **Hysteresis.** Container and disk alerts need ``confirm_cycles`` consecutive bad cycles; stream and
+  backup failures alert at once. A disk alert clears only ``disk_clear_margin`` points below the limit.
+* **No secrets in children.** ``docker`` / ``systemctl`` run with a scrubbed environment; heartbeat and
+  status files are read with ``O_NOFOLLOW`` and a size cap.
+* **Optional dead-man ping.** If ``TBOT_DEADMAN_URL`` is set, one GET is made after every completed
+  cycle (healthchecks.io style); failures are ignored and the URL is never logged.
 """
 
 from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import http.client
 import json
 import logging
@@ -42,6 +53,7 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -58,8 +70,11 @@ from typing import Any
 
 __all__ = [
     "CmdResult",
+    "Collected",
     "ConfigError",
+    "DeadmanPinger",
     "DiskUsage",
+    "Memory",
     "Monitor",
     "Probes",
     "Problem",
@@ -69,12 +84,15 @@ __all__ = [
     "TelegramError",
     "TelegramSender",
     "check_disks",
+    "check_lbank_backup",
     "check_recorders",
     "check_trades_backup",
     "check_units",
+    "collect",
     "collect_problems",
     "evaluate_container",
     "evaluate_lbank_status",
+    "is_valid_token",
     "load_credentials",
     "load_settings",
     "main",
@@ -133,12 +151,15 @@ class Settings:
     backup_max_age_hours: float = 36.0
     heartbeat_max_age_s: float = 300.0
     resolve_cycles: int = 2
+    confirm_cycles: int = 2  # consecutive bad cycles before a container / disk alert is raised
+    disk_clear_margin: float = 2.0  # a disk alert clears only this many points below the limit
     targets: tuple[Target, ...] = DEFAULT_TARGETS
     disk_paths: tuple[Path, ...] = DEFAULT_DISK_PATHS
     lbank_status_file: Path = LBANK_STATUS_FILE
     trades_backup_dir: Path = TRADES_BACKUP_DIR
     state_dir: Path = DEFAULT_STATE_DIR
     hostname: str = "server"
+    deadman_url: str = field(default="", repr=False)  # secret-ish: never logged or printed
 
 
 class ConfigError(Exception):
@@ -160,11 +181,34 @@ def _env_float(env: Mapping[str, str], name: str, default: float, minimum: float
     return value
 
 
+ENV_DEADMAN_URL = "TBOT_DEADMAN_URL"
+
+
+def _load_deadman_url(env: Mapping[str, str]) -> str:
+    """The optional dead-man URL (http/https only). Never logged; invalid values are dropped."""
+    raw = env.get(ENV_DEADMAN_URL, "").strip()
+    if not raw:
+        return ""
+    try:
+        parts = urllib.parse.urlsplit(raw)
+        valid = parts.scheme in ("http", "https") and bool(parts.hostname)
+    except ValueError:
+        valid = False
+    if not valid:
+        log.warning("ignoring %s: not an http(s) URL", ENV_DEADMAN_URL)
+        return ""
+    register_secret(raw)
+    return raw
+
+
 def load_settings(env: Mapping[str, str], *, hostname: str | None = None) -> Settings:
-    """Optional, non-secret tuning from the environment; every value has a safe default."""
+    """Optional tuning from the environment; every value has a safe default."""
     paths_raw = env.get("TBOT_MONITOR_DISK_PATHS", "").strip()
     disk_paths = tuple(Path(p.strip()) for p in paths_raw.split(",") if p.strip()) or DEFAULT_DISK_PATHS
     return Settings(
+        confirm_cycles=int(_env_float(env, "TBOT_MONITOR_CONFIRM_CYCLES", 2.0, 1.0)),
+        disk_clear_margin=_env_float(env, "TBOT_MONITOR_DISK_CLEAR_MARGIN", 2.0, 0.0),
+        deadman_url=_load_deadman_url(env),
         interval_s=_env_float(env, "TBOT_MONITOR_INTERVAL_S", 60.0, 5.0),
         disk_max_pct=_env_float(env, "TBOT_MONITOR_DISK_MAX_PCT", 80.0, 1.0),
         repeat_hours=_env_float(env, "TBOT_MONITOR_REPEAT_HOURS", 6.0, 0.01),
@@ -183,6 +227,11 @@ _TOKEN_RE = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{20,}$")
 _CHAT_ID_RE = re.compile(r"^-?\d{1,20}$")
 
 
+def is_valid_token(token: str) -> bool:
+    """True if ``token`` has the shape of a Telegram bot token (``<digits>:<letters/digits>``)."""
+    return _TOKEN_RE.match(token) is not None
+
+
 def load_credentials(env: Mapping[str, str]) -> tuple[str, str]:
     """Return ``(token, chat_id)`` or raise ``ConfigError`` (never echoing either value)."""
     token = env.get(ENV_TOKEN, "").strip()
@@ -191,7 +240,7 @@ def load_credentials(env: Mapping[str, str]) -> tuple[str, str]:
         raise ConfigError(
             f"{ENV_TOKEN} and {ENV_CHAT_ID} must both be set (see deploy/health_monitor.env.example)"
         )
-    if not _TOKEN_RE.match(token):
+    if not is_valid_token(token):
         raise ConfigError(f"{ENV_TOKEN} does not look like a Telegram bot token (<digits>:<letters/digits>)")
     if not _CHAT_ID_RE.match(chat_id):
         raise ConfigError(f"{ENV_CHAT_ID} must be a numeric chat id (e.g. 123456789 or -1001234567890)")
@@ -288,12 +337,24 @@ class DiskUsage:
 
 CommandRunner = Callable[[Sequence[str]], CmdResult]
 
+# The only variables a child (docker / systemctl) may inherit. Everything else -- in particular
+# TBOT_TELEGRAM_BOT_TOKEN / TBOT_TELEGRAM_CHAT_ID / TBOT_DEADMAN_URL -- stays in this process.
+_CHILD_ENV_ALLOWED = ("PATH", "HOME", "LANG", "LC_ALL", "DOCKER_HOST", "DOCKER_CONFIG", "DOCKER_CONTEXT")
+_DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+
+def _child_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    source = os.environ if environ is None else environ
+    env = {name: source[name] for name in _CHILD_ENV_ALLOWED if name in source}
+    env.setdefault("PATH", _DEFAULT_PATH)
+    return env
+
 
 def run_command(args: Sequence[str]) -> CmdResult:
-    """Run an argument-list command (never a shell) with a hard timeout."""
+    """Run an argument-list command (never a shell) with a hard timeout and a scrubbed environment."""
     try:
         done = subprocess.run(
-            list(args), capture_output=True, text=True, timeout=20.0, check=False
+            list(args), capture_output=True, text=True, timeout=20.0, check=False, env=_child_env()
         )
     except FileNotFoundError as exc:
         raise ToolError(args[0], "not installed / not on PATH") from exc
@@ -304,8 +365,21 @@ def run_command(args: Sequence[str]) -> CmdResult:
     return CmdResult(done.returncode, done.stdout, done.stderr)
 
 
-def _read_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8")
+MAX_READ_BYTES = 1024 * 1024  # heartbeat and status files are tiny; anything bigger is not ours
+
+
+def _read_text(path: Path, max_bytes: int = MAX_READ_BYTES) -> str:
+    """Read a small regular file. A symlink as the final path component is refused (O_NOFOLLOW; the
+    parent directories are not checked), as is anything that is not a regular file or is too large."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(path, flags)
+    with os.fdopen(fd, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise OSError(errno.EINVAL, "not a regular file")
+        data = handle.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise OSError(errno.EFBIG, "file too large")
+    return data.decode("utf-8", errors="replace")
 
 
 def _list_names(path: Path) -> list[str]:
@@ -321,6 +395,21 @@ def _disk_usage(path: Path) -> DiskUsage | None:
     return DiskUsage(used=usage.used, free=usage.free, device=st.st_dev)
 
 
+@dataclass
+class Memory:
+    """What checks may remember between cycles. The ``Monitor`` loads and persists the dicts.
+
+    * ``restart_counts``: last seen docker ``RestartCount`` per container (crash-loop detection),
+    * ``anchors``: ISO timestamps of reference points (e.g. when the backup status file was last seen),
+    * ``open_keys``: keys with an open alert right now (set by the ``Monitor`` before every cycle; the
+      disk check uses it to apply the clear margin).
+    """
+
+    restart_counts: dict[str, int] = field(default_factory=dict)
+    anchors: dict[str, str] = field(default_factory=dict)
+    open_keys: set[str] = field(default_factory=set)
+
+
 @dataclass(frozen=True)
 class Probes:
     now: Callable[[], datetime] = lambda: datetime.now(UTC)
@@ -328,14 +417,35 @@ class Probes:
     read_text: Callable[[Path], str] = _read_text
     list_names: Callable[[Path], list[str]] = _list_names
     disk: Callable[[Path], DiskUsage | None] = _disk_usage
+    memory: Memory = field(default_factory=Memory)
 
 
 @dataclass(frozen=True)
 class Problem:
-    """A current problem. ``key`` is the dedupe identity; ``summary`` is the short human text."""
+    """A current problem. ``key`` is the dedupe identity; ``summary`` is the short human text.
+
+    * ``confirm``: needs ``confirm_cycles`` consecutive bad cycles before it alerts (flapping guard),
+    * ``freeze``: key prefixes this check could NOT evaluate (it failed as a whole); tracked alerts
+      under them are neither cleared nor counted towards RESOLVED this cycle,
+    * ``silent``: not an alert -- it only carries ``freeze``.
+    """
 
     key: str
     summary: str
+    confirm: bool = False
+    freeze: tuple[str, ...] = ()
+    silent: bool = False
+
+
+@dataclass(frozen=True)
+class Collected:
+    """Result of one pass over all checks: current problems plus the key prefixes left unknown."""
+
+    problems: dict[str, Problem]
+    frozen: tuple[str, ...] = ()
+
+    def is_frozen(self, key: str) -> bool:
+        return any(key.startswith(prefix) for prefix in self.frozen)
 
 
 def short(text: str, limit: int = 200) -> str:
@@ -365,23 +475,41 @@ def parse_iso(value: object) -> datetime | None:
 
 
 def check_disks(settings: Settings, probes: Probes) -> list[Problem]:
-    """Class 3: filesystem usage above the threshold (one report per distinct filesystem)."""
+    """Class 3: filesystem usage above the threshold (one report per distinct filesystem).
+
+    An open alert keeps going until usage is ``disk_clear_margin`` points BELOW the limit, so a disk
+    hovering at the limit does not flap. A path that cannot be measured is "unknown": it raises no
+    alert, but a tracked alert for it is frozen instead of being counted as cleared.
+    """
     problems: list[Problem] = []
     seen_devices: set[int] = set()
     for path in settings.disk_paths:
+        key = f"disk:{path}"
         usage = probes.disk(path)
-        if usage is None or usage.device in seen_devices:
+        if usage is None:
+            problems.append(Problem(key, f"cannot measure {path}", freeze=(key,), silent=True))
+            continue
+        if usage.device in seen_devices:
             continue
         seen_devices.add(usage.device)
-        if usage.pct_used > settings.disk_max_pct:
-            summary = f"disk {path} is {usage.pct_used:.1f}% used (limit {settings.disk_max_pct:g}%)"
-            problems.append(Problem(f"disk:{path}", summary))
+        limit = settings.disk_max_pct
+        is_open = key in probes.memory.open_keys
+        if is_open:
+            limit -= settings.disk_clear_margin
+        if usage.pct_used > limit:
+            summary = f"disk {path} is {usage.pct_used:.1f}% used (limit {settings.disk_max_pct:g}%"
+            summary += f", clears below {limit:g}%)" if is_open else ")"
+            problems.append(Problem(key, summary, confirm=True))
     return problems
 
 
 # ---------------------------------------------------------------------------------------------
 # Checks: recorder containers and streams
 # ---------------------------------------------------------------------------------------------
+
+
+def recorder_key(target: Target) -> str:
+    return f"recorder:{target.name}"
 
 
 def _last_health_output(health: Mapping[str, Any]) -> str:
@@ -393,30 +521,30 @@ def _last_health_output(health: Mapping[str, Any]) -> str:
 
 def evaluate_container(target: Target, state: object, now: datetime) -> list[Problem]:
     """Classes 1 and 4 from one ``docker inspect --format '{{json .State}}'`` document."""
-    name, container = target.name, target.container
-    container_key, stream_key = f"container:{name}", f"stream:{name}"
+    container = target.container
+    key = recorder_key(target)  # ONE key per recorder: container state and stream state share it
     if not isinstance(state, dict):
-        return [Problem(container_key, f"{container}: unreadable docker state")]
+        return [Problem(key, f"{container}: unreadable docker state", confirm=True)]
     status = state.get("Status")
     exit_code = state.get("ExitCode")
     if state.get("Restarting") is True or status == "restarting":
-        return [Problem(container_key, f"{container} is restarting (last exit code {exit_code})")]
+        return [Problem(key, f"{container} is restarting (last exit code {exit_code})", confirm=True)]
     if status != "running":
-        return [Problem(container_key, f"{container} is {status} (exit code {exit_code})")]
+        return [Problem(key, f"{container} is {status} (exit code {exit_code})", confirm=True)]
     health = state.get("Health")
     if not isinstance(health, dict):
-        return [Problem(stream_key, f"{container} has no healthcheck status")]
+        return [Problem(key, f"{container} has no healthcheck status")]
     health_status = health.get("Status")
     if health_status == "unhealthy":
-        return [Problem(stream_key, f"{container} unhealthy: {_last_health_output(health)}")]
+        return [Problem(key, f"{container} unhealthy: {_last_health_output(health)}")]
     if health_status == "starting":
         started = parse_iso(state.get("StartedAt"))
         if started is not None and (now - started).total_seconds() > _STARTING_GRACE_S:
             minutes = _STARTING_GRACE_S / 60
-            return [Problem(stream_key, f"{container} still 'starting' after {minutes:.0f} min")]
+            return [Problem(key, f"{container} still 'starting' after {minutes:.0f} min")]
         return []
     if health_status != "healthy":
-        return [Problem(stream_key, f"{container} has unknown health status {short(str(health_status), 40)}")]
+        return [Problem(key, f"{container} has unknown health status {short(str(health_status), 40)}")]
     return []
 
 
@@ -434,7 +562,7 @@ def _heartbeat_age_s(target: Target, payload: object, now: datetime) -> float | 
 
 def check_heartbeat(target: Target, settings: Settings, probes: Probes) -> list[Problem]:
     """Independent read-only look at the heartbeat file through the volume's host mountpoint."""
-    key = f"stream:{target.name}"
+    key = recorder_key(target)
     res = probes.run(["docker", "volume", "inspect", target.volume, "--format", "{{.Mountpoint}}"])
     mountpoint = res.stdout.strip()
     if res.returncode != 0 or not mountpoint:
@@ -453,25 +581,64 @@ def check_heartbeat(target: Target, settings: Settings, probes: Probes) -> list[
     return []
 
 
+_RECORDER_PREFIX = "recorder:"
+# one JSON document with the container State and the RestartCount (the latter is not part of State)
+_INSPECT_FORMAT = '{"state":{{json .State}},"restarts":{{.RestartCount}}}'
+
+
+def _parse_inspect(stdout: str) -> tuple[object, int | None]:
+    try:
+        doc = json.loads(stdout)
+    except ValueError:
+        return None, None
+    if not isinstance(doc, dict):
+        return None, None
+    restarts = doc.get("restarts")
+    count = restarts if isinstance(restarts, int) and not isinstance(restarts, bool) else None
+    return doc.get("state"), count
+
+
+def _restart_note(target: Target, count: int | None, probes: Probes) -> str:
+    """Crash-loop signal: the container's RestartCount went up since the last cycle."""
+    if count is None:
+        return ""
+    counts = probes.memory.restart_counts
+    previous = counts.get(target.container)
+    counts[target.container] = count
+    if previous is None or count <= previous:
+        return ""
+    return f"{target.container} restarted {count - previous} time(s) since the last check (total {count})"
+
+
+def _inspect_target(target: Target, settings: Settings, probes: Probes) -> list[Problem]:
+    res = probes.run(["docker", "inspect", "--format", _INSPECT_FORMAT, target.container])
+    if res.returncode != 0:
+        if "no such" in res.stderr.lower():
+            return [Problem(recorder_key(target), f"{target.container} does not exist", confirm=True)]
+        raise ToolError("docker", f"inspect failed: {short(res.stderr, 120)}")
+    state, restarts = _parse_inspect(res.stdout)
+    found = evaluate_container(target, state, probes.now()) or check_heartbeat(target, settings, probes)
+    note = _restart_note(target, restarts, probes)
+    if not note:
+        return found
+    if found:  # keep the existing problem's flags, add the restart evidence to its text
+        first = found[0]
+        return [Problem(first.key, f"{first.summary}; {note}", first.confirm), *found[1:]]
+    return [Problem(recorder_key(target), note)]
+
+
 def check_recorders(settings: Settings, probes: Probes) -> list[Problem]:
-    """Classes 1 and 4 for every recorder target; a missing/broken docker is one ``tool:docker``."""
+    """Classes 1 and 4 for every recorder target; a missing/broken docker is one ``tool:docker``.
+
+    If docker itself cannot be queried, nothing is known about ANY recorder: the ``tool:docker`` problem
+    freezes every ``recorder:*`` alert so none of them is reported as resolved.
+    """
     problems: list[Problem] = []
     try:
         for target in settings.targets:
-            res = probes.run(["docker", "inspect", "--format", "{{json .State}}", target.container])
-            if res.returncode != 0:
-                if "no such" in res.stderr.lower():
-                    problems.append(Problem(f"container:{target.name}", f"{target.container} does not exist"))
-                    continue
-                return [Problem("tool:docker", f"docker inspect failed: {short(res.stderr, 120)}")]
-            try:
-                state: object = json.loads(res.stdout)
-            except ValueError:
-                state = None
-            found = evaluate_container(target, state, probes.now())
-            problems.extend(found or check_heartbeat(target, settings, probes))
+            problems.extend(_inspect_target(target, settings, probes))
     except ToolError as exc:
-        return [Problem("tool:docker", f"docker unavailable: {exc.reason}")]
+        return [Problem("tool:docker", f"docker unavailable: {exc.reason}", freeze=(_RECORDER_PREFIX,))]
     return problems
 
 
@@ -487,11 +654,12 @@ def evaluate_lbank_status(
 
     ``raw`` is the file's text, or ``None`` with ``error`` naming why it could not be read.
     Alerts on: unreadable / corrupt file, ``ok=false``, ``integrity_ok=false`` or a timestamp
-    older than ``max_age_hours``.
+    older than ``max_age_hours``. A file that does not exist yet is NOT handled here (see
+    ``check_lbank_backup``: it has a grace period).
     """
     key = "backup:lbank"
     if raw is None:
-        return [Problem(key, f"LBank backup status file unreadable ({error})")]
+        return [Problem(f"{key}:unreadable", f"LBank backup status file unreadable ({error})")]
     try:
         data = json.loads(raw)
     except ValueError:
@@ -513,13 +681,39 @@ def evaluate_lbank_status(
     return [Problem(key, "LBank " + "; ".join(issues))] if issues else []
 
 
+_LBANK_ANCHOR = "lbank_status"
+
+
 def check_lbank_backup(settings: Settings, probes: Probes) -> list[Problem]:
+    """Class 2 for LBank. Three distinct keys, so a real failure always raises a NEW alert:
+
+    * ``backup:lbank``: the status file says failed / corrupt / stale,
+    * ``backup:lbank:unreadable``: the file exists but cannot be read (permissions, symlink, too big),
+    * ``backup:lbank:nostatus``: the file has not been created yet. This is normal right after the
+      backup job is first deployed, so it is quiet for ``backup_max_age_hours`` counted from the last
+      time a status was seen (or, if none ever was, from the first time it was found missing), and
+      alerts after that: a backup that never reports must not pass silently.
+    """
+    now = probes.now()
+    anchors = probes.memory.anchors
     try:
-        raw: str | None = probes.read_text(settings.lbank_status_file)
-        error = ""
+        raw = probes.read_text(settings.lbank_status_file)
+    except FileNotFoundError:
+        started = parse_iso(anchors.setdefault(_LBANK_ANCHOR, now.isoformat())) or now
+        waited_h = (now - started).total_seconds() / 3600.0
+        if waited_h <= settings.backup_max_age_hours:
+            return []
+        return [
+            Problem(
+                "backup:lbank:nostatus",
+                f"LBank backup status file does not exist and none has appeared for {waited_h:.0f} h"
+                f" (limit {settings.backup_max_age_hours:g} h): the nightly backup has never reported",
+            )
+        ]
     except OSError as exc:
-        raw, error = None, type(exc).__name__
-    return evaluate_lbank_status(raw, probes.now(), settings.backup_max_age_hours, error=error)
+        return evaluate_lbank_status(None, now, settings.backup_max_age_hours, error=type(exc).__name__)
+    anchors[_LBANK_ANCHOR] = now.isoformat()
+    return evaluate_lbank_status(raw, now, settings.backup_max_age_hours)
 
 
 def check_trades_backup(settings: Settings, probes: Probes) -> list[Problem]:
@@ -552,11 +746,13 @@ def check_units(settings: Settings, probes: Probes) -> list[Problem]:  # noqa: A
             if res.stdout.strip() == "failed":
                 problems.append(Problem(f"backup:unit:{unit}", f"systemd unit {unit} is failed"))
     except ToolError as exc:
-        return [Problem("tool:systemctl", f"systemctl unavailable: {exc.reason}")]
+        return [Problem("tool:systemctl", f"systemctl unavailable: {exc.reason}", freeze=("backup:unit:",))]
     return problems
 
 
-CHECKS: tuple[tuple[str, Callable[[Settings, Probes], list[Problem]]], ...] = (
+CheckFn = Callable[[Settings, Probes], list[Problem]]
+
+CHECKS: tuple[tuple[str, CheckFn], ...] = (
     ("disks", check_disks),
     ("recorders", check_recorders),
     ("lbank_backup", check_lbank_backup),
@@ -564,23 +760,39 @@ CHECKS: tuple[tuple[str, Callable[[Settings, Probes], list[Problem]]], ...] = (
     ("units", check_units),
 )
 
+# Alert keys each check owns. If the check crashes, its result is unknown, so these are frozen.
+CHECK_KEY_PREFIXES: dict[str, tuple[str, ...]] = {
+    "disks": ("disk:",),
+    "recorders": (_RECORDER_PREFIX,),
+    "lbank_backup": ("backup:lbank",),
+    "trades_backup": ("backup:trades",),
+    "units": ("backup:unit:",),
+}
 
-def collect_problems(
-    settings: Settings,
-    probes: Probes,
-    checks: Sequence[tuple[str, Callable[[Settings, Probes], list[Problem]]]] = CHECKS,
-) -> dict[str, Problem]:
-    """Run every check; a crashing check becomes its own ``monitor:<name>`` problem."""
+
+def collect(settings: Settings, probes: Probes, checks: Sequence[tuple[str, CheckFn]] = CHECKS) -> Collected:
+    """Run every check. A crashing check becomes a ``monitor:<name>`` problem AND freezes its keys."""
     found: dict[str, Problem] = {}
+    frozen: list[str] = []
     for name, check in checks:
         try:
             results = check(settings, probes)
         except Exception as exc:
             log.error("check %s crashed: %s", name, type(exc).__name__)
-            results = [Problem(f"monitor:{name}", f"health check '{name}' crashed ({type(exc).__name__})")]
+            summary = f"health check '{name}' crashed ({type(exc).__name__})"
+            results = [Problem(f"monitor:{name}", summary, freeze=CHECK_KEY_PREFIXES.get(name, ()))]
         for problem in results:
-            found.setdefault(problem.key, problem)
-    return found
+            frozen.extend(problem.freeze)
+            if not problem.silent:
+                found.setdefault(problem.key, problem)
+    return Collected(found, tuple(dict.fromkeys(frozen)))
+
+
+def collect_problems(
+    settings: Settings, probes: Probes, checks: Sequence[tuple[str, CheckFn]] = CHECKS
+) -> dict[str, Problem]:
+    """Current problems only (what ``--check`` prints)."""
+    return collect(settings, probes, checks).problems
 
 
 # ---------------------------------------------------------------------------------------------
@@ -675,6 +887,8 @@ class Tracked:
 class MonitorState:
     tracked: dict[str, Tracked] = field(default_factory=dict)
     last_start_notice_ts: str | None = None
+    anchors: dict[str, str] = field(default_factory=dict)
+    restart_counts: dict[str, int] = field(default_factory=dict)
 
 
 class StateStore:
@@ -696,7 +910,9 @@ class StateStore:
                 for key, item in data["tracked"].items()
             }
             notice = data.get("last_start_notice_ts")
-            return MonitorState(tracked, str(notice) if notice else None)
+            anchors = {str(k): str(v) for k, v in (data.get("anchors") or {}).items()}
+            restarts = {str(k): int(v) for k, v in (data.get("restart_counts") or {}).items()}
+            return MonitorState(tracked, str(notice) if notice else None, anchors, restarts)
         except FileNotFoundError:
             return MonitorState()
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
@@ -707,6 +923,8 @@ class StateStore:
         payload = {
             "version": 1,
             "last_start_notice_ts": state.last_start_notice_ts,
+            "anchors": state.anchors,
+            "restart_counts": state.restart_counts,
             "tracked": {
                 key: {
                     "first_ts": t.first_ts,
@@ -754,6 +972,10 @@ class Monitor:
         self._send = send
         self._store = store
         self._state = store.load()
+        self._memory = probes.memory
+        self._memory.anchors.update(self._state.anchors)
+        self._memory.restart_counts.update(self._state.restart_counts)
+        self._pending: dict[str, int] = {}  # consecutive bad cycles of not-yet-alerting keys
         self._send_failures = 0
         self._next_send_at: datetime | None = None
 
@@ -799,24 +1021,40 @@ class Monitor:
 
     # -- one cycle --------------------------------------------------------------------------
 
-    def _plan(self, problems: Mapping[str, Problem], now: datetime) -> list[Event]:
+    def _confirmed(self, problem: Problem) -> bool:
+        """Flapping guard: a ``confirm`` problem must be seen ``confirm_cycles`` cycles in a row."""
+        if not problem.confirm or self._s.confirm_cycles <= 1:
+            return True
+        seen = self._pending.get(problem.key, 0) + 1
+        self._pending[problem.key] = seen
+        return seen >= self._s.confirm_cycles
+
+    def _plan(self, found: Collected, now: datetime) -> list[Event]:
+        problems = found.problems
         tracked = self._state.tracked
         repeat = timedelta(hours=self._s.repeat_hours)
         events: list[Event] = []
+        for key in [k for k in self._pending if k not in problems]:
+            del self._pending[key]  # a bad streak is broken by a good OR an unknown cycle
         for key, problem in problems.items():
             item = tracked.get(key)
             if item is None:
-                events.append(Event("alert", key, problem.summary))
+                if self._confirmed(problem):
+                    events.append(Event("alert", key, problem.summary))
                 continue
             item.summary, item.clear_count = problem.summary, 0
             last_sent = parse_iso(item.last_sent_ts) or now
             if now - last_sent >= repeat:
                 events.append(Event("reminder", key, problem.summary))
         for key, item in tracked.items():
-            if key not in problems:
-                item.clear_count += 1
-                if item.clear_count >= self._s.resolve_cycles:
-                    events.append(Event("resolved", key, item.summary))
+            if key in problems:
+                continue
+            if found.is_frozen(key):  # unknown is not clear: keep the alert open, restart the count
+                item.clear_count = 0
+                continue
+            item.clear_count += 1
+            if item.clear_count >= self._s.resolve_cycles:
+                events.append(Event("resolved", key, item.summary))
         return events
 
     def _apply(self, event: Event, now: datetime) -> None:
@@ -839,15 +1077,18 @@ class Monitor:
     def run_cycle(self) -> list[Event]:
         """Run all checks once. Returns the events that were actually sent."""
         now = self._probes.now()
-        problems = collect_problems(self._s, self._probes)
+        self._memory.open_keys = set(self._state.tracked)
+        found = collect(self._s, self._probes)
         sent: list[Event] = []
-        for event in self._plan(problems, now)[:_MAX_EVENTS_PER_CYCLE]:
+        for event in self._plan(found, now)[:_MAX_EVENTS_PER_CYCLE]:
             if not self._try_send(self._message(event, now), now):
                 break
             self._apply(event, now)
             sent.append(event)
+        self._state.anchors = dict(self._memory.anchors)
+        self._state.restart_counts = dict(self._memory.restart_counts)
         self._store.save(self._state)
-        log.info("cycle done: %d problem(s), %d message(s) sent", len(problems), len(sent))
+        log.info("cycle done: %d problem(s), %d message(s) sent", len(found.problems), len(sent))
         return sent
 
 
@@ -856,12 +1097,57 @@ class Monitor:
 # ---------------------------------------------------------------------------------------------
 
 
-def run_forever(monitor: Monitor, interval_s: float, stop: threading.Event) -> None:
+class DeadmanPinger:
+    """Optional dead-man switch (healthchecks.io style): one HTTP GET to a URL you own, made after
+    every completed cycle. If the whole server (and with it this monitor) dies, the service on the
+    other end notices the missing pings and tells you -- nothing on this host can do that.
+
+    The URL is a secret: it is never logged or printed (``repr`` is masked, failures are logged as
+    an exception type only) and every failure is ignored.
+    """
+
+    def __init__(self, url: str, *, timeout: float = 10.0) -> None:
+        self._url = url
+        self._timeout = timeout
+        self._failing = False
+        register_secret(url)
+
+    def __call__(self) -> bool:
+        try:
+            request = urllib.request.Request(self._url, method="GET")
+            with urllib.request.urlopen(request, timeout=self._timeout) as response:
+                response.read(1024)
+        except Exception as exc:  # urllib errors can carry the URL: log the type only
+            if not self._failing:
+                log.warning("dead-man ping failed (%s); will keep trying silently", type(exc).__name__)
+            self._failing = True
+            return False
+        if self._failing:
+            log.info("dead-man ping works again")
+        self._failing = False
+        return True
+
+    def __repr__(self) -> str:
+        return "DeadmanPinger(url=***)"
+
+
+def run_forever(
+    monitor: Monitor,
+    interval_s: float,
+    stop: threading.Event,
+    ping: Callable[[], object] | None = None,
+) -> None:
     while not stop.is_set():
         try:
             monitor.run_cycle()
         except Exception as exc:  # last line of defence: the loop must survive anything
             log.error("monitor cycle crashed: %s", type(exc).__name__)
+        else:
+            if ping is not None:
+                try:
+                    ping()
+                except Exception as exc:  # a broken ping must never stop the monitor
+                    log.error("dead-man ping crashed: %s", type(exc).__name__)
         stop.wait(interval_s)
 
 
@@ -902,7 +1188,8 @@ def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None
     signal.signal(signal.SIGTERM, _handle)
     signal.signal(signal.SIGINT, _handle)
     monitor.start()
-    run_forever(monitor, settings.interval_s, stop)
+    ping = DeadmanPinger(settings.deadman_url) if settings.deadman_url else None
+    run_forever(monitor, settings.interval_s, stop, ping)
     return 0
 
 
