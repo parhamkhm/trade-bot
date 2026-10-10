@@ -57,7 +57,7 @@ stop before live trading — that is a successful result of this process, not a 
      only emits signals and a human places orders by hand (phase 7a). From 5b on, the automated order path is only
      reachable when `LIVE_TRADING=true` AND the config phase is ≥ 7b.
    - **Order-code guardrail.** A Claude Code `PreToolUse` hook (`.claude/hooks/block_order_code.py`, wired in
-     `.claude/settings.json`, matcher `Write|Edit|MultiEdit`) blocks any edit under `src/` or `scripts/` that
+     `.claude/settings.json`, matcher `Write|Edit|MultiEdit`) blocks any edit under `src/`, `scripts/`, `deploy/` or `config/` (D-055) that
      introduces order / cancel / OCO / margin / withdrawal / `userDataStream` endpoints or HTTP `POST`/`DELETE`
      calls to the exchange. It also blocks edits to itself and to `.claude/settings.json`. Only Parham unlocks it,
      by setting `TBOT_ALLOW_ORDER_CODE=1` himself (phase 5b). The same patterns are scanned by a pytest audit test
@@ -195,8 +195,8 @@ class Broker(Protocol):
 ```
 
 Rules: money and quantities are `Decimal` in execution/portfolio code; `float` is fine inside research and
-indicator math. Quantities are rounded to the exchange's step size and price to tick size via `exchangeInfo`
-filters before submission; orders below min-notional are refused by the RiskManager, not sent.
+indicator math. Quantities are rounded to the exchange's step size and price to tick size via the exchange's
+precision filters (LBank `accuracy.do`) before submission; orders below min-notional are refused by the RiskManager, not sent.
 
 ## 6. LBank API notes (measured from the Turkey server 2026-10-10 — **re-verify with the G0 probe**)
 
@@ -213,7 +213,7 @@ filters before submission; orders below min-notional are refused by the RiskMana
 - Reported 24 h volume is likely partly inflated; liquidity is judged by **measured order-book depth** only.
 - Rate limits: probe **conservatively**, stop at the first 429 or ban-type response — the Turkey server is our
   only IP (D-073). Client-side token bucket + exponential backoff on 429/5xx.
-- Adapter: `ccxt` (exact version pinned in `uv.lock`) for the broker side, read-only methods only; the order-code
+- Adapter: `ccxt` for the broker side (exact version pinned in `uv.lock` when first added, which happens only after Parham has applied the D-075 guard patch), read-only methods only; once that patch is applied the order-code
   guardrail also blocks ccxt's order/cancel/edit/margin/transfer methods in snake_case **and camelCase** (D-075).
   Direct REST is used where ccxt is slow or incomplete (the recorder).
 - Private API: postponed until Parham creates a read-only key from an account in his own name (D-073).

@@ -113,7 +113,7 @@ class RiskConfig(_Base):
     """Pre-set risk limits. The RiskManager (phase 4) is the only consumer."""
 
     max_exposure: float = Field(default=1.0, ge=0.0, le=1.0)
-    annual_vol_target: float = Field(default=0.20, gt=0.0, le=2.0)
+    annual_vol_target: float = Field(default=0.30, gt=0.0, le=2.0)
     max_daily_loss_pct: float = Field(default=0.10, gt=0.0, le=1.0)
     max_orders_per_hour: int = Field(default=6, ge=1)
     max_data_age_seconds: int = Field(default=900, ge=1)

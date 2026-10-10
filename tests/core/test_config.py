@@ -43,6 +43,12 @@ def test_default_yaml_loads_and_matches_schema():
     assert Timeframe.H4 in config.data.timeframes
 
 
+def test_vol_target_is_the_locked_s0_value():
+    # D-063: S0 sizes to 30 % annual vol; 20 %/40 % are robustness variants run via override only
+    config = load_config("default", config_dir=REPO_ROOT / "config")
+    assert config.risk.annual_vol_target == 0.30
+
+
 def test_default_yaml_holdout_is_a_fixed_utc_date():
     config = load_config("default", config_dir=REPO_ROOT / "config")
     assert config.data.holdout_start == datetime(2025, 10, 1, tzinfo=UTC)

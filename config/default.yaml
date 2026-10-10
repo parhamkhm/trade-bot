@@ -36,6 +36,8 @@ data:
   # CANONICAL_HOLDOUT_START, and a mismatch here is refused and logged (D-026, D-030).
   holdout_start: 2025-10-01T00:00:00Z
 
+# Legacy Tabdeal section (D-062): kept so existing code and tests load; LBank settings arrive with the
+# LBank client. Nothing here is traded.
 exchange:
   base_url: https://api1.tabdeal.org
   read_prefix: /r/api/v1
@@ -47,7 +49,7 @@ exchange:
 
 risk:
   max_exposure: 1.0
-  annual_vol_target: 0.20
+  annual_vol_target: 0.30
   max_daily_loss_pct: 0.10
   max_orders_per_hour: 6
   max_data_age_seconds: 900

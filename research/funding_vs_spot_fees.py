@@ -112,9 +112,9 @@ def analyse(funding: pd.DataFrame, pos: pd.DataFrame) -> dict[str, object]:
             {
                 "year": f"{year} (partial)" if partial else str(year),
                 "funding_always_long_pct": round(100 * grp["rate"].sum(), 2),
-                "funding_while_s0_long_pct": round(100 * (grp["rate"] * grp["pos"]).sum(), 2),
-                "s0_time_in_market_pct": round(100 * p.mean(), 1),
-                "s0_sides": _sides(pos["pos"].loc[pos_year["year"] <= year])
+                "funding_while_proxy_long_pct": round(100 * (grp["rate"] * grp["pos"]).sum(), 2),
+                "proxy_time_in_market_pct": round(100 * p.mean(), 1),
+                "proxy_sides": _sides(pos["pos"].loc[pos_year["year"] <= year])
                 - _sides(pos["pos"].loc[pos_year["year"] < year]),
                 "share_of_8h_periods_positive_pct": round(100 * (grp["rate"] > 0).mean(), 1),
             }
@@ -137,7 +137,7 @@ def analyse(funding: pd.DataFrame, pos: pd.DataFrame) -> dict[str, object]:
         "sample": {"start": start.isoformat(), "end_exclusive": end.isoformat(), "years": round(years, 3)},
         "n_funding_events": len(merged),
         "funding_always_long_pct_per_year": round(always, 2),
-        "funding_while_s0_long_pct_per_year": round(while_long, 2),
+        "funding_while_proxy_long_pct_per_year": round(while_long, 2),
         "share_of_8h_periods_positive_pct": round(100 * float((merged["rate"] > 0).mean()), 2),
         "s0": {
             "rule": f"SMA{SMA_DAYS} proxy: close > SMA{SMA_DAYS} (1d), long/flat, weight 1.0, no stop, "
@@ -163,7 +163,7 @@ def _markdown(res: dict[str, object]) -> str:
         "",
         f"- Funding paid by an always-long perpetual: **{res['funding_always_long_pct_per_year']} % / year**",
         "- Funding paid only while the SMA100 proxy is long: "
-        f"**{res['funding_while_s0_long_pct_per_year']} % / year** "
+        f"**{res['funding_while_proxy_long_pct_per_year']} % / year** "
         f"(time in market {s0['time_in_market_pct']} %, {s0['sides_per_year']} sides / year)",
         "",
         "| perpetual leg | saving / side (bps) | fee saving % / yr | net extra cost of perp % / yr"
@@ -187,8 +187,8 @@ def _markdown(res: dict[str, object]) -> str:
     assert isinstance(by_year, list)
     for row in by_year:
         lines.append(
-            f"| {row['year']} | {row['funding_always_long_pct']} | {row['funding_while_s0_long_pct']} | "
-            f"{row['s0_time_in_market_pct']} | {row['s0_sides']} | "
+            f"| {row['year']} | {row['funding_always_long_pct']} | {row['funding_while_proxy_long_pct']} | "
+            f"{row['proxy_time_in_market_pct']} | {row['proxy_sides']} | "
             f"{row['share_of_8h_periods_positive_pct']} |"
         )
     return "\n".join(lines) + "\n"

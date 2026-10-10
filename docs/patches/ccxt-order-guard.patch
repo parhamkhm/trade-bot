@@ -1,5 +1,5 @@
 diff --git a/.claude/hooks/order_code_patterns.py b/.claude/hooks/order_code_patterns.py
-index bfd871b..5c27262 100644
+index bfd871b..92d51b9 100644
 --- a/.claude/hooks/order_code_patterns.py
 +++ b/.claude/hooks/order_code_patterns.py
 @@ -221,6 +221,14 @@ _RECEIVER_RE = (
@@ -17,7 +17,7 @@ index bfd871b..5c27262 100644
  FORBIDDEN_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
      (
          "path:/order",
-@@ -310,6 +318,31 @@ FORBIDDEN_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+@@ -310,6 +318,42 @@ FORBIDDEN_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
              r"place_order|new_oco_order|create_\w*_order|withdraw|delete_order|cancel_replace)\s*\("
          ),
      ),
@@ -30,30 +30,41 @@ index bfd871b..5c27262 100644
 +    # (`(?-i:...)`) so a stats attribute like `stats.createdOrders` or `canceled_orders` stays clean.
 +    ("sdk:ccxt-order-method", re.compile(r"(?i)\.\s*" + _CCXT_ORDER_METHOD + r"\b")),
 +    # The same names as a quoted literal: `getattr(ex, "createOrder")`, `methods = ["cancel_order"]`.
-+    ("sdk:ccxt-order-method-literal", re.compile(r"(?i)([\"'])" + _CCXT_ORDER_METHOD + r"\1")),
-+    # Margin, leverage, borrowing, transfers and withdrawals (snake_case and camelCase).
++    # A read-only capability lookup (`ex.has["createOrder"]`) is deliberately left alone.
++    ("sdk:ccxt-order-method-literal", re.compile(r"(?i)(?<!\bhas\[)([\"'])" + _CCXT_ORDER_METHOD + r"\1")),
++    # Margin, leverage, borrowing, transfers, withdrawals and conversions (snake_case and camelCase).
 +    (
 +        "sdk:ccxt-funds-method",
 +        re.compile(
-+            r"(?i)\.\s*(?:set_?leverage|set_?margin_?mode|set_?position_?mode|add_?margin|reduce_?margin|"
-+            r"borrow\w*|repay\w*|transfer|withdraw)\b"
++            r"(?i)\.\s*(?:set_?leverage|set_?margin(?:_?mode)?|set_?position_?mode|add_?margin|reduce_?margin|"
++            r"borrow(?:_?\w*margin)?|repay(?:_?\w*margin)?|transfer(?:_?(?:in|out))?|withdraw(?:_?ws)?|"
++            r"create_?convert_?trade)\b"
 +        ),
 +    ),
 +    # ccxt's implicit private API: `ex.privatePostOrder(...)`, `ex.private_delete_order(...)`,
-+    # `ex.v2PrivatePostOrder(...)`, plus the low-level `fetch2` entry point.
-+    ("sdk:ccxt-implicit-private", re.compile(r"(?i)\.\s*\w*private_?(?:post|put|delete|patch)\w*")),
++    # `ex.v2PrivatePostTradeOrder(...)`. Case-sensitive tail so `.private_posture` stays clean.
++    (
++        "sdk:ccxt-implicit-private",
++        re.compile(r"\.\s*(?-i:\w*[Pp]rivate_?(?:[Pp]ost|[Pp]ut|[Dd]elete|[Pp]atch)(?![a-z]))"),
++    ),
 +    ("sdk:ccxt-fetch2", re.compile(r"(?i)\.\s*fetch2\s*\(")),
 +    # `getattr(<exchange-looking object>, <anything>)`: the method name may be built at runtime, which
-+    # no literal pattern can see. Any other `getattr(obj, "id", None)` is unaffected.
-+    ("dynamic:getattr-on-exchange", re.compile(r"(?i)\bgetattr\s*\(\s*(?:self\.)?_?\w*(?:exchange|ccxt)\w*\s*,")),
++    # no literal pattern can see. Receivers named like an exchange client are matched; any other
++    # `getattr(obj, "id", None)` is unaffected. Known false positive: `getattr(self._exchange_info, ...)`.
++    (
++        "dynamic:getattr-on-exchange",
++        re.compile(
++            r"(?i)\bgetattr\s*\(\s*(?:self\.)?_?(?:\w*(?:exchange|ccxt|lbank|broker)\w*|ex|api|client)\s*,"
++        ),
++    ),
      # round 4: `delete_order`/`cancel_replace` added above (reviewer-found missed SDK method
      # names). Deliberately did NOT add `get_order` or `query_order`: `src/tbot/core/types.py`'s
      # `Broker` protocol already defines `get_order(self, client_order_id: str) -> OrderStatus`
 diff --git a/tests/test_order_code_audit.py b/tests/test_order_code_audit.py
-index 2d32778..a9e3cd9 100644
+index 2d32778..bea29b8 100644
 --- a/tests/test_order_code_audit.py
 +++ b/tests/test_order_code_audit.py
-@@ -275,6 +275,24 @@ def test_skip_predicate_never_skips_in_ci() -> None:
+@@ -275,6 +275,29 @@ def test_skip_predicate_never_skips_in_ci() -> None:
          # "order" as a substring of a longer argument, so a call like `self._url("reorder")` (a
          # different word, not the bare literal "order") stays unmatched.
          'self._url("reorder")\n',
@@ -75,10 +86,15 @@ index 2d32778..a9e3cd9 100644
 +        'x = getattr(obj, "id", None)\n',
 +        "x = getattr(self, name)\n",
 +        "x = getattr(value, name_of_field)\n",
++        "x = ex.has['createOrder']\n",
++        'x = self.exchange.has["cancelOrder"]\n',
++        "n = loan.borrowed\n",
++        "n = plan.repayment_schedule\n",
++        "n = obj.private_posture\n",
      ],
  )
  def test_known_safe_snippets_produce_no_matches(safe_snippet: str) -> None:
-@@ -413,6 +431,43 @@ def test_known_safe_snippet_op_delete_is_accepted_as_still_blocked() -> None:
+@@ -413,6 +436,54 @@ def test_known_safe_snippet_op_delete_is_accepted_as_still_blocked() -> None:
          # `test_bare_fstring_path_tail_without_prose_whitespace_is_still_blocked` below for the
          # fuller explanation; this entry just keeps it covered by the parametrized sweep too.
          ('f"{fills}/orders"', "path:/order"),
@@ -108,17 +124,28 @@ index 2d32778..a9e3cd9 100644
 +        ("ex.set_leverage(3, symbol)", "ccxt-funds-method"),
 +        ("ex.setLeverage(3, symbol)", "ccxt-funds-method"),
 +        ("ex.setMarginMode('isolated', symbol)", "ccxt-funds-method"),
++        ("ex.setMargin(symbol, 1)", "ccxt-funds-method"),
++        ("ex.set_margin(symbol, 1)", "ccxt-funds-method"),
 +        ("ex.addMargin(symbol, 1)", "ccxt-funds-method"),
 +        ("ex.borrowCrossMargin('USDT', 10)", "ccxt-funds-method"),
 +        ("ex.repay_isolated_margin(symbol, 'USDT', 10)", "ccxt-funds-method"),
 +        ("ex.transfer('USDT', 10, 'spot', 'swap')", "ccxt-funds-method"),
++        ("ex.transferIn('USDT', 1)", "ccxt-funds-method"),
++        ("ex.transfer_out('USDT', 1)", "ccxt-funds-method"),
 +        ("ex.withdraw('USDT', 10, address)", "ccxt-funds-method"),
++        ("ex.withdrawWs('USDT', 10, address)", "ccxt-funds-method"),
++        ("ex.withdraw_ws('USDT', 10, address)", "ccxt-funds-method"),
++        ("ex.createConvertTrade(id, a, b, 1)", "ccxt-funds-method"),
++        ("ex.create_convert_trade(id, a, b, 1)", "ccxt-funds-method"),
 +        ("ex.privatePostOrder(params)", "ccxt-implicit-private"),
 +        ("ex.private_delete_order(params)", "ccxt-implicit-private"),
++        ("ex.private_post_order(params)", "ccxt-implicit-private"),
 +        ("ex.v2PrivatePostTradeOrder(params)", "ccxt-implicit-private"),
 +        ("ex.fetch2(path, 'private', 'GET', params)", "ccxt-fetch2"),
 +        ('m = getattr(self._exchange, "create" + "_order")', "getattr-on-exchange"),
 +        ("m = getattr(ccxt_client, name)", "getattr-on-exchange"),
++        ("m = getattr(self.ex, name)", "getattr-on-exchange"),
++        ("m = getattr(lbank, name)", "getattr-on-exchange"),
      ],
  )
  def test_known_unsafe_snippets_are_detected(unsafe_snippet: str, expected_pattern_substring: str) -> None:
