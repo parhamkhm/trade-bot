@@ -1,0 +1,1161 @@
+"""Tests for the host-side Telegram health monitor. Only fake values and fake edges are used:
+no real token, no network, no docker, no systemctl, no real env file."""
+
+from __future__ import annotations
+
+import io
+import json
+import logging
+import socket
+import threading
+import traceback
+import urllib.error
+import urllib.request
+from collections.abc import Callable, Sequence
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from tbot.monitoring import health_monitor as hm
+from tbot.monitoring.health_monitor import (
+    CmdResult,
+    ConfigError,
+    DiskUsage,
+    Monitor,
+    Probes,
+    Problem,
+    Settings,
+    StateStore,
+    Target,
+    TelegramError,
+    TelegramSender,
+)
+
+REPO = Path(__file__).resolve().parents[2]
+NOW = datetime(2026, 10, 10, 12, 0, 0, tzinfo=UTC)
+FAKE_TOKEN = "123456789:AAFakeTokenFakeTokenFakeToken_xyz"
+FAKE_CHAT = "424242"
+
+TABDEAL = hm.DEFAULT_TARGETS[0]
+LBANK = hm.DEFAULT_TARGETS[1]
+ROOT = Path("/")
+DOCKER_DIR = Path("/var/lib/docker")
+BACKUP_DIR = Path("/var/backups/tbot")
+
+GIB = 1024**3
+
+
+def iso(dt: datetime) -> str:
+    return dt.isoformat().replace("+00:00", "Z")
+
+
+def container_state(**over: Any) -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "Status": "running",
+        "Restarting": False,
+        "ExitCode": 0,
+        "StartedAt": "2026-10-09T00:00:00.123456789Z",
+        "Health": {"Status": "healthy", "Log": [{"Output": "ok"}]},
+    }
+    state.update(over)
+    return state
+
+
+class Clock:
+    def __init__(self, start: datetime = NOW) -> None:
+        self.t = start
+
+    def __call__(self) -> datetime:
+        return self.t
+
+    def advance(self, **kw: float) -> None:
+        self.t += timedelta(**kw)
+
+
+class Host:
+    """A fake server: containers, volumes, files, directories, units and disks, all mutable."""
+
+    def __init__(self, clock: Clock) -> None:
+        self.clock = clock
+        self.states: dict[str, Any] = {
+            "tbot-recorder": container_state(),
+            "tbot-lbank-recorder": container_state(),
+        }
+        self.mounts = {"tbot-data": "/v/tbot-data", "tbot-lbank-data": "/v/tbot-lbank-data"}
+        self.files: dict[Path, str | Exception | Callable[[], str]] = {}
+        self.dirs: dict[Path, list[str] | Exception] = {}
+        self.failed_units: set[str] = set()
+        self.disks: dict[Path, DiskUsage | None] = {
+            ROOT: DiskUsage(50 * GIB, 50 * GIB, 1),
+            DOCKER_DIR: DiskUsage(50 * GIB, 50 * GIB, 1),
+            BACKUP_DIR: DiskUsage(10 * GIB, 90 * GIB, 2),
+        }
+        self.tool_missing: set[str] = set()
+        self.docker_down = False
+        self.calls: list[tuple[str, ...]] = []
+        self.heartbeat_ok()
+        self.lbank_status()
+        self.trades_backup()
+
+    # -- scenario helpers -------------------------------------------------------------------
+
+    def heartbeat_ok(self, age_s: float = 10.0) -> None:
+        """Heartbeats that stay `age_s` old however far the fake clock advances (a live recorder)."""
+
+        def tabdeal() -> str:
+            return json.dumps({"last_poll_ts": iso(self.clock() - timedelta(seconds=age_s))})
+
+        def lbank() -> str:
+            when = self.clock() - timedelta(seconds=age_s)
+            return json.dumps({"written_ms": int(when.timestamp() * 1000)})
+
+        self.files[Path("/v/tbot-data") / "tabdeal/heartbeat.json"] = tabdeal
+        self.files[Path("/v/tbot-lbank-data") / "lbank/heartbeat.json"] = lbank
+
+    def lbank_status(self, **over: Any) -> None:
+        data: dict[str, Any] = {
+            "ts": iso(self.clock() - timedelta(hours=3)),
+            "ok": True,
+            "exit_code": 0,
+            "days_archived": [],
+            "days_pending": [],
+            "message": "ok",
+            "integrity_ok": True,
+        }
+        data.update(over)
+        self.files[hm.LBANK_STATUS_FILE] = json.dumps(data)
+
+    def trades_backup(self, age_h: float = 5.0) -> None:
+        stamp = (self.clock() - timedelta(hours=age_h)).strftime("%Y%m%dT%H%M%SZ")
+        self.dirs[hm.TRADES_BACKUP_DIR] = [f"trades-{stamp}.sqlite", "notes.txt"]
+
+    # -- injected edges ---------------------------------------------------------------------
+
+    def run(self, args: Sequence[str]) -> CmdResult:
+        argv = tuple(args)
+        self.calls.append(argv)
+        if argv[0] in self.tool_missing:
+            raise hm.ToolError(argv[0], "not installed / not on PATH")
+        if argv[0] == "systemctl":
+            failed = argv[2] in self.failed_units
+            return CmdResult(0 if failed else 1, "failed\n" if failed else "active\n", "")
+        if self.docker_down:
+            return CmdResult(1, "", "Cannot connect to the Docker daemon")
+        if argv[:2] == ("docker", "inspect"):
+            state = self.states.get(argv[-1])
+            if state is None:
+                return CmdResult(1, "", f"Error: No such object: {argv[-1]}")
+            return CmdResult(0, state if isinstance(state, str) else json.dumps(state), "")
+        if argv[:3] == ("docker", "volume", "inspect"):
+            mount = self.mounts.get(argv[3])
+            return CmdResult(0, f"{mount}\n", "") if mount else CmdResult(1, "", "no such volume")
+        raise AssertionError(f"unexpected command {argv}")
+
+    def read_text(self, path: Path) -> str:
+        item = self.files.get(path)
+        if item is None:
+            raise FileNotFoundError(path.name)
+        if isinstance(item, Exception):
+            raise item
+        return item() if callable(item) else item
+
+    def list_names(self, path: Path) -> list[str]:
+        item = self.dirs.get(path)
+        if item is None:
+            raise FileNotFoundError(path.name)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    def disk(self, path: Path) -> DiskUsage | None:
+        return self.disks.get(path)
+
+    def probes(self) -> Probes:
+        return Probes(
+            now=self.clock, run=self.run, read_text=self.read_text, list_names=self.list_names, disk=self.disk
+        )
+
+
+def make_settings(tmp_path: Path, **over: Any) -> Settings:
+    return Settings(state_dir=tmp_path / "state", hostname="testhost", **over)
+
+
+@pytest.fixture
+def clock() -> Clock:
+    return Clock()
+
+
+@pytest.fixture
+def host(clock: Clock) -> Host:
+    return Host(clock)
+
+
+@pytest.fixture
+def settings(tmp_path: Path) -> Settings:
+    return make_settings(tmp_path)
+
+
+class Outbox:
+    """Collects sent messages; can be told to fail."""
+
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+        self.calls = 0
+        self.fail: Exception | None = None
+
+    def __call__(self, text: str) -> None:
+        self.calls += 1
+        if self.fail is not None:
+            raise self.fail
+        self.sent.append(text)
+
+
+def make_monitor(
+    settings: Settings, host: Host, out: Outbox, store: StateStore | None = None
+) -> Monitor:
+    return Monitor(settings, host.probes(), out, store or StateStore(settings.state_dir / "state.json"))
+
+
+def keys(problems: dict[str, Problem] | list[Problem]) -> set[str]:
+    items = problems.values() if isinstance(problems, dict) else problems
+    return {p.key for p in items}
+
+
+# ---------------------------------------------------------------------------------------------
+# Healthy baseline
+# ---------------------------------------------------------------------------------------------
+
+
+def test_healthy_host_has_no_problems(host: Host, settings: Settings) -> None:
+    assert hm.collect_problems(settings, host.probes()) == {}
+
+
+# ---------------------------------------------------------------------------------------------
+# Class 3: disks
+# ---------------------------------------------------------------------------------------------
+
+
+def test_disk_above_limit_alerts_and_equal_does_not(host: Host, settings: Settings) -> None:
+    host.disks[BACKUP_DIR] = DiskUsage(81 * GIB, 19 * GIB, 2)
+    found = hm.check_disks(settings, host.probes())
+    assert keys(found) == {"disk:" + str(BACKUP_DIR)}
+    assert "81.0%" in found[0].summary
+
+    host.disks[BACKUP_DIR] = DiskUsage(80 * GIB, 20 * GIB, 2)
+    assert hm.check_disks(settings, host.probes()) == []
+
+
+def test_disk_reports_one_problem_per_filesystem(host: Host, settings: Settings) -> None:
+    full = DiskUsage(95 * GIB, 5 * GIB, 7)
+    host.disks[ROOT] = full
+    host.disks[DOCKER_DIR] = full  # same device id as "/": one filesystem, one alert
+    assert keys(hm.check_disks(settings, host.probes())) == {"disk:" + str(ROOT)}
+
+
+def test_disk_path_that_cannot_be_read_is_skipped(host: Host, settings: Settings) -> None:
+    host.disks[DOCKER_DIR] = None
+    assert hm.check_disks(settings, host.probes()) == []
+
+
+# ---------------------------------------------------------------------------------------------
+# Class 4: containers
+# ---------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("state", "needle"),
+    [
+        (container_state(Status="exited", ExitCode=137), "exited"),
+        (container_state(Status="restarting", Restarting=True, ExitCode=1), "restarting"),
+        (container_state(Status="dead"), "dead"),
+        (container_state(Status="paused"), "paused"),
+    ],
+)
+def test_container_not_running_alerts(
+    host: Host, settings: Settings, state: dict[str, Any], needle: str
+) -> None:
+    host.states["tbot-recorder"] = state
+    found = hm.check_recorders(settings, host.probes())
+    assert keys(found) == {"container:tabdeal"}
+    assert needle in found[0].summary
+
+
+def test_missing_container_alerts(host: Host, settings: Settings) -> None:
+    del host.states["tbot-lbank-recorder"]
+    found = hm.check_recorders(settings, host.probes())
+    assert keys(found) == {"container:lbank"}
+    assert "does not exist" in found[0].summary
+
+
+def test_unreadable_docker_state_alerts(host: Host, settings: Settings) -> None:
+    host.states["tbot-recorder"] = "this is not json"
+    assert keys(hm.check_recorders(settings, host.probes())) == {"container:tabdeal"}
+
+
+def test_unhealthy_container_is_a_stream_problem_with_reason(host: Host, settings: Settings) -> None:
+    host.states["tbot-lbank-recorder"] = container_state(
+        Health={"Status": "unhealthy", "Log": [{"Output": "book stream stale: 412s"}]}
+    )
+    found = hm.check_recorders(settings, host.probes())
+    assert keys(found) == {"stream:lbank"}
+    assert "book stream stale: 412s" in found[0].summary
+
+
+def test_starting_health_is_tolerated_only_for_the_grace_period(host: Host, settings: Settings) -> None:
+    fresh = iso(NOW - timedelta(minutes=2))
+    host.states["tbot-recorder"] = container_state(StartedAt=fresh, Health={"Status": "starting"})
+    assert hm.check_recorders(settings, host.probes()) == []
+    old = iso(NOW - timedelta(minutes=30))
+    host.states["tbot-recorder"] = container_state(StartedAt=old, Health={"Status": "starting"})
+    assert keys(hm.check_recorders(settings, host.probes())) == {"stream:tabdeal"}
+
+
+def test_container_without_healthcheck_status_alerts(host: Host, settings: Settings) -> None:
+    host.states["tbot-recorder"] = container_state(Health=None)
+    assert keys(hm.check_recorders(settings, host.probes())) == {"stream:tabdeal"}
+
+
+# ---------------------------------------------------------------------------------------------
+# Class 1: stale or erroring stream (independent heartbeat read)
+# ---------------------------------------------------------------------------------------------
+
+
+def test_stale_heartbeat_alerts_for_both_formats(host: Host, settings: Settings) -> None:
+    host.heartbeat_ok(age_s=900)
+    found = hm.check_recorders(settings, host.probes())
+    assert keys(found) == {"stream:tabdeal", "stream:lbank"}
+    assert all("900s old" in p.summary for p in found)
+
+
+def test_heartbeat_just_inside_limit_is_fine(host: Host, settings: Settings) -> None:
+    host.heartbeat_ok(age_s=290)
+    assert hm.check_recorders(settings, host.probes()) == []
+
+
+def test_unreadable_or_invalid_heartbeat_alerts(host: Host, settings: Settings) -> None:
+    host.files[Path("/v/tbot-data") / "tabdeal/heartbeat.json"] = "{not json"
+    host.files[Path("/v/tbot-lbank-data") / "lbank/heartbeat.json"] = json.dumps({"written_ms": "yesterday"})
+    assert keys(hm.check_recorders(settings, host.probes())) == {"stream:tabdeal", "stream:lbank"}
+    del host.files[Path("/v/tbot-data") / "tabdeal/heartbeat.json"]
+    host.files[Path("/v/tbot-lbank-data") / "lbank/heartbeat.json"] = PermissionError("denied")
+    assert keys(hm.check_recorders(settings, host.probes())) == {"stream:tabdeal", "stream:lbank"}
+
+
+def test_unknown_docker_volume_alerts(host: Host, settings: Settings) -> None:
+    del host.mounts["tbot-data"]
+    found = hm.check_recorders(settings, host.probes())
+    assert keys(found) == {"stream:tabdeal"}
+    assert "tbot-data" in found[0].summary
+
+
+# ---------------------------------------------------------------------------------------------
+# Class 2: backups
+# ---------------------------------------------------------------------------------------------
+
+
+def lbank(host: Host, settings: Settings) -> list[Problem]:
+    return hm.check_lbank_backup(settings, host.probes())
+
+
+def test_lbank_status_ok(host: Host, settings: Settings) -> None:
+    assert lbank(host, settings) == []
+
+
+def test_lbank_status_ok_false_alerts_with_exit_code_and_message(host: Host, settings: Settings) -> None:
+    host.lbank_status(ok=False, exit_code=1, message="disk full")
+    found = lbank(host, settings)
+    assert keys(found) == {"backup:lbank"}
+    assert "exit 1" in found[0].summary
+    assert "disk full" in found[0].summary
+
+
+def test_lbank_integrity_failure_alerts(host: Host, settings: Settings) -> None:
+    host.lbank_status(ok=False, exit_code=2, integrity_ok=False, message="corrupt")
+    found = lbank(host, settings)
+    assert "integrity check FAILED" in found[0].summary
+    host.lbank_status(ok=True, integrity_ok=False)  # integrity alone is enough
+    assert "integrity check FAILED" in lbank(host, settings)[0].summary
+
+
+def test_lbank_integrity_null_is_not_an_alert(host: Host, settings: Settings) -> None:
+    host.lbank_status(integrity_ok=None)
+    assert lbank(host, settings) == []
+
+
+def test_lbank_status_older_than_36h_alerts(host: Host, settings: Settings) -> None:
+    host.lbank_status(ts=iso(NOW - timedelta(hours=37)))
+    found = lbank(host, settings)
+    assert keys(found) == {"backup:lbank"}
+    assert "37 h old" in found[0].summary
+    host.lbank_status(ts=iso(NOW - timedelta(hours=35)))
+    assert lbank(host, settings) == []
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "{broken",
+        "[]",
+        json.dumps({"ts": iso(NOW)}),  # no "ok"
+        json.dumps({"ts": "not-a-time", "ok": True}),
+        json.dumps({"ok": True}),
+    ],
+)
+def test_lbank_corrupt_status_alerts(host: Host, settings: Settings, content: str) -> None:
+    host.files[hm.LBANK_STATUS_FILE] = content
+    found = lbank(host, settings)
+    assert keys(found) == {"backup:lbank"}
+    assert "corrupt" in found[0].summary
+
+
+def test_lbank_missing_or_unreadable_status_alerts(host: Host, settings: Settings) -> None:
+    del host.files[hm.LBANK_STATUS_FILE]
+    assert "unreadable (FileNotFoundError)" in lbank(host, settings)[0].summary
+    host.files[hm.LBANK_STATUS_FILE] = PermissionError("denied")
+    assert "unreadable (PermissionError)" in lbank(host, settings)[0].summary
+
+
+def test_trades_backup_fresh_ok_and_stale_alerts(host: Host, settings: Settings) -> None:
+    assert hm.check_trades_backup(settings, host.probes()) == []
+    host.trades_backup(age_h=40)
+    found = hm.check_trades_backup(settings, host.probes())
+    assert keys(found) == {"backup:trades"}
+    assert "40 h old" in found[0].summary
+
+
+def test_trades_backup_uses_the_newest_file(host: Host, settings: Settings) -> None:
+    old = (NOW - timedelta(hours=100)).strftime("%Y%m%dT%H%M%SZ")
+    new = (NOW - timedelta(hours=2)).strftime("%Y%m%dT%H%M%SZ")
+    host.dirs[hm.TRADES_BACKUP_DIR] = [f"trades-{old}.sqlite", f"trades-{new}.sqlite"]
+    assert hm.check_trades_backup(settings, host.probes()) == []
+
+
+def test_trades_backup_missing_dir_or_no_files_alerts(host: Host, settings: Settings) -> None:
+    host.dirs[hm.TRADES_BACKUP_DIR] = ["README", "trades-garbage.sqlite"]
+    assert "no trades backup file" in hm.check_trades_backup(settings, host.probes())[0].summary
+    del host.dirs[hm.TRADES_BACKUP_DIR]
+    assert keys(hm.check_trades_backup(settings, host.probes())) == {"backup:trades"}
+
+
+def test_failed_backup_units_alert(host: Host, settings: Settings) -> None:
+    host.failed_units = {"tbot-trades-backup.service", "tbot-lbank-backup.service"}
+    found = hm.check_units(settings, host.probes())
+    assert keys(found) == {
+        "backup:unit:tbot-trades-backup.service",
+        "backup:unit:tbot-lbank-backup.service",
+    }
+    assert ("systemctl", "is-failed", "tbot-lbank-backup.service") in host.calls
+
+
+def test_inactive_units_do_not_alert(host: Host, settings: Settings) -> None:
+    assert hm.check_units(settings, host.probes()) == []
+
+
+# ---------------------------------------------------------------------------------------------
+# Missing or broken docker / systemctl are alerts, not crashes
+# ---------------------------------------------------------------------------------------------
+
+
+def test_missing_docker_is_one_tool_problem(host: Host, settings: Settings) -> None:
+    host.tool_missing = {"docker"}
+    found = hm.check_recorders(settings, host.probes())
+    assert keys(found) == {"tool:docker"}
+    assert "not installed" in found[0].summary
+
+
+def test_docker_daemon_down_is_one_tool_problem(host: Host, settings: Settings) -> None:
+    host.docker_down = True
+    found = hm.check_recorders(settings, host.probes())
+    assert keys(found) == {"tool:docker"}
+    assert "Cannot connect" in found[0].summary
+
+
+def test_missing_systemctl_is_a_tool_problem(host: Host, settings: Settings) -> None:
+    host.tool_missing = {"systemctl"}
+    assert keys(hm.check_units(settings, host.probes())) == {"tool:systemctl"}
+
+
+def test_missing_tools_do_not_stop_the_other_checks(host: Host, settings: Settings) -> None:
+    host.tool_missing = {"docker", "systemctl"}
+    host.disks[BACKUP_DIR] = DiskUsage(95 * GIB, 5 * GIB, 2)
+    found = hm.collect_problems(settings, host.probes())
+    assert keys(found) == {"tool:docker", "tool:systemctl", "disk:" + str(BACKUP_DIR)}
+
+
+def test_a_crashing_check_becomes_a_monitor_problem(host: Host, settings: Settings) -> None:
+    def boom(_s: Settings, _p: Probes) -> list[Problem]:
+        raise RuntimeError("secret-ish detail that must not leak")
+
+    found = hm.collect_problems(settings, host.probes(), checks=(("boom", boom), ("disks", hm.check_disks)))
+    assert keys(found) == {"monitor:boom"}
+    assert "RuntimeError" in found["monitor:boom"].summary
+    assert "secret-ish" not in found["monitor:boom"].summary
+
+
+def test_run_command_missing_binary_raises_tool_error() -> None:
+    with pytest.raises(hm.ToolError) as info:
+        hm.run_command(["definitely-not-an-installed-binary-xyz"])
+    assert "not installed" in info.value.reason
+
+
+# ---------------------------------------------------------------------------------------------
+# Alert hygiene: dedupe, reminder, resolved
+# ---------------------------------------------------------------------------------------------
+
+
+def test_new_problem_alerts_once_and_is_deduplicated(host: Host, settings: Settings, clock: Clock) -> None:
+    out = Outbox()
+    monitor = make_monitor(settings, host, out)
+    host.failed_units = {"tbot-trades-backup.service"}
+    first = monitor.run_cycle()
+    assert [e.kind for e in first] == ["alert"]
+    for _ in range(5):
+        clock.advance(minutes=1)
+        assert monitor.run_cycle() == []
+    assert len(out.sent) == 1
+    text = out.sent[0]
+    assert "ALERT backup:unit:tbot-trades-backup.service" in text
+    assert text.startswith("[testhost]")
+    assert text.rstrip().endswith("UTC")
+    assert "2026-10-10 12:00:00 UTC" in text
+
+
+def test_reminder_every_repeat_hours_not_before(host: Host, settings: Settings, clock: Clock) -> None:
+    out = Outbox()
+    monitor = make_monitor(settings, host, out)
+    host.failed_units = {"tbot-lbank-backup.service"}
+    monitor.run_cycle()
+    clock.advance(hours=5, minutes=59)
+    assert monitor.run_cycle() == []
+    clock.advance(minutes=2)
+    assert [e.kind for e in monitor.run_cycle()] == ["reminder"]
+    assert "REMINDER" in out.sent[-1]
+    clock.advance(hours=3)
+    assert monitor.run_cycle() == []
+    clock.advance(hours=3)
+    assert [e.kind for e in monitor.run_cycle()] == ["reminder"]
+    assert len(out.sent) == 3
+
+
+def test_resolved_after_the_problem_clears(host: Host, settings: Settings, clock: Clock) -> None:
+    out = Outbox()
+    monitor = make_monitor(settings, host, out)
+    host.disks[BACKUP_DIR] = DiskUsage(90 * GIB, 10 * GIB, 2)
+    monitor.run_cycle()
+    host.disks[BACKUP_DIR] = DiskUsage(10 * GIB, 90 * GIB, 2)
+    clock.advance(minutes=1)
+    assert monitor.run_cycle() == []  # first clear cycle: wait (flap guard)
+    clock.advance(minutes=1)
+    assert [e.kind for e in monitor.run_cycle()] == ["resolved"]
+    assert "RESOLVED disk:" in out.sent[-1]
+    assert "after 2 min" in out.sent[-1]
+    clock.advance(minutes=1)
+    assert monitor.run_cycle() == []  # and it is not announced again
+    assert len(out.sent) == 2
+
+
+def test_flapping_problem_does_not_resolve_or_realert(host: Host, settings: Settings, clock: Clock) -> None:
+    out = Outbox()
+    monitor = make_monitor(settings, host, out)
+    bad, good = DiskUsage(90 * GIB, 10 * GIB, 2), DiskUsage(10 * GIB, 90 * GIB, 2)
+    host.disks[BACKUP_DIR] = bad
+    monitor.run_cycle()
+    for disk in (good, bad, good, bad):
+        host.disks[BACKUP_DIR] = disk
+        clock.advance(minutes=1)
+        assert monitor.run_cycle() == []
+    assert len(out.sent) == 1
+
+
+def test_each_problem_key_is_tracked_separately(host: Host, settings: Settings, clock: Clock) -> None:
+    out = Outbox()
+    monitor = make_monitor(settings, host, out)
+    host.failed_units = {"tbot-trades-backup.service"}
+    monitor.run_cycle()
+    host.failed_units.add("tbot-lbank-backup.service")
+    clock.advance(minutes=1)
+    sent = monitor.run_cycle()
+    assert [e.key for e in sent] == ["backup:unit:tbot-lbank-backup.service"]
+
+
+def test_state_survives_a_restart_without_realerting(host: Host, settings: Settings, clock: Clock) -> None:
+    host.failed_units = {"tbot-trades-backup.service"}
+    out = Outbox()
+    make_monitor(settings, host, out).run_cycle()
+    assert len(out.sent) == 1
+    clock.advance(minutes=10)
+    out2 = Outbox()
+    restarted = make_monitor(settings, host, out2)
+    assert restarted.run_cycle() == []
+    assert out2.sent == []
+    host.failed_units = set()  # and the restarted instance still announces the recovery
+    for _ in range(2):
+        clock.advance(minutes=1)
+        restarted.run_cycle()
+    assert "RESOLVED" in out2.sent[-1]
+
+
+def test_at_most_eight_messages_per_cycle(host: Host, tmp_path: Path, clock: Clock) -> None:
+    paths = tuple(Path(f"/mnt/d{i}") for i in range(12))
+    for i, path in enumerate(paths):
+        host.disks[path] = DiskUsage(99 * GIB, 1 * GIB, 100 + i)
+    settings = make_settings(tmp_path, disk_paths=paths)
+    out = Outbox()
+    monitor = make_monitor(settings, host, out)
+    assert len(monitor.run_cycle()) == 8
+    assert len(monitor.run_cycle()) == 4
+    assert monitor.run_cycle() == []
+    assert len(out.sent) == 12
+
+
+# ---------------------------------------------------------------------------------------------
+# Telegram failures never crash the loop
+# ---------------------------------------------------------------------------------------------
+
+
+def test_telegram_failure_keeps_the_alert_pending_and_backs_off(
+    host: Host, settings: Settings, clock: Clock, caplog: pytest.LogCaptureFixture
+) -> None:
+    out = Outbox()
+    out.fail = TelegramError("http error", 502)
+    monitor = make_monitor(settings, host, out)
+    host.failed_units = {"tbot-trades-backup.service"}
+    with caplog.at_level(logging.ERROR, logger="tbot.health_monitor"):
+        assert monitor.run_cycle() == []
+    assert "telegram send failed" in caplog.text
+    assert "HTTP 502" in caplog.text
+    assert out.calls == 1
+
+    clock.advance(seconds=30)  # inside the back-off window: no new attempt
+    assert monitor.run_cycle() == []
+    assert out.calls == 1
+
+    out.fail = None  # Telegram is back; the next attempt after the back-off delivers the alert
+    clock.advance(seconds=40)
+    assert [e.kind for e in monitor.run_cycle()] == ["alert"]
+    assert len(out.sent) == 1
+
+
+def test_backoff_doubles_and_is_capped(host: Host, settings: Settings, clock: Clock) -> None:
+    out = Outbox()
+    out.fail = TelegramError("timeout")
+    monitor = make_monitor(settings, host, out)
+    host.failed_units = {"tbot-trades-backup.service"}
+    gaps = []
+    for _ in range(8):
+        before = out.calls
+        monitor.run_cycle()
+        assert out.calls == before + 1
+        gap = (monitor._next_send_at - clock()).total_seconds()  # type: ignore[operator]
+        gaps.append(gap)
+        clock.advance(seconds=gap)
+    assert gaps[:4] == [60.0, 120.0, 240.0, 480.0]
+    assert max(gaps) == hm._MAX_BACKOFF_S
+
+
+def test_unexpected_sender_exception_does_not_crash(host: Host, settings: Settings, clock: Clock) -> None:
+    out = Outbox()
+    out.fail = RuntimeError("anything")
+    monitor = make_monitor(settings, host, out)
+    host.failed_units = {"tbot-trades-backup.service"}
+    assert monitor.run_cycle() == []
+
+
+def test_failed_alert_is_not_persisted_as_sent(host: Host, settings: Settings, clock: Clock) -> None:
+    out = Outbox()
+    out.fail = TelegramError("timeout")
+    host.failed_units = {"tbot-trades-backup.service"}
+    make_monitor(settings, host, out).run_cycle()
+    out2 = Outbox()
+    clock.advance(minutes=5)
+    assert [e.kind for e in make_monitor(settings, host, out2).run_cycle()] == ["alert"]
+
+
+def test_run_forever_survives_a_crashing_cycle() -> None:
+    stop = threading.Event()
+
+    class Flaky:
+        def __init__(self) -> None:
+            self.n = 0
+
+        def run_cycle(self) -> list[Any]:
+            self.n += 1
+            if self.n == 1:
+                raise RuntimeError("boom")
+            stop.set()
+            return []
+
+    flaky = Flaky()
+    hm.run_forever(flaky, 0.0, stop)  # type: ignore[arg-type]
+    assert flaky.n == 2
+
+
+# ---------------------------------------------------------------------------------------------
+# Start notice
+# ---------------------------------------------------------------------------------------------
+
+
+def test_start_notice_sent_once(host: Host, settings: Settings) -> None:
+    out = Outbox()
+    make_monitor(settings, host, out).start()
+    assert len(out.sent) == 1
+    assert "INFO monitor started" in out.sent[0]
+    assert "[testhost]" in out.sent[0]
+
+
+def test_start_notice_suppressed_in_rapid_restart_loop(host: Host, settings: Settings, clock: Clock) -> None:
+    out = Outbox()
+    make_monitor(settings, host, out).start()
+    clock.advance(seconds=60)
+    make_monitor(settings, host, out).start()
+    assert len(out.sent) == 1
+    clock.advance(minutes=10)
+    make_monitor(settings, host, out).start()
+    assert len(out.sent) == 2
+
+
+def test_start_notice_failure_is_not_fatal_and_not_recorded(host: Host, settings: Settings) -> None:
+    out = Outbox()
+    out.fail = TelegramError("connect error")
+    make_monitor(settings, host, out).start()
+    out.fail = None
+    make_monitor(settings, host, out).start()
+    assert len(out.sent) == 1
+
+
+# ---------------------------------------------------------------------------------------------
+# StateStore
+# ---------------------------------------------------------------------------------------------
+
+
+def test_state_store_round_trip_and_atomic_write(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "sub" / "state.json")
+    state = hm.MonitorState({"k": hm.Tracked("a", "b", "summary", 1)}, "2026-01-01T00:00:00+00:00")
+    store.save(state)
+    loaded = store.load()
+    assert loaded.tracked["k"].summary == "summary"
+    assert loaded.tracked["k"].clear_count == 1
+    assert loaded.last_start_notice_ts == "2026-01-01T00:00:00+00:00"
+    assert sorted(p.name for p in (tmp_path / "sub").iterdir()) == ["state.json"]  # no temp leftovers
+
+
+def test_state_store_missing_or_corrupt_file_starts_empty(tmp_path: Path) -> None:
+    path = tmp_path / "state.json"
+    assert StateStore(path).load().tracked == {}
+    path.write_text("{ truncated", encoding="utf-8")
+    assert StateStore(path).load().tracked == {}
+    path.write_text(json.dumps({"tracked": {"k": {"nope": 1}}}), encoding="utf-8")
+    assert StateStore(path).load().tracked == {}
+
+
+def test_state_store_write_failure_does_not_raise(tmp_path: Path) -> None:
+    blocker = tmp_path / "file"
+    blocker.write_text("x", encoding="utf-8")
+    StateStore(blocker / "state.json").save(hm.MonitorState())  # parent is a file -> OSError, logged
+
+
+# ---------------------------------------------------------------------------------------------
+# Settings and credentials
+# ---------------------------------------------------------------------------------------------
+
+
+def test_load_settings_defaults() -> None:
+    s = hm.load_settings({}, hostname="h")
+    assert (s.interval_s, s.disk_max_pct, s.repeat_hours, s.backup_max_age_hours) == (60.0, 80.0, 6.0, 36.0)
+    assert s.resolve_cycles == 2
+    assert s.state_dir == Path("/var/lib/tbot-health-monitor")
+    assert s.lbank_status_file == Path("/var/backups/tbot/lbank/status.json")
+    assert s.hostname == "h"
+
+
+def test_load_settings_overrides_and_bad_values() -> None:
+    s = hm.load_settings(
+        {
+            "TBOT_MONITOR_DISK_MAX_PCT": "70",
+            "TBOT_MONITOR_REPEAT_HOURS": "2",
+            "TBOT_MONITOR_INTERVAL_S": "abc",  # ignored -> default
+            "TBOT_MONITOR_HEARTBEAT_MAX_AGE_S": "1",  # below minimum -> default
+            "TBOT_MONITOR_DISK_PATHS": "/, /data ,",
+            "TBOT_MONITOR_STATE_DIR": "/tmp/x",
+        }
+    )
+    assert s.disk_max_pct == 70.0
+    assert s.repeat_hours == 2.0
+    assert s.interval_s == 60.0
+    assert s.heartbeat_max_age_s == 300.0
+    assert s.disk_paths == (Path("/"), Path("/data"))
+    assert s.state_dir == Path("/tmp/x")
+
+
+def test_load_credentials_ok() -> None:
+    assert hm.load_credentials({hm.ENV_TOKEN: FAKE_TOKEN, hm.ENV_CHAT_ID: "-1001234567890"}) == (
+        FAKE_TOKEN,
+        "-1001234567890",
+    )
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {},
+        {hm.ENV_TOKEN: FAKE_TOKEN},
+        {hm.ENV_CHAT_ID: FAKE_CHAT},
+        {hm.ENV_TOKEN: "not-a-token-FAKE", hm.ENV_CHAT_ID: FAKE_CHAT},
+        {hm.ENV_TOKEN: FAKE_TOKEN, hm.ENV_CHAT_ID: "@channelname"},
+    ],
+)
+def test_load_credentials_rejects_bad_input_without_echoing_it(env: dict[str, str]) -> None:
+    with pytest.raises(ConfigError) as info:
+        hm.load_credentials(env)
+    for value in env.values():
+        assert value not in str(info.value)
+
+
+# ---------------------------------------------------------------------------------------------
+# Secret handling: the bot token never reaches logs, exceptions, repr or tracebacks
+# ---------------------------------------------------------------------------------------------
+
+
+class FakeResponse:
+    def __init__(self, status: int, body: bytes) -> None:
+        self.status = status
+        self._body = body
+
+    def __enter__(self) -> FakeResponse:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+    def read(self, _n: int = -1) -> bytes:
+        return self._body
+
+
+def _http_error(request: urllib.request.Request) -> Exception:
+    return urllib.error.HTTPError(request.full_url, 401, "Unauthorized", {}, io.BytesIO(b"nope"))  # type: ignore[arg-type]
+
+
+def _timeout(request: urllib.request.Request) -> Exception:
+    return TimeoutError(f"timed out talking to {request.full_url}")
+
+
+def _url_error_timeout(request: urllib.request.Request) -> Exception:
+    return urllib.error.URLError(TimeoutError(f"read timed out {request.full_url}"))
+
+
+def _connect_error(request: urllib.request.Request) -> Exception:
+    return urllib.error.URLError(socket.gaierror(f"cannot resolve host for {request.full_url}"))
+
+
+def _os_error(request: urllib.request.Request) -> Exception:
+    return ConnectionResetError(f"reset while fetching {request.full_url}")
+
+
+FAILURES = {
+    "http_error": (_http_error, "HTTP 401"),
+    "timeout": (_timeout, "timeout"),
+    "url_error_timeout": (_url_error_timeout, "timeout"),
+    "connect_error": (_connect_error, "connect error"),
+    "os_error": (_os_error, "ConnectionResetError"),
+}
+
+
+def patch_urlopen(monkeypatch: pytest.MonkeyPatch, behaviour: Any) -> list[urllib.request.Request]:
+    seen: list[urllib.request.Request] = []
+
+    def fake(request: urllib.request.Request, timeout: float = 0.0) -> FakeResponse:
+        seen.append(request)
+        result = behaviour(request) if callable(behaviour) else behaviour
+        if isinstance(result, Exception):
+            raise result
+        assert isinstance(result, FakeResponse)
+        return result
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    return seen
+
+
+def all_log_text(caplog: pytest.LogCaptureFixture) -> str:
+    """Raw log text plus every record rendered through the production JSON formatter."""
+    formatter = hm.JsonFormatter()
+    rendered = "\n".join(formatter.format(r) for r in caplog.records)
+    return caplog.text + "\n" + rendered
+
+
+@pytest.mark.parametrize("name", sorted(FAILURES))
+def test_token_never_appears_in_telegram_error(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+    make_exc, expected = FAILURES[name]
+    patch_urlopen(monkeypatch, make_exc)
+    with pytest.raises(TelegramError) as info:
+        TelegramSender(FAKE_TOKEN, FAKE_CHAT)("hello")
+    exc = info.value
+    rendered = "\n".join(
+        [str(exc), repr(exc), "".join(traceback.format_exception(exc)), exc.reason, str(exc.args)]
+    )
+    assert FAKE_TOKEN not in rendered
+    assert "bot123456789" not in rendered
+    assert expected in rendered
+    assert exc.__cause__ is None
+    assert exc.__suppress_context__ is True
+
+
+def test_token_never_in_telegram_error_for_malformed_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    for body in (b"<html>gateway</html>", b'{"ok": false, "description": "Unauthorized"}', b"[1, 2]"):
+        patch_urlopen(monkeypatch, FakeResponse(200, body))
+        with pytest.raises(TelegramError) as info:
+            TelegramSender(FAKE_TOKEN, FAKE_CHAT)("hello")
+        rendered = str(info.value) + repr(info.value) + "".join(traceback.format_exception(info.value))
+        assert FAKE_TOKEN not in rendered
+        assert "HTTP 200" in rendered
+
+
+@pytest.mark.parametrize("name", sorted(FAILURES))
+def test_token_never_appears_in_logs_when_sending_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    host: Host,
+    settings: Settings,
+    name: str,
+) -> None:
+    make_exc, expected = FAILURES[name]
+    patch_urlopen(monkeypatch, make_exc)
+    monitor = Monitor(
+        settings,
+        host.probes(),
+        TelegramSender(FAKE_TOKEN, FAKE_CHAT),
+        StateStore(settings.state_dir / "state.json"),
+    )
+    host.failed_units = {"tbot-trades-backup.service"}
+    with caplog.at_level(logging.DEBUG):
+        monitor.start()
+        monitor.run_cycle()
+    text = all_log_text(caplog)
+    assert "telegram send failed" in text
+    assert expected in text
+    assert FAKE_TOKEN not in text
+    assert "api.telegram.org" not in text
+    captured = capsys.readouterr()
+    assert FAKE_TOKEN not in captured.out + captured.err
+
+
+def test_token_never_appears_in_logs_for_malformed_response(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, host: Host, settings: Settings
+) -> None:
+    patch_urlopen(monkeypatch, FakeResponse(200, b"<html>not json</html>"))
+    monitor = Monitor(
+        settings,
+        host.probes(),
+        TelegramSender(FAKE_TOKEN, FAKE_CHAT),
+        StateStore(settings.state_dir / "state.json"),
+    )
+    host.failed_units = {"tbot-trades-backup.service"}
+    with caplog.at_level(logging.DEBUG):
+        monitor.run_cycle()
+    text = all_log_text(caplog)
+    assert "malformed response" in text
+    assert FAKE_TOKEN not in text
+
+
+def test_successful_send_uses_get_with_params_and_logs_no_url(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, host: Host, settings: Settings
+) -> None:
+    seen = patch_urlopen(monkeypatch, FakeResponse(200, b'{"ok": true, "result": {}}'))
+    monitor = Monitor(
+        settings,
+        host.probes(),
+        TelegramSender(FAKE_TOKEN, FAKE_CHAT),
+        StateStore(settings.state_dir / "state.json"),
+    )
+    host.failed_units = {"tbot-trades-backup.service"}
+    with caplog.at_level(logging.DEBUG):
+        monitor.start()
+        sent = monitor.run_cycle()
+    assert len(sent) == 1
+    assert len(seen) == 2
+    request = seen[1]
+    assert request.get_method() == "GET"
+    assert request.data is None
+    assert request.full_url.startswith(f"https://api.telegram.org/bot{FAKE_TOKEN}/sendMessage?")
+    query = request.full_url.split("?", 1)[1]
+    assert f"chat_id={FAKE_CHAT}" in query
+    assert "disable_notification=false" in query
+    assert "text=" in query
+    assert FAKE_TOKEN not in all_log_text(caplog)
+
+
+def test_message_text_is_truncated(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen = patch_urlopen(monkeypatch, FakeResponse(200, b'{"ok": true}'))
+    TelegramSender(FAKE_TOKEN, FAKE_CHAT)("x" * 5000)
+    assert len(seen[0].full_url) < 1500
+
+
+def test_sender_repr_is_masked() -> None:
+    sender = TelegramSender(FAKE_TOKEN, FAKE_CHAT)
+    for text in (repr(sender), str(sender), f"{sender!r}", f"{sender}"):
+        assert FAKE_TOKEN not in text
+        assert FAKE_CHAT not in text
+        assert "***" in text
+
+
+def test_redact_removes_registered_tokens_url_segments_and_token_shapes() -> None:
+    hm.register_secret(FAKE_TOKEN)
+    assert hm.redact(f"failed for {FAKE_TOKEN} here") == "failed for *** here"
+    assert FAKE_TOKEN not in hm.redact(f"GET https://api.telegram.org/bot{FAKE_TOKEN}/sendMessage?x=1")
+    assert "/bot***/sendMessage" in hm.redact("https://api.telegram.org/botANYTHING-HERE/sendMessage")
+    other = "987654321:BBotherTokenotherTokenother12"
+    assert other not in hm.redact(f"token {other} leaked")
+
+
+def test_json_formatter_never_renders_tracebacks(caplog: pytest.LogCaptureFixture) -> None:
+    logger = logging.getLogger("tbot.health_monitor")
+    try:
+        raise ValueError(f"url was https://api.telegram.org/bot{FAKE_TOKEN}/getMe")
+    except ValueError:
+        with caplog.at_level(logging.ERROR, logger="tbot.health_monitor"):
+            logger.exception("something failed")
+    record = caplog.records[-1]
+    line = hm.JsonFormatter().format(record)
+    payload = json.loads(line)
+    assert payload["exc_type"] == "ValueError"
+    assert payload["msg"] == "something failed"
+    assert FAKE_TOKEN not in line
+    assert "Traceback" not in line
+
+
+def test_setup_logging_quietens_http_libraries_and_emits_json(capsys: pytest.CaptureFixture[str]) -> None:
+    root = logging.getLogger()
+    saved_handlers, saved_level = list(root.handlers), root.level
+    saved_levels = {n: logging.getLogger(n).level for n in ("httpx", "httpcore", "urllib3")}
+    try:
+        hm.setup_logging()
+        for name in saved_levels:
+            assert logging.getLogger(name).level == logging.WARNING
+        logging.getLogger("tbot.health_monitor").info("hello %s", "world")
+        line = capsys.readouterr().out.strip().splitlines()[-1]
+        assert json.loads(line)["msg"] == "hello world"
+    finally:
+        root.handlers = saved_handlers
+        root.setLevel(saved_level)
+        for name, level in saved_levels.items():
+            logging.getLogger(name).setLevel(level)
+
+
+# ---------------------------------------------------------------------------------------------
+# CLI (main)
+# ---------------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def cli(monkeypatch: pytest.MonkeyPatch, host: Host) -> Host:
+    monkeypatch.setattr(hm, "setup_logging", lambda *_a, **_k: None)
+    monkeypatch.setattr(hm, "Probes", host.probes)
+    return host
+
+
+def test_main_without_credentials_exits_2_and_never_prints_values(
+    cli: Host, capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.ERROR):
+        code = hm.main([], env={hm.ENV_TOKEN: "garbage-value-FAKE", hm.ENV_CHAT_ID: FAKE_CHAT})
+    assert code == 2
+    assert "garbage-value-FAKE" not in caplog.text + capsys.readouterr().out
+
+
+def test_main_check_prints_problems_and_sends_nothing(
+    cli: Host, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seen = patch_urlopen(monkeypatch, FakeResponse(200, b'{"ok": true}'))
+    cli.failed_units = {"tbot-trades-backup.service"}
+    assert hm.main(["--check"], env={}) == 0
+    out = capsys.readouterr().out
+    assert "backup:unit:tbot-trades-backup.service" in out
+    assert seen == []
+
+
+def test_main_send_test_sends_one_message(
+    cli: Host, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seen = patch_urlopen(monkeypatch, FakeResponse(200, b'{"ok": true}'))
+    env = {hm.ENV_TOKEN: FAKE_TOKEN, hm.ENV_CHAT_ID: FAKE_CHAT}
+    assert hm.main(["--send-test"], env=env) == 0
+    assert len(seen) == 1
+    assert "TEST" in seen[0].full_url
+    captured = capsys.readouterr()
+    assert "test message sent" in captured.out
+    assert FAKE_TOKEN not in captured.out + captured.err
+
+
+def test_main_send_test_failure_exits_1_without_leaking_the_token(
+    cli: Host, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    patch_urlopen(monkeypatch, _http_error)
+    env = {hm.ENV_TOKEN: FAKE_TOKEN, hm.ENV_CHAT_ID: FAKE_CHAT}
+    assert hm.main(["--send-test"], env=env) == 1
+    captured = capsys.readouterr()
+    assert "HTTP 401" in captured.err
+    assert FAKE_TOKEN not in captured.out + captured.err
+
+
+# ---------------------------------------------------------------------------------------------
+# Deployment artifacts
+# ---------------------------------------------------------------------------------------------
+
+
+def test_env_example_has_exactly_two_empty_secrets() -> None:
+    lines = (REPO / "deploy" / "health_monitor.env.example").read_text(encoding="utf-8").splitlines()
+    active = [ln for ln in lines if ln.strip() and not ln.lstrip().startswith("#")]
+    assert active == ["TBOT_TELEGRAM_BOT_TOKEN=", "TBOT_TELEGRAM_CHAT_ID="]
+
+
+def test_env_example_is_not_ignored_but_the_real_file_is() -> None:
+    ignore = (REPO / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert "deploy/health_monitor.env" in ignore
+    assert "!.env.example" in ignore
+
+
+def test_systemd_unit_is_hardened_and_uses_the_root_only_env_file() -> None:
+    text = (REPO / "deploy" / "systemd" / "tbot-health-monitor.service").read_text(encoding="utf-8")
+    required = [
+        "EnvironmentFile=/opt/tbot/health-monitor.env",
+        "Type=simple",
+        "User=root",
+        "NoNewPrivileges=yes",
+        "ProtectSystem=strict",
+        "ReadWritePaths=/var/lib/tbot-health-monitor",
+        "PrivateTmp=yes",
+        "ProtectHome=yes",
+        "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+        "Restart=always",
+        "RestartSec=10",
+        "WantedBy=multi-user.target",
+    ]
+    active = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+    for line in required:
+        assert line in active
+    assert "docker.sock" not in text
+    assert "Requires=docker.service" not in active  # must keep running (and alert) when docker is down
+
+
+def test_run_script_delegates_to_main(monkeypatch: pytest.MonkeyPatch) -> None:
+    from scripts import run_health_monitor
+
+    calls: list[Sequence[str] | None] = []
+    def fake_main(argv: Sequence[str] | None = None, env: Any = None) -> int:
+        calls.append(argv)
+        return 0
+
+    monkeypatch.setattr(hm, "main", fake_main)
+    monkeypatch.setattr("sys.argv", ["run_health_monitor.py", "--check"])
+    assert run_health_monitor._run() == 0
+    assert calls == [["--check"]]
+
+
+def test_default_targets_match_the_compose_container_names() -> None:
+    assert isinstance(TABDEAL, Target)
+    assert TABDEAL.container == "tbot-recorder"
+    assert LBANK.container == "tbot-lbank-recorder"
+    compose = (REPO / "deploy" / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "container_name: tbot-recorder" in compose
