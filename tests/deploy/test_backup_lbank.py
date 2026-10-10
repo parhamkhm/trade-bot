@@ -89,7 +89,9 @@ def test_closed_day_is_archived_verified_backed_up_then_removed(tmp_path: Path) 
     (dst / "lbank-2026-10-11.sqlite").write_bytes(b"last night's plain copy")
     assert backup.run(src, dst, codec=GzipCodec(), now=NOW) == 0
     assert sorted(p.name for p in src.iterdir()) == ["lbank-2026-10-11.sqlite.zst"]
-    assert sorted(p.name for p in dst.iterdir() if p.is_file()) == ["lbank-2026-10-11.sqlite.zst"]
+    assert sorted(p.name for p in dst.iterdir() if p.name.startswith("lbank-")) == [
+        "lbank-2026-10-11.sqlite.zst"
+    ]
     assert _unzip_count(dst / "lbank-2026-10-11.sqlite.zst", tmp_path) == 5
     assert not list((dst / ".staging").iterdir())
 
@@ -118,10 +120,11 @@ def test_recently_written_past_day_is_not_archived_yet(tmp_path: Path) -> None:
 def test_failed_verification_keeps_the_source_and_leaves_no_archive(tmp_path: Path) -> None:
     src, dst = _dirs(tmp_path)
     _make_day(src / "lbank-2026-10-11.sqlite", 500)
-    assert backup.run(src, dst, codec=GzipCodec(corrupt=True), now=NOW) in (1, 2)
+    assert backup.run(src, dst, codec=GzipCodec(corrupt=True), now=NOW) == 2  # corrupt, not merely failed
     assert _count(src / "lbank-2026-10-11.sqlite") == 500
     assert not list(src.glob("*.zst*"))
     assert not list(dst.glob("*.zst*"))
+    assert _count(dst / "lbank-2026-10-11.sqlite") == 500  # M5: the full closed day is safe in the backup
 
 
 def test_interrupted_run_is_finished_next_night(tmp_path: Path) -> None:
@@ -167,7 +170,7 @@ def test_archive_whose_backup_copy_is_missing_is_copied(tmp_path: Path) -> None:
 def test_corrupt_open_day_is_reported_and_leaves_no_tmp(tmp_path: Path) -> None:
     src, dst = _dirs(tmp_path)
     (src / "lbank-2026-10-12.sqlite").write_bytes(b"not a database" * 100)
-    assert backup.run(src, dst, codec=GzipCodec(), now=NOW) in (1, 2)
+    assert backup.run(src, dst, codec=GzipCodec(), now=NOW) == 2
     assert not list(dst.glob("*.tmp"))
     assert not (dst / "lbank-2026-10-12.sqlite").exists()
 
