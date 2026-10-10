@@ -53,9 +53,12 @@ class RuntimeConfig(_Base):
 class CostConfig(_Base):
     """Fees and slippage applied in every backtest (CLAUDE.md section 3.4)."""
 
-    taker_fee_bps: Decimal = Decimal("35")  # Tabdeal tier 1, D-047
-    maker_fee_bps: Decimal = Decimal("33")
-    slippage_bps: Decimal = Decimal("5")
+    taker_fee_bps: Decimal = Decimal("10")  # LBank spot VIP 0, verified 2026-10-10, D-060
+    maker_fee_bps: Decimal = Decimal("10")
+    slippage_bps: Decimal = Decimal("5")  # provisional until the LBank G0 probe measures it (D-060)
+    # True until the measured depth-at-size model replaces the placeholder: reports must say so and no
+    # phase-3 gate may be decided on provisional slippage (D-060)
+    slippage_provisional: bool = True
 
     @field_validator("taker_fee_bps", "maker_fee_bps", "slippage_bps")
     @classmethod
@@ -110,7 +113,7 @@ class RiskConfig(_Base):
     """Pre-set risk limits. The RiskManager (phase 4) is the only consumer."""
 
     max_exposure: float = Field(default=1.0, ge=0.0, le=1.0)
-    annual_vol_target: float = Field(default=0.20, gt=0.0, le=2.0)
+    annual_vol_target: float = Field(default=0.30, gt=0.0, le=2.0)
     max_daily_loss_pct: float = Field(default=0.10, gt=0.0, le=1.0)
     max_orders_per_hour: int = Field(default=6, ge=1)
     max_data_age_seconds: int = Field(default=900, ge=1)

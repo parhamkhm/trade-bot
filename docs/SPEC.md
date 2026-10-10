@@ -111,17 +111,21 @@ Two layers, no overlap:
 1. **`config/<name>.yaml`** (committed, no secrets) — validated by `Config` (`extra="forbid"`, frozen).
    Sections: `runtime`, `costs`, `data`, `exchange`, `risk`.
 2. **Environment / `.env`** (never committed), prefix `TBOT_` — validated by `Secrets`:
-   `TBOT_TABDEAL_API_KEY`, `TBOT_TABDEAL_API_SECRET`, `TBOT_TELEGRAM_BOT_TOKEN`,
+   `TBOT_TABDEAL_API_KEY`, `TBOT_TABDEAL_API_SECRET` (legacy; the LBank key names are defined when the private probe is added, D-073), `TBOT_TELEGRAM_BOT_TOKEN`,
    `TBOT_TELEGRAM_CHAT_ID`, `TBOT_LIVE_TRADING`, `TBOT_CONFIG`.
 
 Secrets are `SecretStr`; they must never appear in logs, tracebacks, reports or Telegram messages.
 
 **Live-order gate (single authority).** `Config.live_orders_enabled(secrets)` returns `True` only when
 all three hold: `TBOT_LIVE_TRADING=true` **and** `runtime.phase >= 6` **and** `runtime.mode == "live"`.
+*Superseded by D-049 (phase order 5a → 6 → 7a → 5b → 7b): the automated order path is allowed only from 7b.
+Phase labels are not numerically ordered, so phase 5a replaces the integer with an explicit ordinal enum; until
+then no order path exists, so the integer gate cannot be reached.*
 Loading a config with `mode: live` and `phase < 6` is a validation error. No other code may decide this.
 
-Key defaults: taker fee 35 bps, maker fee 33 bps per side (Tabdeal tier 1, D-047), slippage 5 bps per side, `requests_per_second: 5`,
-`recv_window_ms: 5000`, `max_data_age_seconds: 900`, `annual_vol_target: 0.20`, `max_exposure: 1.0`.
+Key defaults: taker fee 10 bps, maker fee 10 bps per side (LBank spot VIP 0, verified, D-060), slippage 5 bps per side
+(provisional until the LBank G0 probe measures spread and slippage, D-060), `requests_per_second: 5`,
+`recv_window_ms: 5000`, `max_data_age_seconds: 900`, `annual_vol_target: 0.30`, `max_exposure: 1.0`.
 
 ---
 
@@ -260,10 +264,29 @@ Required test kinds (phase-dependent):
 
 These refine `CLAUDE.md` §9 into measurable checks. They may be tightened, never relaxed after seeing data.
 
-**G0 — Foundations.** From the Turkey server: `ping` and `time` succeed; |server clock − local NTP clock| < 1 s;
-`exchangeInfo` lists `BTCUSDT` with status `TRADING` and readable tick/step/min-notional filters;
-median bid/ask spread over ≥ 30 samples spread across ≥ 6 h is < 0.20 %; a signed read endpoint
-(`account`) answers 200 with the read-only key (key has no withdrawal permission and is IP-whitelisted).
+**G0 — Foundations (LBank, D-073).** Measured **from the Turkey server**, public endpoints only, ≥ 30 samples
+spread across ≥ 6 h. Every number carries where and when it was measured.
+- *Pass conditions:*
+  - every spot v2 endpoint (`timestamp`, `accuracy`, `depth`, `supplement/trades`, `kline`, `ticker/24hr`) and
+    the perpetual `marketData` answer 200;
+  - median |LBank server time − local NTP clock| < 1 s;
+  - `accuracy` lists `btc_usdt` with readable price/quantity precision, minimum quantity and minimum order value;
+  - median best bid/ask spread < 0.20 %.
+- *Reported, not gating:*
+  - p50 and p95 latency per endpoint;
+  - kline history depth for 1d, 4h, 1h and 1m;
+  - depth within 0.1 %, 0.5 % and 1 % of mid (median and p10 per side);
+  - the largest market order that fills within 0.1 % and 0.5 % at the median sample. This feeds the
+    **temporary** depth-at-size curve (D-067).
+- *Rate limits are probed conservatively.* The request rate rises step by step from the recorder's normal rate,
+  and probing **stops at the first 429, 418, 403 or other ban-type response**. Headers and codes are recorded.
+  The Turkey server is our only IP, so a ban must never be risked.
+- *Private part* (a signed read of balances and the user's fee rate, with a read-only key): **postponed** until
+  Parham creates a read-only LBank key from an account in his own name (no trading, no withdrawal,
+  IP-whitelisted). It must pass before phase 7a. Until then no private call is made. The verified VIP 0 spot fee
+  (D-060) stands.
+
+*Legacy:* the Tabdeal G0 (public part passed 2026-10-08, `docs/reports/g0-report.md`) is historical.
 
 **G1a — Research data (Binance).** 1h/4h/1d for BTCUSDT and ETHUSDT from 2018-01-01 to `holdout_start`:
 every file checksum-verified, zero duplicate timestamps, zero out-of-order timestamps, and every missing
@@ -272,10 +295,21 @@ unit of every file is detected and normalised (see D-017). Source anomalies are 
 *Pending Parham (D-040), not yet in force:* how to treat reconciliation mismatches that sit in Binance's own
 files (see the phase 0–1 report). Until he decides, the criterion above applies unchanged.
 
-**G1b — Live data (Tabdeal).** The recorder has run ≥ 7 consecutive days with ≥ 99 % of hours complete,
-zero trade-id gaps (*proposed wording, pending Parham — D-037:* zero `window_no_overlap` gaps, because per-symbol
-ids are never contiguous), and `coverage_ratio ≥ 3` on every poll (D-024), and the Binance-vs-Tabdeal BTCUSDT basis
-is measured (median and p95, in bps) over that window. G1a and G1b are decided separately: phase 2 may start once G1a passes (decision D-016).
+**G1b — Live data (LBank, D-073).** The LBank recorder (D-068) has run **≥ 7 consecutive days** healthy:
+- ≥ 99 % of hours have ≥ 99 % of their expected 10 s order-book snapshots;
+- every trade poll overlaps the previous one in time (`gap = 0`). Any `gap = 1` or `gap = 2` poll is
+  explained in the G1b report (restart, exchange outage);
+- funding and klines have no stream silent beyond its healthcheck limit;
+- every nightly archive and backup succeeded.
+
+The Binance-vs-LBank BTC/USDT basis (median and p95, in bps, on 1h closes) is measured over the same window.
+LBank bars come from the recorder; they are stored apart from research data and the research loader cannot read
+them (D-074). The Binance side needs bars after `holdout_start`: a separate live-compare fetch limited to the
+G1b window is **approved with conditions (D-039, D-074)**: Binance closes at the matching LBank timestamps only,
+kept in `data/live_compare/`, never read by the research loader, not a trial.
+
+G1a and G1b are decided separately: phase 2 may start once G1a passes (D-016). *Legacy:* the Tabdeal G1b
+definition (D-024, D-037) is historical.
 
 **G2 — Engine.** Truncation test passes exactly; a hand-computed 5-bar example matches the engine to the
 cent; buy-and-hold and SMA-filter equity curves match an independent vectorbt run to ≤ 0.1 % final equity;
@@ -284,20 +318,208 @@ fees and slippage appear in the ledger and reduce returns by the expected amount
 **G3 — Strategy (out-of-sample, after costs).** `maxDD ≤ 0.60 × maxDD(buy-and-hold)`,
 `Sharpe ≥ 0.80 × Sharpe(buy-and-hold)`, `PBO < 0.30`, Deflated Sharpe > 0 at the 95 % level using the trial
 count from `research/EXPERIMENTS.md`; neighbouring parameter sets (±1 grid step) keep ≥ 70 % of the Sharpe
-(no knife-edge optimum); ETH/USDT Sharpe > 0 with the same rules; fees and slippage ×2 (i.e. 70 bps taker fee + 10 bps slippage per
-side, D-047) keep the strategy profitable net of costs. Every phase-3 report states annual turnover and the
+(no knife-edge optimum); ETH/USDT Sharpe > 0 with the same rules. *For S0* (one pre-registered configuration,
+never selected) PBO is not applicable, and the neighbour test is the six robustness variants fixed in §7.1
+(SMA 50/75/150/200; vol target 0.20/0.40), each logged as a sensitivity run (not a trial) and each keeping
+≥ 70 % of S0's Sharpe. *For S1* (no parameters of its own) PBO and the neighbour test are not applicable; every member must
+have passed them. *For S0 and S1*: fees and slippage ×2 (i.e. 20 bps taker fee per side plus twice the §7 G3
+slippage model, D-060) keep the strategy profitable net of costs. Every phase-3 report states annual turnover and the
 annual cost drag (fees + slippage, % of equity per year) next to the returns.
+Every G3 number is reported twice (D-051): fill at the next bar's open, and fill after the manual delay. The
+gating delay is **6 h, fixed**: the fill price is the open of the Binance 1h bar that starts 6 h after the signal
+bar's close, adjusted by **adverse** slippage (buys fill higher, sells lower). The slippage model is a
+depth-at-size curve: for each side, the median over all recorder order-book snapshots from the G1b start to the
+day phase 3 starts (that window is then frozen) of the cost in bps of walking the book for a given notional,
+**measured from the best bid/ask**, interpolated piecewise-linearly in notional and extrapolated beyond the
+deepest recorded level at the slope of the last two points, evaluated at the trade's own notional with backtest
+equity fixed at 10,000 USDT; half the median spread is then added exactly once. It is calibrated once, logged in `research/EXPERIMENTS.md`, and applied
+unchanged to the whole 2018–2025 history; other delays are reported as sensitivity only. **The gate
+must pass on the manual-delay version**, because phase 7a executes by hand. Every candidate implements
+`stop_price()` (D-050) and its report states MinTRL — computed per Bailey & López de Prado on the **pooled OOS
+manual-delay daily return series** (skew and kurtosis included) at 95 % confidence, against a benchmark Sharpe
+of 0 and, separately, against buy-and-hold's Sharpe over the same period.
 
-**G4 — Risk + regime + holdout.** The regime overlay is kept only if it improves OOS Sharpe, or cuts maxDD
-materially at equal Sharpe; otherwise it is dropped. The one-shot sealed-holdout run must land inside the
-95 % stationary-block-bootstrap band for both Sharpe and maxDD. Run once, logged in `research/HOLDOUT_LOG.md`.
+**G4 — Risk + regime + holdout.** The regime overlay is kept only if, on the pooled OOS manual-delay series,
+its Sharpe is strictly higher than the same strategy without the overlay **and** its maxDD is not worse;
+otherwise it is dropped. Every overlay variant tried is a trial in `research/EXPERIMENTS.md`. The keep/drop
+decision is made before the gates and is part of the strategy's configuration. The one-shot sealed-holdout run must pass the band defined in §7.1 (stationary
+bootstrap, adverse tails only: Sharpe ≥ 2.5th percentile and maxDD ≤ 97.5th percentile). Run once, logged in `research/HOLDOUT_LOG.md`.
+What runs is decided only by the go-live rule in §7.1 (D-048, D-057); the holdout is applied there once, as a
+pass/fail gate on a single walk-forward choice.
 
 **G5 — Paper (8–12 weeks).** Zero unresolved state mismatches; for every bar, the live signal equals the
 backtest signal computed on the same bars (100 % match); no unhandled exception; reconciliation clean after
 each restart; alerting verified by fault injection.
 
-**G6 — Small live (3 months).** Realised Sharpe and drawdown inside the expected band; automatic halt if
-drawdown exceeds the 95th percentile of the bootstrap distribution. Capital scales only by a written rule.
+**G6a — Small live, manual execution (phase 7a, 3 months).** Parham places every order by hand from the bot's
+signal and logs each fill (price, qty, time). Realised results inside the expected band of the **manual-delay**
+backtest; automatic halt (signals stop, Parham alerted) if drawdown exceeds the 95th percentile of the bootstrap
+distribution. Measured slippage vs signal price is reported per trade. Three months is shorter than MinTRL for
+any plausible strategy: G6a tests execution and parity, not edge, and cannot be used to switch strategies.
+
+**G6b — Automated live (phase 7b, 3 months).** Same band and halt rule with automated execution (after 5b);
+capital scales only by a written rule.
+
+### 7.1 Allocator acceptance rule (phase 4, D-048, amended by D-054)
+
+Fixed before any phase-3 result. Nothing in this section may be tuned after results are seen; every
+parameter below is a fixed number.
+
+**S0 — locked default.** One strategy, fully specified here, never tuned on phase-3 results.
+**LOCKED by Parham on 2026-10-10 (D-063).** The lock commit is recorded in `research/EXPERIMENTS.md`. Every
+number below is fixed.
+
+`sma100_1d`, BTCUSDT, Binance 1d bars (a bar's `ts` is its close, 00:00 UTC).
+
+- *Indicators (all finite and start-independent; a value at close t uses closes up to and including t).*
+  - `SMA100_t` = the mean of `close_{t−99} … close_t`.
+  - `ATR20_t` = the **simple** mean of the last 20 true ranges up to and including t,
+    `TR_k = max(high_k − low_k, |high_k − close_{k−1}|, |low_k − close_{k−1}|)`. This is **not** Wilder's
+    ATR, whose memory is infinite.
+  - `σ̂_t` = the finite 150-return kernel of D-056: `r_t = ln(close_t / close_{t−1})`, α = 2/31 (span 30),
+    K = 150, `σ̂_t = sqrt( Σ_{k=0}^{K−1} (1−α)^k · r_{t−k}² / Σ_{k=0}^{K−1} (1−α)^k ) × sqrt(365)`.
+- *State machine.* The state is FLAT, LONG or STOPPED, updated on every Binance 1d bar by **anchored replay**
+  (below).
+  - **FLAT → LONG** at close t if `close_t > SMA100_t` and t is a tradable close (warm-up below).
+  - **LONG → FLAT** at close t if `close_t ≤ SMA100_t`.
+  - **LONG → STOPPED** on bar u (u ≥ t+1, *including the entry bar t+1*) if `low_u ≤ stop`. The stop-out
+    happens inside bar u, before its close is evaluated.
+  - **STOPPED → FLAT** at the first close `≤ SMA100`. This includes the close of the stop-out bar u itself:
+    the close comes after the intraday stop.
+  - **Re-entry after a stop-out** therefore needs a close `≤ SMA100` and then a fresh close `> SMA100`. A
+    trend that never dips back to the SMA is not re-entered.
+  - If the stop and an exit signal fall on the same bar, the stop comes first, then the close moves the state
+    to FLAT. The final state is the same either way.
+- *Protective stop (Q1: FIXED, not trailing; D-050).*
+  - **Level:** `stop = P_ref − 3 × ATR20_t`, where t is the entry signal bar and `P_ref` = the **Binance open of
+    bar t+1**, i.e. the next-open entry price before slippage. The stop stays fixed for the whole position.
+    If `P_ref − 3 × ATR20_t < 0.01`, the stop is 0.01.
+  - **Why `P_ref` and not each model's own fill price (clarifies Parham's "entry fill price").** In the
+    next-open model the two differ only by the entry slippage, a few bps. Using `P_ref` makes the stop level,
+    and therefore the stop-out state, identical in backtest, paper and live, whatever the fill model, the
+    slippage or the real LBank fill (G5 parity).
+  - **Daily stop fill (next-open model).** On bar u with `low_u ≤ stop`, the fill is `min(open_u, stop)` minus
+    adverse slippage. A gap below the stop fills at the open, and the fill is never better than the stop.
+  - **Manual-delay variant (D-051).** The stop level is the same. It is active from the delayed entry fill
+    and is checked on 1h bars from that hour on: the first 1h bar h with `low_h ≤ stop` fills at
+    `min(open_h, stop)` minus slippage. The stop-out **state** is still defined only by the daily rule above.
+    Execution never feeds back into the state:
+    - if the state is STOPPED but the delayed position was not stopped (e.g. the daily low came before the
+      delayed fill), the target is 0 and the position exits 6 h after the close of the stop-out bar;
+    - if the 1h execution stopped out while the state is still LONG, the position stays flat until the
+      state's next FLAT → LONG transition (the engine's re-arm rule).
+  - **Live parity requirement (phase 5).** The backtest fills stops at the stop level intraday. Live must
+    therefore either keep an exchange-side stop resting on LBank or watch the price intraday (≤ 1 min) and
+    send a market sell. Checking only at the daily close would fill far worse than the backtest assumes.
+    Whether LBank spot offers stop orders is verified when the private API is in use. Until then the bot
+    plans for intraday monitoring.
+- *Sizing.* `w_target = min(1, 0.30 / σ̂_t)` while the state is LONG, otherwise 0. At BTC's usual σ̂ (0.6–0.8)
+  this is ≈ 0.375–0.5 of equity.
+- *Rebalance rule.* Let `w_now` be the actual (drifted) weight at the close of t.
+  1. Entries (FLAT → LONG) and exits (to FLAT or STOPPED) **always** trade.
+  2. Vol-driven resizing trades only while in a position (`w_now > 0`), and only if
+     `|w_target − w_now| ≥ 0.25 × max(w_target, w_now)` (25 % relative band).
+  3. A RiskManager-forced reduction or exit, and a stop-out, are never blocked by the band.
+- *Fills.* A signal at the close of t fills at the open of t+1 plus slippage. The manual-delay variant (D-051,
+  6 h) fills at the open of the Binance 1h bar that starts 6 h after the close of t.
+- *Warm-up and anchored replay.* `warmup_bars = 151` (σ̂ needs 151 closes; SMA100 needs 100; ATR20 needs 21).
+  The first tradable close is close #151 counted from `history_start`, i.e. 2018-06-01 00:00 UTC. Close #1 is
+  the bar opening at 2018-01-01 00:00 UTC.
+  - The state has memory (STOPPED, and the fixed stop of an open position), so it is defined by **replay from
+    the anchor** `history_start` = 2018-01-01. The state starts FLAT and every Binance 1d bar up to t is
+    replayed.
+  - The backtest, **every** walk-forward fold, and the paper/live runner do this identically. Folds never
+    restart the strategy; they only slice the replayed series. This, not `warmup_bars`, is what makes
+    backtest and live agree on the same bars (G5).
+  - The same replay rule applies to **every** stateful strategy. In walk-forward with per-fold parameters,
+    each fold's parameter set is replayed from the anchor. The jump at a fold boundary is charged as a trade
+    (fees + slippage).
+- *Robustness (sensitivity runs, not trials; fixed now).* Six one-at-a-time variants:
+  - SMA 50, 75, 150 and 200, at vol target 0.30;
+  - vol target 0.20 and 0.40, at SMA 100.
+
+  Each must keep **≥ 70 % of S0's Sharpe** (pooled OOS, manual-delay fills). In every variant the ATR period
+  stays at 20 (Q3), the multiplier at 3, and the re-entry rule, the band and σ̂ are unchanged.
+
+These are textbook parameters with no search, so S0 counts as **one trial** (N = 1 in its DSR).
+
+**S1 — equal-weight blend.** Equal-weight average of the target weights of every strategy that passed G3 (S0
+included if it passed), netted into one position, with S0's rebalance rule (relative 25 % band; transitions
+always traded). When S1 is compared with a candidate C, S1 is computed **without C** (leave-one-out). S1's DSR uses the
+same trial count as every other non-S0 contender (see "Deflated Sharpe" below).
+
+**S2 — champion/challenger (from phase 7b only).** A challenger replaces the running strategy only if all hold
+over the evaluation window = the **paper and live days after the challenger's lock date** — the commit date of
+the challenger's frozen entry in `research/EXPERIMENTS.md` — (historical
+walk-forward days all predate the lock and do not count), minimum 365 days. **The test is run only at pre-registered dates: day 365 after the challenger's lock date and then on each further anniversary of that date.** There is no daily or weekly re-testing; a failed evaluation is final until the next date, so repeated looks cannot inflate the false-positive rate:
+(a) **Sharpe-difference test (D-064, replaces the fixed 0.10 DSR margin).** A one-sided Ledoit–Wolf (2008)
+test of `H0: SR_challenger − SR_champion ≤ 0` on the two daily net return series over **the same days**:
+  - the series are paper returns for the challenger, and the champion's realised returns (paper or live, after
+    all costs);
+  - `z = (SR̂_c − SR̂_ch) / se`, where `se` comes from the delta method on the joint first and second moments
+    of the two series;
+  - the HAC covariance uses a **Parzen** kernel with **Andrews (1991)** automatic bandwidth (AR(1) plug-in),
+    fixed;
+  - the challenger replaces the champion only if `z ≥ 1.645` (p ≤ 0.05).
+
+  When m > 1 challengers are tested against the same champion at the same evaluation date, the threshold is the
+  one-sided Bonferroni value `z ≥ Φ⁻¹(1 − 0.05 / m)`. Every challenger tested is logged in
+  `research/EXPERIMENTS.md`, so m is honest. Unlike the old margin, a strong champion can still be replaced by
+  a significantly better challenger;
+(b) it tripped no risk tripwire (REDUCING/HALTED, stop breach, drawdown halt) in the window;
+(c) Sharpe > 0 after costs in at least 2 of 3 regime buckets — terciles of `σ̂` (the S0 estimator) with the two
+cut-points computed **once** on the 2018-01-01 … holdout_start research data and frozen.
+
+**S3 — regime-conditional selection.** Ablation only: reported, never deployed in v1. The regime overlay remains
+an exposure scaler and must beat "no overlay" out of sample (G4).
+
+**Deflated Sharpe (one definition for the whole project).** DSR is Bailey & López de Prado's deflated Sharpe
+ratio expressed as a probability, `DSR = PSR(SR*) ∈ [0, 1]`. Inputs, all fixed:
+- the return series is the **pooled OOS manual-delay daily return series** of the strategy being judged;
+- Sharpe inside PSR and SR* is the **daily, non-annualised** Sharpe; T = the number of OOS days; PSR uses the
+  skew and kurtosis of that series;
+- SR* = the expected maximum of N independent daily Sharpes. For **every contender other than S0** (each
+  candidate C and S1) N is the same number: all non-S0 trials logged in `research/EXPERIMENTS.md` up to **the
+  date X is chosen**, across all strategy types (no "family" partitioning), and V[SR] = the variance of the
+  daily Sharpe across exactly those trials, each computed on its own pooled OOS manual-delay series. If that
+  count is 1, SR* = 0. Only S0 — locked before any result — always uses N = 1, so SR* = 0 and DSR = PSR(0).
+"Deflated Sharpe > 0 at the 95 % level" (G3) means **DSR ≥ 0.95**; every DSR threshold and margin in this
+document is in these probability units.
+
+**Go-live rule.**
+- *Metric.* Annualised Sharpe (365, after all costs, **manual-delay fills**) of the **pooled** out-of-sample
+  walk-forward return series (all folds concatenated).
+- *Walk-forward gates* = G3 plus the **non-holdout** part of G4 (the regime-overlay decision). The holdout is
+  never used to qualify or rank anything.
+- *A candidate C qualifies* only if C passes the walk-forward gates, C's pooled OOS Sharpe is higher than both
+  S0's and S1's (S1 leave-one-out without C), C's annualised manual-delay Sharpe beats S0's in at least half of
+  the folds, and C's DSR ≥ 0.95 with
+  every variant counted. S1 with no member other than C is not a contender.
+- *The single choice X* is made on walk-forward results only: the qualifying C with the highest pooled OOS Sharpe;
+  if none qualifies, the baseline (S0 or S1) with the higher pooled OOS Sharpe **among those that pass the
+  walk-forward gates**; if neither passes, X = none and nothing goes live — the no-edge outcome of CLAUDE.md §1.
+- *Parameters of X for the holdout and for live.* A strategy with per-fold parameters runs with the parameter
+  set its own selection procedure picks on the final training window that ends at `holdout_start` (all research
+  data); that set is logged with the band, before unsealing. S0 has no parameters to pick.
+- *Holdout band (fixed, computed before unsealing).* Source series: X's pooled OOS manual-delay daily returns.
+  Stationary bootstrap (Politis–Romano) with mean block length 20 days, path length = the number of days in the
+  holdout, 10,000 resamples, seed 20261008. From the resampled paths, the 2.5th percentile of annualised Sharpe
+  and the 97.5th percentile of maxDD. Both numbers, with the parameters above and the code commit, are written to
+  `research/HOLDOUT_LOG.md` **before** the holdout is unsealed.
+- *Holdout gate.* The holdout is unsealed **once**, for X only. X passes if its holdout Sharpe ≥ the 2.5th
+  percentile **and** its holdout maxDD ≤ the 97.5th percentile (one-sided, adverse tails only: an unusually good
+  holdout is reported but never fails). If X passes, X runs. If it does not, **nothing goes live** — there is no
+  fallback to a second-best strategy, because choosing one after seeing the holdout would turn the sealed year
+  into a selection set.
+- *After G4: live bar store.* Live replay and the G5 comparison need Binance bars from `holdout_start` onward.
+  After the single unsealing, those bars are ingested into a **separate live bar store** (`data/live_bars/`) used
+  only by the paper/live runner and G5; the research loader never reads it, and the step is logged in
+  `research/HOLDOUT_LOG.md`.
+
+**Switching.** A switch applies to new entries only: an open position is managed to its exit by the strategy
+that opened it (under S1 the netted position is treated as one position opened by S1), then the new strategy
+takes over. The new choice is kept at least 3 months, and every switch needs Parham's written approval in
+`docs/reports/`.
 
 ---
 
@@ -343,7 +565,7 @@ drawdown exceeds the 95th percentile of the bootstrap distribution. Capital scal
 | D-036 | Binance source anomalies are classified per row instead of aborting the file: `misaligned` (off-grid open), `empty_irregular` (irregular close, 0 trades) and `long` (closes after its label) are dropped; `short` (on-grid, ends early, has trades) is stored at the normal label and flagged. Anomalies persist in `_dataset.json`; a gap overlapping one is `exchange_outage`. File-level errors still abort | the real 2018-01 file aborted ingestion. A full scan (175,188 rows) found 60 irregular-duration rows and a 42-hour off-grid run (2018-02-09..11). Dropping or labelling at-or-after the real end is causal; nothing is filled or interpolated |
 | D-037 | Recorder continuity is proven by window overlap (lowest returned id ≤ last stored id), not by `first_id == last_stored_id + 1`; gap reason `window_no_overlap` | measured from the Turkey server on 2026-10-04 (curl to public `/trades`, limit 1000): BTCUSDT and ETHUSDT ids interleave in one global id space (median step 84 between consecutive BTCUSDT trades). The old rule would fire on every poll. **G1b wording change pending Parham** |
 | D-038 | Recorder hardening after review: one SQLite transaction per poll; the candle sweep never passes the last verified poll (`recorder_state`); a `meta` table pins the database to one symbol; recorder-level exponential backoff (cap 300 s) after 5 consecutive errors; the heartbeat carries `last_new_trade_ts_ms` and the healthcheck fails after 7200 s without a new trade | review MAJOR-1..3 and m3/m4/m6. 7200 s because the measured max gap between BTCUSDT trades on Tabdeal was 2120 s |
-| D-039 | **Proposed, pending Parham:** G1b's Binance-vs-Tabdeal basis needs Binance bars after `holdout_start`, which D-032 forbids downloading. Proposal: a separate live-comparison fetch (Binance REST, only the G1b window) into `data/live_compare/`, unreadable by the research loader and never used for strategy evaluation | the seal and G1b otherwise contradict each other (review m10) |
+| D-039 | **Approved by Parham 2026-10-10, with conditions (see D-074):** G1b's Binance-vs-LBank basis stores only Binance close prices at timestamps matching LBank candles in `data/live_compare/`; no indicator or return is computed from them, the research loader cannot read that path (tested), and the fetch is not a trial. (Originally proposed for Tabdeal.) | the seal and G1b otherwise contradict each other (review m10) |
 | D-040 | **Open, pending Parham:** G1a reconciliation fails on exactly 3 timestamps (2021-01-21, 2021-04-23, 2022-04-13), volume only, identical in BTC and ETH and in both 4h and 1d — Binance's own files disagree; OHLC reconciles everywhere outside outages | §7 says criteria may never be relaxed after seeing data, so this is Parham's call, not the orchestrator's |
 | D-041 | Recorder review round 2: the candle sweep needs evidence the feed has passed the hour (a later trade, or a 2 h quiet timeout after a verified poll); `[]` after data is not verified; the 24 h age filter is replaced by a plausibility check; schema v4 self-healing rewrites; fatal exit after 20 failed cycles | round-2 MAJOR-A (age filter rejected ~17 % of every 29 h window), MAJOR-B (`[]` sealed hours with missing trades) and m-C (stale/cached responses, clock skew). Cost: a genuinely silent hour seals up to 2 h late |
 | D-042 | Amends D-036: gap auto-classification is evidence-scoped — `exchange_outage` only when a *dropped* anomaly overlaps the missing-bar window `(from, to − Δ]`; `exchange_outage_after_short_bar` when a stored short bar's label equals the gap start; `exchange_wide_outage` when the identical window is missing in the other symbol from the same source. Every gap records `classified_by` (anomaly_overlap / after_short_bar / cross_symbol / manual); no rule overwrites a non-`unknown` classification. A raw close later than its label (beyond the 1-unit epsilon) is `long` and dropped | round-2 m-J: the first rule was broad enough to explain away unrelated gaps. Cross-symbol corroboration is evidence, not a guess: an exchange-wide stop hits every market at once |
@@ -352,19 +574,48 @@ drawdown exceeds the 95th percentile of the bootstrap distribution. Capital scal
 | D-045 | Tabdeal `exchangeInfo` is a bare JSON list of markets (1047 on 2026-10-05, measured from the Turkey server), not Binance's `{"symbols": [...]}`; the probe accepts both. BTCUSDT filters: tick 0.01, step 0.000001, min notional 1 USDT, market max qty 8.84 BTC | the first server probe reported BTCUSDT "not found" because of the Binance-shaped parser |
 | D-046 | The G0 probe also samples BTCIRT and USDTIRT depth each round, for comparison only (the traded pair stays BTCUSDT), reports fillable BUY/SELL size within 0.1 % / 0.5 % of mid (median and p10 across samples) and the implied BTC/USDT basis (BTCIRT/USDTIRT vs BTCUSDT) | Parham's request: execution capacity and the IRT market as context for G0 |
 | D-047 | **Fees (supersedes D-018):** Tabdeal tier 1 (30-day volume < 1,000 USDT) taker 35 bps, maker 33 bps per side (tier 2: 35/31, tier 3: 33/28, tier 4: 31/26). Backtests assume taker unless a strategy explicitly uses limit orders; the G3 ×2 stress means 70 bps per side. Phase-3 reports must show turnover and annual cost drag. Whether USDT markets use the same table is still to verify | Parham's fee-table review (2026-10-06). A pre-registration update made **before any strategy result** exists — it tightens, never loosens: a round trip now costs ≈ 0.8 % (2 × 35 bps fee + spread/slippage), which leaves only slow, low-turnover variants realistic |
+| D-048 | Allocator acceptance rule S0/S1/S2/S3 and the go-live rule (§7.1). S0's definition is **locked by Parham on 2026-10-10 (D-063)** | Parham, design additions from the peer project (2026-10-06). Locking a default before results is the only defence against picking the best of many backtests |
+| D-049 | Phase order 0 → 1 → 2 → 3 → 4 → 5a (signal infra, no order code) → 6 paper → 7a small live with manual execution → 5b order code → 7b automated live | Parham (2026-10-06): order code is the riskiest code in the project; it is written only after a manual live period has proven the signals. The `runtime.phase` integer and the `mode: live` check in `core/config.py` are re-mapped to these labels in phase 5a (no order path exists before then) |
+| D-050 | `Strategy.stop_price(window, entry_price) -> Decimal` is mandatory; registration fails without it; the RiskManager (phase 4) refuses a long whose stop is missing, non-positive or not below the price | Parham (2026-10-06). The stop rule is part of the strategy: its parameters are fixed in advance and every variant counts as a trial. In 7a the stop is placed by hand; exchange-side stops arrive with 5b (`docs/vendor/tabdeal-api-notes.md` §3) |
+| D-051 | From phase 3 every backtest reports two fill models — next-bar open, and a configurable manual delay (default 6 h) with slippage from recorded order-book snapshots — and validation reports state Minimum Track Record Length per candidate; paper/live records shorter than MinTRL may not be used to choose between strategies | Parham (2026-10-06): phase 7a fills are manual and late; a strategy that only works with instant fills must not pass |
+| D-052 | Order-code guardrail: a `PreToolUse` hook blocks edits under `src/` and `scripts/` introducing order/cancel/OCO/margin/withdrawal/`userDataStream` endpoints or exchange `POST`/`DELETE`; unlock only by Parham via `TBOT_ALLOW_ORDER_CODE=1`; the hook protects itself and `.claude/settings.json`; a pytest audit + CI step scan the same patterns | Parham (2026-10-06). The hook cannot see writes made through a shell, so the audit test and CI are the binding check |
 | D-053 | PR #2 review round: the late-trade / sealed-hour cursor lives in SQLite only (`sweep_cursor`, advanced after each written candle and reconciled with Parquet once per sweep, outside the poll transaction) — no Parquet access on the trade-ingestion path. Every downstream step (candle sweep, post-commit candle rewrites, order-book snapshot, heartbeat write) is isolated: a failure is logged at error level and counted in the heartbeat's `consecutive_cycle_exceptions` (healthcheck fails at 3), never via backoff or process exit. An unparsable item's gap anchors to its own plausible time, else its parsed neighbours' hour span | CLAUDE.md §3.8 (raw data first). Review M-1: one unreadable Parquet part stopped all trade recording, and Tabdeal keeps only ~29 h of history |
+| D-054 | Amends D-048/D-051 after review: S0 fully specified (M = ⌊N/2⌋, σ̂ definition, warm-up, transitions always traded, a 25 % *relative* band only for vol-driven resizing, stop model and post-stop reset); go-live metric = pooled OOS Sharpe after costs with manual-delay fills; S0/S1 run only if they themselves pass G3 and G4, else no-go; S1 leave-one-out with summed trials; S2 margin, window and frozen vol-tercile cut-points fixed; gating manual delay fixed at 6 h with a calibrated depth-at-size slippage curve; MinTRL inputs fixed | T6 review M-4/M-5: with an absolute 0.25 band and vol targeting at ~0.22–0.33 weight, the proposed S0 could never exit; unnamed metrics and "otherwise S0 runs" left choices open after results and could deploy a strategy that failed G3 |
+| D-055 | Amends D-052 after review: the guardrail's scope is any path with a `src`, `scripts`, `deploy` or `config` segment (worktrees and other checkouts included); the protected set is `.claude/settings.json`, `.claude/settings.local.json`, the whole `.claude/hooks/` directory, `tests/test_order_code_audit.py` and `.github/workflows/ci.yml`, never unlocked by `TBOT_ALLOW_ORDER_CODE`; the CI audit can never be skipped; verb literals, endpoint literals and SDK-style order methods are matched; read-only order queries for 7a reconciliation will need a reviewed allow-list that Parham edits by hand | T6 reviews M-1..M-3 and round-3 m-1/m-2: path, case and worktree bypasses, unprotected disarm files, and a realistic config-held endpoint slip |
+| D-056 | Amends D-054: σ̂ is a finite 150-return exponential kernel (start-independent; `warmup_bars = 151`); one DSR definition (probability units, G3 threshold DSR ≥ 0.95); go-live picks the best qualifying candidate, which must itself pass G3/G4; baseline fallback order fixed; the single holdout unsealing evaluates S0, S1 and all qualifying candidates together and only gates the walk-forward choice; S2 window = post-lock paper/live days; manual-delay stop model, adverse depth-at-size slippage calibration window and MinTRL input series fixed | T6 round-3 review MAJOR-1/2 and m-4..m-6: an infinite-memory EWMA broke the warm-up test and live/backtest parity; several go-live choices were still open after results |
+| D-057 | Amends D-054/D-056: S0's sub-signal state is defined by anchored replay from `history_start` (all flat at close #1; backtest, every walk-forward fold and the live runner replay every Binance 1d bar) — `warmup_bars = 151` is only the minimum before trading (first tradable close 2018-06-01); the stop-out reset follows the Binance-bar rule only; the manual-delay stop fills at `min(open_h, stop)` with adverse slippage; DSR inputs fixed (pooled OOS manual-delay daily series, daily non-annualised Sharpe, N and V[SR] from the logged trials, SR* = 0 for N = 1); the holdout is unsealed once for a single walk-forward choice X and only gates it — no fallback after a holdout failure; G4's summary now points to §7.1; slippage measured from the best quote. D-055's "endpoint literals are matched" is restored by the round-4 guardrail fix | T6 third review MAJOR-A/B, m-a, m-b, m-d and NITs: hysteresis made the Donchian state start-dependent beyond any fixed warm-up; qualifying on G4 while also gating on the holdout was circular |
+| D-058 | Amends D-056/D-057 after the fourth T6 review: DSR trial count for any non-S0 candidate = all non-S0 trials up to its lock date across all strategy types (no family partitioning); G3 for S0 = six fixed one-at-a-time neighbour variants (sensitivity runs, not trials), PBO N/A for S0 and S1; holdout band fully specified (stationary bootstrap of X's pooled OOS manual-delay returns, block 20, 10,000 paths, seed 20261008, adverse-tail percentiles) and logged before unsealing; post-G4 live bar store outside the research loader; the daily Binance rule alone drives S0's state, rule 2 never re-enters from flat; anchored replay and charged fold-boundary trades for every stateful strategy; overlay keep rule numeric and overlay variants counted as trials; fold metric named | T6 fourth review MAJOR-S1/S2/S3 and m-1..m-4: each left a choice open after results (trial partitioning, an S0 that could never pass G3, a holdout band whose parameters could be picked after unsealing) |
+| D-059 | Amends D-058 after the fifth T6 review: every non-S0 contender (each candidate and S1) uses one DSR trial count — all non-S0 trials logged up to the date X is chosen — and SR* = 0 if that count is 1; "lock date" is defined only for S2 (commit date of the challenger's frozen EXPERIMENTS.md entry); X's parameters for holdout and live = its own procedure on the final training window ending at holdout_start, logged before unsealing; G4 points to the one-sided §7.1 band. Guardrail: the CI audit runs with no project ini (`-c /dev/null`) and no autoloaded plugins, and requires the binding tests by name; `/order` must be a whole path segment | Fifth review MAJOR-1 (a pyproject `python_functions` edit dropped the scanning test while keeping the count) and MAJOR-2 (two contradicting trial-count rules for S1, undefined lock date) |
+| D-060 | **Fees (supersedes D-047 for the traded venue):** LBank **spot**, Parham's VIP 0 account, verified 2026-10-10: taker 10 bps, maker 10 bps per side (VIP1 8/8, VIP2 7/6.5, VIP3 6/5, VIP4 5/4, VIP5 4/3, VIP6 3.5/2, SVIP 3/0). Backtests assume taker unless a strategy explicitly uses limit orders; the G3 ×2 stress means **20 bps per side**. Spread and slippage are **not assumed**: the 5 bps slippage default is a provisional placeholder that the LBank G0 probe's measured spread/depth replaces before any phase-3 result. The perpetual table (taker 6 / maker 2 bps at VIP 0) is recorded in `docs/COMPARISON.md` only — we do not trade it (D-061) | The venue changed (Tabdeal → LBank) and the fee is read from the account, not guessed. This **lowers** the cost assumption (35 → 10 bps), which D-047 said pre-registration must not do after results are seen; it is legitimate here only because no strategy result exists yet (no result row in `research/EXPERIMENTS.md`) and the number is a verified fact of the new venue, not a choice. **Fee rule from now on (tightened after review):** after the first phase-3 result is logged in `research/EXPERIMENTS.md`, every gate is evaluated only at the schedule pre-registered on that date (here VIP 0, 10/10). A **higher** verified fee always applies. A **lower** verified fee (a higher VIP tier, a token discount, another venue) may appear only as a labelled sensitivity line and never decides a gate. The venue change itself is D-062 |
+| D-061 | **We stay on spot; no perpetual, even unleveraged.** Typical long funding is about 0.01 % per 8 h, i.e. roughly 11 % a year, and more in euphoric markets — far above the perpetual's fee saving, and a perpetual adds liquidation/ADL risk. Binance BTCUSDT funding, 2020-01 to 2025-09 (pre-holdout, 6,300 events, `research/funding_vs_spot_fees.py`): an always-long perpetual paid **13.2 % a year** (17.2 / 30.6 / 4.2 / 7.9 / 12.0 % in 2020–2024, 4.0 % in Jan–Sep 2025; longs paid in ~88 % of 8 h periods). Held only while an SMA100 proxy (close > SMA100 on 1d, long/flat, weight 1, no stop and no vol sizing — S0's signal only; 62.7 % in the market) is long, it still paid **12.0 % a year**, because funding is highest in the bull trends a trend follower holds. The proxy traded 14.8 sides a year, so the fee saving is only **0.6 % a year** (perp taker 6 vs spot 10 bps) or **1.2 %** (perp maker 2 bps): the perpetual costs **10.8–11.4 % a year more** than spot. Breakeven needs 150–300 full-equity sides a year, 10–20× the proxy's turnover. With volatility sizing, funding scales with the average weight while rebalancing adds some turnover, but even 10× the proxy's turnover stays below breakeven, so the conclusion holds | Parham's request 2026-10-10: back the spot decision with data, not intuition. Caveats: Binance funding is the stand-in; LBank perpetual funding is recorded from 2026-10-10 13:39:59 UTC and its correlation with Binance is reported once they overlap. S0's stop and sizing add turnover, but stay far below breakeven. This is a cost computation, not a strategy trial (no return metric), so it is not in the trial count |
+| D-062 | **Venue pivot (approved by Parham 2026-10-10): the traded venue is LBank spot; Tabdeal becomes legacy.** Tabdeal code, notes and recorded data stay in the repo and on the server but are not traded and not extended. Tabdeal's recorder is stopped only after the LBank recorder has had its first successful nightly backup and 24 h without errors, after one online `trades.sqlite` backup with `integrity_check` has been taken and handed to Parham | LBank offers public order-book, kline and trade endpoints that Tabdeal lacks (no kline endpoint, ~29 h of trades), and a VIP 0 spot fee of 10 bps against Tabdeal's 35 bps (D-060). The raw Tabdeal trades are the one dataset that cannot be re-downloaded, hence the ordered shutdown (CLAUDE.md §3.8) |
+| D-063 | **S0 is locked by Parham on 2026-10-10:** SMA100 trend filter on Binance 1d bars (`close_t > SMA100_t` long, else flat; fill at the next open, plus the 6 h manual-delay variant of D-051), sizing `w = min(1, 0.30/σ̂)` with the finite 150-return kernel (D-056), vol-driven reweighting only at a ≥ 25 % relative change and only while in position, fixed stop `P_ref − 3×ATR20_t` (`P_ref` = Binance open of bar t+1 before slippage, §7.1, so the stop-out state is identical in backtest, paper and live; ATR20 = simple 20-day mean of True Range) with the gap rule (low ≤ stop fills at the stop, an open below the stop fills at the open, slippage applies, never better than the stop), and re-entry only after a close ≤ SMA100 followed by a fresh close above it. Robustness is pre-registered: anchored replay from 2018-01-01 and six variants (SMA 50/75/150/200; vol target 20 %/40 %), each keeping ≥ 70 % of S0's Sharpe. S0 counts as **one** trial. The lock content was first committed in `8736334` (branch `feat/lbank-adaptation`) before any phase-3 result existed; the lock is logged in `research/EXPERIMENTS.md` | S0 is the champion every challenger must beat (D-064); it was proposed in Parham's own pivot message, not selected from data, so locking it before results keeps the trial count honest |
+| D-064 | **The champion/challenger test is a one-sided Ledoit–Wolf (2008) Sharpe-difference test** (H0: SR_challenger − SR_champion ≤ 0) on the two daily net return series over the same days, with a HAC estimator (Parzen kernel, Andrews automatic bandwidth), pass at z ≥ 1.645, minimum 365 days of overlap, together with the tripwire and 2-of-3 regime conditions in §7.1. It replaces the fixed 0.10 DSR margin | a fixed margin ignores the sampling noise of a Sharpe difference between two correlated series; an explicit test with a fixed bandwidth rule has no tunable knob |
+| D-065 | **Capital and venue-risk rule:** only capital Parham can afford to lose is ever placed on the exchange. Parham accepts, as of 2026-10-10, the jurisdiction risk, the risk of an account freeze and the risk of withdrawal delays at LBank. No larger sum is placed than the written scaling rule of G6 allows | the exchange sits outside any regulator we could appeal to; the bot cannot mitigate that, so the exposure is capped by the amount, and the acceptance is dated |
+| D-066 | **Funding-rate risk-off overlay (regime layer):** the backtest proxy is **Binance** BTCUSDT funding history (the only deep history; LBank's perpetual API gives the current value only and is recorded every 60 s from now on). Thresholds are set from Binance history alone by a pre-registered rule that is **causal**: an expanding-window percentile computed up to t, or a value fitted inside each walk-forward training fold only (never on the full 2020–2025 sample, which would leak into the out-of-sample folds, CLAUDE.md §3.1); every rule variant tried is a logged trial. They are never taken from the aggregates already viewed in `research/funding_vs_spot_fees.py` (disclosed in `research/EXPERIMENTS.md`). Live uses LBank funding; once an overlap window exists the LBank-vs-Binance correlation is reported. The overlay is kept only if it beats no-overlay out of sample (CLAUDE.md §9 phase 4) | funding is highest in the bull trends a trend follower holds (D-061), so an extreme-funding risk-off rule is plausible; the proxy is declared so nobody mistakes it for LBank data |
+| D-067 | **Cost model.** Spread and slippage come from measured order-book depth, never from reported volume (LBank's reported 24 h volume is likely partly inflated). Until recorded snapshots exist, a **temporary depth-at-size curve** from the G0 probe (the largest market order that fills within 0.1 % and 0.5 % at the median sample) is used, and every report that uses it must label it *temporary*. The 5 bps slippage default of D-060 stays provisional until then | a number measured from our own server is worth more than an assumption, but one probe is not a distribution, so the label is mandatory |
+| D-068 | **LBank recorder and storage plan.** One SQLite file per UTC day (`lbank-YYYY-MM-DD.sqlite`) with order-book snapshots every 10 s (top 20 levels), public trades (UUID ids, deduped by id, continuity by time overlap), klines and perpetual funding. A nightly job (~02:40 UTC) writes a zstd archive of each closed day, verifies it by reading it back, and only then deletes the source; an online backup and an 80 % disk alarm are in force. Order-book history starts 2026-10-10 13:40:00.871 UTC. Raw-first (CLAUDE.md §3.8) applies: no downstream failure stops recording | the order-book history is the only way to replace the temporary cost curve (D-067) and cannot be re-downloaded; per-day files keep a corrupt file from costing more than a day |
+| D-069 | **Strategy universe.** Seven strategies with small pre-fixed parameter grids: S0, Donchian ensemble, time-series momentum, EWMAC, volatility-compression breakout, pullback mean-reversion (weak evidence; included for completeness), and order-book imbalance (paper/shadow only, evaluated first as an execution filter). Every grid point is a trial in `research/EXPERIMENTS.md`; non-S0 DSR counting follows D-059 | a pre-fixed small universe makes the trial count finite and honest; the weak and shadow-only entries are named so they are not silently promoted |
+| D-070 | **Dependencies approved by Parham (2026-10-10):** `ccxt` (broker adapter side; the exact version is recorded here when it is added to `pyproject.toml`/`uv.lock`, and only read-only methods may be used before phase 5b), `fastapi` + `uvicorn` + `jinja2` (dashboard, D-072), and **uPlot vendored** into the repo with its version and checksum recorded (no CDN, no npm). Each is added in the PR that first uses it, **except `ccxt`: it may not enter `pyproject.toml` or `uv.lock` until Parham has applied the D-075 guard patch and CI is green with it** | CLAUDE.md §7 requires approval and a one-line justification for each new dependency; vendoring keeps the dashboard free of third-party network calls |
+| D-071 | **S&P 500 and Nasdaq-100 daily history from Stooq** is allowed as *research/informational* data only (never traded, never used for gate decisions). Annualisation is 252 days and the series are price indices (dividends excluded), reported as such | a benchmark for context; the different annualisation and the price-only series must be stated wherever the numbers appear |
+| D-072 | **Dashboard.** A read-only GET API (FastAPI) with an OpenAPI schema and `docs/dashboard-api.md`, plus a simple Jinja2 UI that reads only that public API; bound to `127.0.0.1` only; no write endpoint of any kind. Claude builds the UI | one source of truth for what the UI shows, and no remote control surface on a machine that will hold an exchange key |
+| D-073 | **LBank gates.** G0 is the public part only (§7 G0): measured from the Turkey server, ≥ 30 samples over ≥ 6 h, conservative rate-limit probing that stops at the first 429/418/403 or other ban-type response; the private signed-read part is postponed until Parham creates a read-only key from an account in his own name and must pass before phase 7a. G1b is ≥ 7 consecutive healthy recorder days (§7 G1b), earliest 2026-10-17 13:40 UTC. G1a and G1b are decided separately (D-016) | the server is our only IP, so a ban must never be risked; the private key does not exist yet, so no private call is made |
+| D-074 | **Live-compare data (D-039 approved, with conditions).** Binance close prices at timestamps matching LBank candles are stored in `data/live_compare/` for the G1b basis only. No indicator, return or other statistic is computed from them for strategy evaluation, the research loader cannot read that path (a test proves it), and the fetch is **not a trial** and does not count toward the trial count. LBank bars from the recorder are likewise stored apart from research data | the sealed holdout (D-032) and the G1b basis otherwise contradict each other; storing closes only, in an unreadable place, lets the basis be measured without opening the holdout |
+| D-075 | **ccxt order-method guard.** The order-code guardrail also blocks ccxt's order, cancel, edit, margin and transfer methods in snake_case and camelCase (including `*_ws`, `create_orders`, `cancel_orders`, `edit_order`, `create_order_with_*`, `private_post*`, `transfer` and `getattr`-style dynamic calls). The guardrail files are self-protected, so Parham applies the change by hand from `docs/patches/ccxt-order-guard.patch` with `git apply`; nothing is bypassed. **Status: pending until Parham applies it**; the patch covers the spellings listed in its tests, and the guard remains defence-in-depth, with review as the binding check | ccxt exposes order paths under names the existing pattern list does not cover, and the broker adapter arrives with ccxt in phase 5b |
+| D-076 | **Telegram alerts, health only (approved 2026-10-10).** A separate small host-side health-monitor service sends alerts when a recorder stream is stale or erroring, a backup fails or fails its integrity check, disk use exceeds 80 %, or a container is unhealthy. It is the only component that holds the bot token and chat id (a root-only env file); recorder containers receive no secrets. Trade alerts come later, in phase 5a | alerts that need secrets must not widen what the recorder containers can read; a host-side unit also needs no docker socket inside a container |
+| D-077 | **Model reporting.** Every delegated task's report-back states the model the subagent actually ran on. As of 2026-10-10 the aliases resolve to `claude-sonnet-5-5` (agents) and `claude-opus-5-5` (reviewer), so the agent files stay unpinned | an alias can silently change under an update; the report makes a change visible |
 
 ---
 
 ## 9. Open questions (need Parham or the probe to answer)
 
-1. ~~Tabdeal fee tier~~ — answered by Parham (D-047): tier 1, taker 35 / maker 33 bps. Still open: whether
-   USDT-quoted markets use the same table.
-2. **Real `exchangeInfo` filters** for BTCUSDT/ETHUSDT (tick, step, min-notional) — unknown until G0.
+1. ~~Fee tier~~ — answered by Parham: LBank spot VIP 0, taker 10 / maker 10 bps, verified from his account
+   (D-060; supersedes the Tabdeal answer in D-047). Spread and slippage: from the LBank G0 probe.
+2. **Real exchange filters** (LBank `accuracy.do`; legacy Tabdeal: `exchangeInfo`) for BTCUSDT/ETHUSDT (tick, step, min-notional) — unknown until G0.
 3. **Rate limits** (undocumented). Start at 5 req/s; the probe reports observed headers and any 429.
-4. **Does any endpoint require `tabdealSymbol=BTC_USDT`** instead of `symbol=BTCUSDT`?
+4. *(Legacy, Tabdeal)* **Does any endpoint require `tabdealSymbol=BTC_USDT`** instead of `symbol=BTCUSDT`?
 5. **Server static IP** for the API-key whitelist.
-6. **`/trades` behaviour**: default and maximum `limit`, whether the window is id- or time-based — determines
+6. *(Legacy, Tabdeal)* **`/trades` behaviour**: default and maximum `limit`, whether the window is id- or time-based — determines
    the recorder's polling interval.
    *Answered from the Turkey server (2026-10-04, curl):* recent-trades window; `limit=1000` accepted (~29 h of
    BTCUSDT); `time` in integer ms; ids global across markets (D-037). The full probe run will re-confirm.
