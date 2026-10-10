@@ -1,0 +1,20 @@
+# The LBank recorder runs from its own pinned checkout, /opt/tbot/lbank-run (a git worktree or clone
+# checked out at a fixed commit), NOT from /opt/tbot/trade-bot: pulling main must never rebuild or
+# restart the raw recorder by accident (CLAUDE.md §3.8). Upgrade deliberately:
+#   cd /opt/tbot/lbank-run && git fetch && git checkout <commit>
+#   docker compose -f deploy/docker-compose.lbank.yml up -d --build
+#
+[Unit]
+Description=Nightly online backup of the LBank recorder's per-day SQLite files
+Documentation=file:///opt/tbot/trade-bot/deploy/SERVER_SETUP.md
+After=docker.service
+Requisite=docker.service
+
+[Service]
+Type=oneshot
+User=root
+Nice=19
+IOSchedulingClass=idle
+WorkingDirectory=/opt/tbot/lbank-run
+ExecStart=/bin/sh -c 'VOL=$(docker volume inspect tbot-lbank-data --format "{{ .Mountpoint }}") && exec /usr/bin/python3 /opt/tbot/lbank-run/deploy/backup_lbank.py --source-dir "$VOL/lbank" --dest-dir /var/backups/tbot/lbank'
+TimeoutStartSec=1800

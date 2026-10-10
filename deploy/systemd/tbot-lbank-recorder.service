@@ -1,0 +1,27 @@
+# The LBank recorder runs from its own pinned checkout, /opt/tbot/lbank-run (a git worktree or clone
+# checked out at a fixed commit), NOT from /opt/tbot/trade-bot: pulling main must never rebuild or
+# restart the raw recorder by accident (CLAUDE.md §3.8). Upgrade deliberately:
+#   cd /opt/tbot/lbank-run && git fetch && git checkout <commit>
+#   docker compose -f deploy/docker-compose.lbank.yml up -d --build
+#
+[Unit]
+Description=tbot LBank raw market-data recorder (docker compose project)
+Documentation=file:///opt/tbot/trade-bot/deploy/SERVER_SETUP.md
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=tbot
+Group=docker
+WorkingDirectory=/opt/tbot/lbank-run
+ExecStart=/usr/bin/docker compose -f /opt/tbot/lbank-run/deploy/docker-compose.lbank.yml up -d
+ExecStop=/usr/bin/docker compose -f /opt/tbot/lbank-run/deploy/docker-compose.lbank.yml down
+TimeoutStartSec=300
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
