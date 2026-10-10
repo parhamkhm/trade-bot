@@ -578,12 +578,22 @@ class Clock(Protocol):
 
 @runtime_checkable
 class Strategy(Protocol):
-    """Pure mapping from a window of closed bars to a target weight."""
+    """Pure mapping from a window of closed bars to a target weight, plus its protective stop.
+
+    ``stop_price`` is mandatory (SPEC D-050): for an open long entered at ``entry_price``, it returns the
+    price at which the position must be closed, computed only from ``window`` (closed bars up to and
+    including ``t``). It must be positive and below the current price; the RiskManager refuses a long
+    whose stop is missing or invalid, and ``tbot.strategies.base.StrategyRegistry`` refuses a strategy
+    that does not implement it. The stop rule is part of the strategy: its parameters are fixed in
+    advance and every variant counts as a trial.
+    """
 
     id: str
     warmup_bars: int
 
     def on_bar(self, window: BarWindow) -> TargetIntent: ...
+
+    def stop_price(self, window: BarWindow, entry_price: Decimal) -> Decimal: ...
 
 
 @runtime_checkable
