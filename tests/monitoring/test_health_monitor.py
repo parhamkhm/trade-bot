@@ -6,7 +6,9 @@ from __future__ import annotations
 import io
 import json
 import logging
+import os
 import socket
+import subprocess
 import threading
 import traceback
 import urllib.error
@@ -271,6 +273,24 @@ def test_disk_path_that_cannot_be_read_raises_no_alert_but_is_unknown(host: Host
     assert hm.collect(settings, host.probes()).problems == {}
 
 
+def test_disk_clear_margin_keeps_an_open_alert_until_well_below_the_limit(
+    host: Host, settings: Settings
+) -> None:
+    key = "disk:" + str(BACKUP_DIR)
+    probes = host.probes()
+    host.disks[BACKUP_DIR] = DiskUsage(79 * GIB, 21 * GIB, 2)  # 79%: not open yet, below the 80% limit
+    assert hm.check_disks(settings, probes) == []
+    probes.memory.open_keys = {key}  # simulate: this alert is already open
+    found = hm.check_disks(settings, probes)
+    assert keys(found) == {key}  # still above 80 - 2 = 78%, so it does not clear
+    assert "clears below 78%" in found[0].summary
+    host.disks[BACKUP_DIR] = DiskUsage(77 * GIB, 23 * GIB, 2)  # 77%: now below the clear margin
+    assert hm.check_disks(settings, probes) == []
+    host.disks[BACKUP_DIR] = DiskUsage(85 * GIB, 15 * GIB, 2)  # unrelated: a fresh alert still needs >80%
+    probes.memory.open_keys = set()
+    assert keys(hm.check_disks(settings, probes)) == {key}
+
+
 # ---------------------------------------------------------------------------------------------
 # Class 4: containers
 # ---------------------------------------------------------------------------------------------
@@ -327,6 +347,56 @@ def test_starting_health_is_tolerated_only_for_the_grace_period(host: Host, sett
 def test_container_without_healthcheck_status_alerts(host: Host, settings: Settings) -> None:
     host.states["tbot-recorder"] = container_state(Health=None)
     assert keys(hm.check_recorders(settings, host.probes())) == {"recorder:tabdeal"}
+
+
+def test_restart_count_increase_is_folded_into_the_recorder_alert(host: Host, settings: Settings) -> None:
+    """A crash loop (RestartCount climbing) is a container-state signal; it shares the recorder's
+    one key rather than minting a separate one (review MAJOR 2/3 unification; MINOR 10)."""
+    host.restarts["tbot-lbank-recorder"] = 1
+    assert hm.check_recorders(settings, host.probes()) == []  # first sighting: nothing to compare yet
+    host.restarts["tbot-lbank-recorder"] = 3
+    found = hm.check_recorders(settings, host.probes())
+    assert keys(found) == {"recorder:lbank"}
+    assert "restarted 2 time(s)" in found[0].summary
+    assert "total 3" in found[0].summary
+
+
+def test_restart_count_note_is_appended_to_an_existing_container_problem(
+    host: Host, settings: Settings
+) -> None:
+    host.restarts["tbot-lbank-recorder"] = 1
+    hm.check_recorders(settings, host.probes())  # first sighting
+    host.restarts["tbot-lbank-recorder"] = 2
+    host.states["tbot-lbank-recorder"] = container_state(Status="exited", ExitCode=1)
+    found = hm.check_recorders(settings, host.probes())
+    assert keys(found) == {"recorder:lbank"}  # still one key, not two
+    assert "exited" in found[0].summary
+    assert "restarted 1 time(s)" in found[0].summary
+
+
+def test_container_and_stream_problems_share_one_key_and_never_falsely_clear_each_other(
+    host: Host, tmp_path: Path, clock: Clock
+) -> None:
+    """Review MAJOR 3: one recorder used to be two keys (container:x, stream:x); a container
+    coming back healthy must not RESOLVE a key that is still open for a stale heartbeat."""
+    out = Outbox()
+    monitor = make_monitor(make_settings(tmp_path, confirm_cycles=1), host, out)
+    host.states["tbot-lbank-recorder"] = container_state(Status="exited", ExitCode=1)
+    assert [e.kind for e in monitor.run_cycle()] == ["alert"]
+    host.states["tbot-lbank-recorder"] = container_state()  # container is healthy again...
+    stale = Path("/v/tbot-lbank-data") / "lbank/heartbeat.json"
+    host.files[stale] = json.dumps({"written_ms": int((clock() - timedelta(seconds=900)).timestamp() * 1000)})
+    # ...but the stream is now stale: same key, must stay open
+    clock.advance(minutes=1)
+    assert monitor.run_cycle() == []  # no RESOLVED: the key's problem just changed shape
+    clock.advance(minutes=1)
+    assert monitor.run_cycle() == []
+    host.files[stale] = json.dumps({"written_ms": int((clock() - timedelta(seconds=10)).timestamp() * 1000)})
+    # now genuinely healthy
+    clock.advance(minutes=1)
+    assert monitor.run_cycle() == []
+    clock.advance(minutes=1)
+    assert [(e.kind, e.key) for e in monitor.run_cycle()] == [("resolved", "recorder:lbank")]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -602,6 +672,79 @@ def test_run_command_missing_binary_raises_tool_error() -> None:
 
 
 # ---------------------------------------------------------------------------------------------
+# No secrets reach docker / systemctl: the scrubbed child environment
+# ---------------------------------------------------------------------------------------------
+
+
+def test_child_env_drops_everything_except_the_allow_list() -> None:
+    fake_environ = {
+        "PATH": "/usr/bin",
+        "HOME": "/root",
+        "TBOT_TELEGRAM_BOT_TOKEN": FAKE_TOKEN,
+        "TBOT_TELEGRAM_CHAT_ID": FAKE_CHAT,
+        "TBOT_DEADMAN_URL": "https://example.com/ping/secret",
+        "SOME_RANDOM_VAR": "x",
+    }
+    env = hm._child_env(fake_environ)
+    assert env == {"PATH": "/usr/bin", "HOME": "/root"}
+
+
+def test_child_env_falls_back_to_a_default_path_when_unset() -> None:
+    env = hm._child_env({})
+    assert env["PATH"] == hm._DEFAULT_PATH
+
+
+def test_run_command_passes_only_the_scrubbed_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_run(args: Any, **kwargs: Any) -> Any:
+        seen.update(kwargs)
+
+        class Done:
+            returncode, stdout, stderr = 0, "", ""
+
+        return Done()
+
+    monkeypatch.setattr(os, "environ", {"PATH": "/bin", hm.ENV_TOKEN: FAKE_TOKEN})
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    hm.run_command(["docker", "ps"])
+    assert seen["env"] == {"PATH": "/bin"}
+    assert FAKE_TOKEN not in str(seen["env"])
+
+
+# ---------------------------------------------------------------------------------------------
+# _read_text: O_NOFOLLOW, regular-file check, size cap
+# ---------------------------------------------------------------------------------------------
+
+
+def test_read_text_reads_a_small_regular_file(tmp_path: Path) -> None:
+    path = tmp_path / "small.json"
+    path.write_text("hello", encoding="utf-8")
+    assert hm._read_text(path) == "hello"
+
+
+def test_read_text_refuses_a_file_above_the_size_cap(tmp_path: Path) -> None:
+    path = tmp_path / "big.json"
+    path.write_text("x" * 10, encoding="utf-8")
+    with pytest.raises(OSError):
+        hm._read_text(path, max_bytes=5)
+
+
+def test_read_text_refuses_a_symlink_as_the_final_component(tmp_path: Path) -> None:
+    if not hasattr(os, "symlink") or not hasattr(os, "O_NOFOLLOW"):
+        pytest.skip("platform has no symlink / O_NOFOLLOW support for this check")
+    target = tmp_path / "real.json"
+    target.write_text("{}", encoding="utf-8")
+    link = tmp_path / "link.json"
+    try:
+        link.symlink_to(target)
+    except (OSError, NotImplementedError):
+        pytest.skip("creating a symlink is not permitted in this environment")
+    with pytest.raises(OSError):
+        hm._read_text(link)
+
+
+# ---------------------------------------------------------------------------------------------
 # Alert hygiene: dedupe, reminder, resolved
 # ---------------------------------------------------------------------------------------------
 
@@ -696,6 +839,41 @@ def test_state_survives_a_restart_without_realerting(host: Host, settings: Setti
         clock.advance(minutes=1)
         restarted.run_cycle()
     assert "RESOLVED" in out2.sent[-1]
+
+
+def test_restart_counts_persist_across_a_process_restart(
+    host: Host, settings: Settings, clock: Clock
+) -> None:
+    """A real restart replaces the whole process (fresh Memory); only the persisted state survives.
+    The crash-loop count must come from there, not be lost on every restart."""
+    host.restarts["tbot-lbank-recorder"] = 1
+    make_monitor(settings, host, Outbox()).run_cycle()  # first sighting: remembered, no note yet
+    clock.advance(minutes=1)
+    fresh_host = Host(clock)  # a brand-new Host/Memory, as if the monitor process restarted
+    fresh_host.restarts["tbot-lbank-recorder"] = 2
+    out = Outbox()
+    events = make_monitor(settings, fresh_host, out).run_cycle()
+    assert [(e.kind, e.key) for e in events] == [("alert", "recorder:lbank")]
+    assert "restarted 1 time(s)" in out.sent[-1]
+    assert "total 2" in out.sent[-1]
+
+
+def test_lbank_nostatus_grace_anchor_persists_across_a_process_restart(
+    host: Host, tmp_path: Path, clock: Clock
+) -> None:
+    settings = make_settings(tmp_path)
+    del host.files[hm.LBANK_STATUS_FILE]
+    make_monitor(settings, host, Outbox()).run_cycle()  # first sighting: anchor persisted at NOW
+    clock.advance(hours=35)
+    fresh_host = Host(clock)
+    del fresh_host.files[hm.LBANK_STATUS_FILE]
+    out = Outbox()
+    # a fresh process at 35 h must still be quiet (the grace clock did not restart with the process)
+    assert make_monitor(settings, fresh_host, out).run_cycle() == []
+    clock.advance(hours=2)
+    out2 = Outbox()
+    events = make_monitor(settings, fresh_host, out2).run_cycle()
+    assert [(e.kind, e.key) for e in events] == [("alert", "backup:lbank:nostatus")]
 
 
 def test_at_most_eight_messages_per_cycle(host: Host, tmp_path: Path, clock: Clock) -> None:
@@ -794,6 +972,71 @@ def test_run_forever_survives_a_crashing_cycle() -> None:
 
 
 # ---------------------------------------------------------------------------------------------
+# Optional dead-man ping: never logs the URL, never fatal, only after a clean cycle
+# ---------------------------------------------------------------------------------------------
+
+
+_DEADMAN_URL = "https://hc-ping.com/super-secret-id"
+
+
+def test_deadman_pinger_sends_a_get_and_the_url_never_appears_in_repr_or_logs(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    seen: list[urllib.request.Request] = []
+
+    def fake_urlopen(request: urllib.request.Request, timeout: float = 0.0) -> FakeResponse:
+        seen.append(request)
+        return FakeResponse(200, b"OK")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    pinger = hm.DeadmanPinger(_DEADMAN_URL)
+    assert _DEADMAN_URL not in repr(pinger)
+    with caplog.at_level(logging.DEBUG):
+        assert pinger() is True
+    assert len(seen) == 1
+    assert seen[0].get_method() == "GET"
+    assert seen[0].full_url == _DEADMAN_URL
+    assert _DEADMAN_URL not in caplog.text
+
+
+def test_deadman_pinger_ignores_failures_and_never_logs_the_url(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def fake_urlopen(request: urllib.request.Request, timeout: float = 0.0) -> FakeResponse:
+        raise TimeoutError(f"timed out talking to {request.full_url}")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    pinger = hm.DeadmanPinger(_DEADMAN_URL)
+    with caplog.at_level(logging.WARNING):
+        assert pinger() is False  # ignored: does not raise
+    assert _DEADMAN_URL not in caplog.text
+    assert "dead-man ping failed" in caplog.text
+
+
+def test_run_forever_pings_only_after_a_clean_cycle_and_never_lets_a_broken_ping_stop_it() -> None:
+    stop = threading.Event()
+    calls = {"cycles": 0, "pings": 0}
+
+    class OnceThenStop:
+        def run_cycle(self) -> list[Any]:
+            calls["cycles"] += 1
+            if calls["cycles"] == 2:
+                stop.set()
+                raise RuntimeError("the cycle itself crashed: no ping should follow")
+            return []
+
+    def ping() -> bool:
+        calls["pings"] += 1
+        if calls["pings"] == 1:
+            raise RuntimeError("a broken ping must not stop the loop")
+        return True
+
+    hm.run_forever(OnceThenStop(), 0.0, stop, ping)  # type: ignore[arg-type]
+    assert calls["cycles"] == 2  # a crashing cycle still happened, but got no ping afterwards
+    assert calls["pings"] == 1  # only after the one clean cycle
+
+
+# ---------------------------------------------------------------------------------------------
 # Start notice
 # ---------------------------------------------------------------------------------------------
 
@@ -866,9 +1109,33 @@ def test_load_settings_defaults() -> None:
     s = hm.load_settings({}, hostname="h")
     assert (s.interval_s, s.disk_max_pct, s.repeat_hours, s.backup_max_age_hours) == (60.0, 80.0, 6.0, 36.0)
     assert s.resolve_cycles == 2
+    assert s.confirm_cycles == 2
+    assert s.disk_clear_margin == 2.0
+    assert s.deadman_url == ""
     assert s.state_dir == Path("/var/lib/tbot-health-monitor")
     assert s.lbank_status_file == Path("/var/backups/tbot/lbank/status.json")
     assert s.hostname == "h"
+
+
+def test_load_settings_confirm_cycles_and_disk_clear_margin() -> None:
+    s = hm.load_settings({"TBOT_MONITOR_CONFIRM_CYCLES": "4", "TBOT_MONITOR_DISK_CLEAR_MARGIN": "5"})
+    assert s.confirm_cycles == 4
+    assert s.disk_clear_margin == 5.0
+
+
+def test_load_settings_deadman_url_accepts_http_and_https_only() -> None:
+    s = hm.load_settings({"TBOT_DEADMAN_URL": "https://hc-ping.com/abc-123"})
+    assert s.deadman_url == "https://hc-ping.com/abc-123"
+    assert "abc-123" not in repr(s)  # the field is repr=False: never printed by accident
+
+
+def test_load_settings_rejects_a_non_http_deadman_url_without_raising(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.WARNING):
+        s = hm.load_settings({"TBOT_DEADMAN_URL": "ftp://example.com/x"})
+    assert s.deadman_url == ""
+    assert "not an http" in caplog.text
 
 
 def test_load_settings_overrides_and_bad_values() -> None:
