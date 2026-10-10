@@ -59,7 +59,8 @@ CLAUDE.md §3.6).
 ## 6. Fills and commission
 
 - Fills include `commission` and `commissionAsset`. Always record the **actual** commission and its asset per fill;
-  never assume the fee rate. The fee table (D-047, tier 1: taker 35 / maker 33 bps) is a backtest assumption only.
+  never assume the fee rate. The fee table (D-047, tier 1: taker 35 / maker 33 bps) was a backtest assumption only;
+  **superseded by D-060** (the project now trades LBank spot, 10/10 bps) — Tabdeal is legacy.
 - Reconcile the recorded commission against the expected rate. A persistent deviation means a tier change or a
   wrong assumption, and is flagged.
 

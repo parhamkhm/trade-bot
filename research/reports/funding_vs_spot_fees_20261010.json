@@ -7,8 +7,9 @@
   "n_funding_events": 6300,
   "funding_always_long_pct_per_year": 13.17,
   "funding_while_s0_long_pct_per_year": 11.97,
+  "share_of_8h_periods_positive_pct": 87.65,
   "s0": {
-    "rule": "close > SMA100 (1d), long/flat, weight 1.0, no stop",
+    "rule": "SMA100 proxy: close > SMA100 (1d), long/flat, weight 1.0, no stop, no vol sizing",
     "sides": 85,
     "sides_per_year": 14.8,
     "time_in_market_pct": 62.7

@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 from pydantic import SecretStr, ValidationError
 
-from tbot.core.config import Config, RuntimeConfig, Secrets, load_config
+from tbot.core.config import Config, CostConfig, RuntimeConfig, Secrets, load_config
 from tbot.core.types import Timeframe
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -35,6 +35,10 @@ def test_default_yaml_loads_and_matches_schema():
     assert config.runtime.phase == 0
     assert config.costs.taker_fee_bps == Decimal("10")  # LBank spot VIP 0, D-060
     assert config.costs.maker_fee_bps == Decimal("10")
+    assert config.costs.slippage_bps == Decimal("5")
+    assert config.costs.slippage_provisional is True
+    # the YAML and the code defaults must not drift apart
+    assert config.costs == CostConfig()
     assert config.data.symbols == ("BTCUSDT", "ETHUSDT")
     assert Timeframe.H4 in config.data.timeframes
 

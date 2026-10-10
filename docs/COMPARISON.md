@@ -32,7 +32,7 @@ already netted in.
 Stand-in: Binance BTCUSDT USD-M funding, 2020-01-01 → 2025-10-01 (pre-holdout, 6,300 events), from
 `research/funding_vs_spot_fees.py` → `research/reports/funding_vs_spot_fees_20261010.md`.
 
-| year | funding paid by an always-long perpetual, % of notional | while the S0 proxy is long, % | S0 proxy in market |
+| year | funding paid by an always-long perpetual, % of notional | while the SMA100 proxy is long, % | proxy in market |
 |---|---|---|---|
 | 2020 | 17.2 | 18.2 | 82 % |
 | 2021 | 30.6 | 28.9 | 69 % |
@@ -43,27 +43,29 @@ Stand-in: Binance BTCUSDT USD-M funding, 2020-01-01 → 2025-10-01 (pre-holdout,
 | **per year, whole sample** | **13.2** | **12.0** | 63 % |
 
 Longs paid in about 88 % of all 8 h periods. Funding is highest in bull trends, which is exactly when a
-trend follower is long. That is why holding only while S0 is long saves very little versus always long.
+trend follower is long. That is why holding only while the proxy is long saves very little versus always long.
 
-## 3. All-in cost per year at S0's turnover
+## 3. All-in cost per year at the SMA100 proxy's turnover
 
-S0 proxy: close > SMA100 on 1d bars, long/flat, weight 1.0, no stop. It made **14.8 sides a year**. Slippage
+SMA100 proxy: close > SMA100 on 1d bars, long/flat, weight 1.0, no stop and no vol sizing (S0's signal
+only, not S0). It made **14.8 sides a year**. Slippage
 uses the provisional 5 bps per side until the LBank G0 probe measures it.
 
-| cost line, % of equity per year | spot 1× (this project) | perpetual 1× | perpetual 2× (peer) |
+| cost line, % of equity per year | spot 1× (this project) | perpetual 1× | perpetual 2× * |
 |---|---|---|---|
 | fees (taker) | 1.48 | 0.89 | 1.78 |
 | spread + slippage (provisional 5 bps) | 0.74 | 0.74 * | 1.48 * |
 | funding while long (Binance stand-in) | 0.00 | 11.97 | 23.94 |
 | **total** | **2.22** | **13.60** | **27.20** |
 
-\* The perpetual has its own order book; its spread is not measured yet.
+\* The perpetual has its own order book; its spread is not measured yet. The 2× column assumes the proxy's
+turnover and exposure. It is **not** the peer project's actual cost, which depends on its own strategy.
 
 The perpetual's fee saving (0.6 %/yr as taker, 1.2 %/yr as maker) is about a tenth of its funding bill.
-The two break even only at **150–300 sides a year**, 10–20× S0's turnover. Leverage doubles every line.
+The two break even only at **150–300 full-equity sides a year**, 10–20× the proxy's turnover. Leverage doubles every line.
 It also adds liquidation and auto-deleveraging risk, which spot does not have and which this table does not
-price. Volatility targeting (weight ≈ 0.4–0.5) scales every line by the same factor, so the ranking does not
-change.
+price. With volatility sizing (weight ≈ 0.4–0.5), funding scales with the average weight while rebalancing adds
+some turnover, but even 10× the proxy's turnover stays below breakeven, so the ranking does not change.
 
 ## 4. Pending (fill in as measurements arrive)
 
