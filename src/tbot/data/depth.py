@@ -19,14 +19,20 @@ trade-id gap, which is detected separately from the stored trade ids, not from t
 
 from __future__ import annotations
 
-from decimal import Decimal, InvalidOperation
+from collections.abc import Sequence
+from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from typing import Any, Literal
 
 __all__ = [
     "best_bid_ask",
+    "convert_irt_to_usdt",
     "cumulative_depth",
+    "implied_price_from_legs",
     "is_saturated",
+    "median_decimal",
     "parse_depth_levels",
+    "percentile_decimal",
+    "price_basis_bps",
     "spread_bps_and_pct",
     "to_decimal",
 ]
@@ -155,3 +161,74 @@ def is_saturated(requested_limit: int, returned_count: int) -> bool:
     missed trade. See the module docstring for the metrics that actually matter operationally.
     """
     return requested_limit > 0 and returned_count >= requested_limit
+
+
+# ---------------------------------------------------------------------------------
+# IRT cross-rate maths (Parham's request, G0 depth-sampling extension): BTCIRT and USDTIRT are
+# measured for comparison only -- the traded pair stays BTCUSDT (CLAUDE.md section 2) -- but
+# sizing an IRT-denominated book in USDT, and checking the implied BTC/USDT cross against the
+# directly-quoted BTCUSDT price, both need a few more pure Decimal helpers. None of these ever
+# raise on a non-positive divisor: a momentarily bad or missing USDTIRT mid must degrade one
+# round's cross maths to ``None``, never abort an hours-long sampling run.
+# ---------------------------------------------------------------------------------
+
+
+def convert_irt_to_usdt(amount_irt: Decimal, usdt_irt_mid: Decimal) -> Decimal | None:
+    """Convert an IRT-denominated amount (e.g. a BTCIRT book's quote-side notional) to USDT
+    using a same-round USDTIRT mid price. ``None`` (never raises) when ``usdt_irt_mid`` is
+    non-positive -- a zero or negative mid is not a valid exchange rate."""
+    if usdt_irt_mid <= 0:
+        return None
+    return amount_irt / usdt_irt_mid
+
+
+def implied_price_from_legs(leg_irt_mid: Decimal, usdt_irt_mid: Decimal) -> Decimal | None:
+    """Implied USDT price of an IRT-quoted leg, e.g. ``implied_price_from_legs(btcirt_mid,
+    usdtirt_mid)`` for the implied BTC/USDT cross rate. ``None`` (never raises) when
+    ``usdt_irt_mid`` is non-positive."""
+    if usdt_irt_mid <= 0:
+        return None
+    return leg_irt_mid / usdt_irt_mid
+
+
+def price_basis_bps(observed: Decimal, reference: Decimal) -> float | None:
+    """``(observed - reference) / reference`` in basis points. ``None`` (never raises) when
+    ``reference`` is non-positive. Mirrors :func:`spread_bps_and_pct`'s float-at-the-last-step
+    convention -- the comparison itself is exact Decimal, only the reported ratio is a float."""
+    if reference <= 0:
+        return None
+    return float((observed - reference) / reference) * 10_000
+
+
+def median_decimal(values: Sequence[Decimal]) -> Decimal | None:
+    """Exact Decimal median -- never routes through float. ``None`` for an empty sequence.
+
+    An odd-length sequence returns its middle element unchanged (no arithmetic at all); an
+    even-length one averages the two middle elements, which is exact because dividing an exact
+    Decimal sum by 2 never loses precision.
+    """
+    if not values:
+        return None
+    ordered = sorted(values)
+    n = len(ordered)
+    mid = n // 2
+    if n % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def percentile_decimal(values: Sequence[Decimal], fraction: Decimal) -> Decimal | None:
+    """Nearest-rank percentile (no interpolation) -- exact Decimal in, exact Decimal out.
+
+    ``fraction`` is in ``[0, 1]`` (e.g. ``Decimal("0.10")`` for p10). Nearest-rank means every
+    returned value is one of the inputs themselves, never an interpolated point between two of
+    them -- appropriate here since "p10 of the fillable size across samples" means a specific,
+    real, bad-but-common snapshot, not a synthetic blend of two different snapshots.
+    ``None`` for an empty sequence.
+    """
+    if not values:
+        return None
+    ordered = sorted(values)
+    n = len(ordered)
+    rank = 1 if fraction <= 0 else min(n, int((fraction * n).to_integral_value(rounding=ROUND_CEILING)))
+    return ordered[rank - 1]

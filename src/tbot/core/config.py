@@ -53,8 +53,8 @@ class RuntimeConfig(_Base):
 class CostConfig(_Base):
     """Fees and slippage applied in every backtest (CLAUDE.md section 3.4)."""
 
-    taker_fee_bps: Decimal = Decimal("20")
-    maker_fee_bps: Decimal = Decimal("20")
+    taker_fee_bps: Decimal = Decimal("35")  # Tabdeal tier 1, D-047
+    maker_fee_bps: Decimal = Decimal("33")
     slippage_bps: Decimal = Decimal("5")
 
     @field_validator("taker_fee_bps", "maker_fee_bps", "slippage_bps")

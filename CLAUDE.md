@@ -43,9 +43,10 @@ stop before live trading — that is a successful result of this process, not a 
    paper and live. Only the `DataFeed` and `Broker` implementations differ.
 3. **Strategies emit intents, never orders.** A strategy returns a `TargetIntent` (target weight in [0, 1]).
    The `RiskManager` approves, resizes or refuses it. Only approved intents become `OrderRequest`s.
-4. **Costs everywhere.** Every backtest includes Tabdeal taker fee (configurable; default 0.2% per side until the
-   real tier is known) + slippage model (default 0.05% per side, configurable). Annualization uses **365** days
-   (8760 for hourly).
+4. **Costs everywhere.** Every backtest includes the real Tabdeal fee (tier 1: taker 0.35 %, maker 0.33 % per side;
+   taker unless a strategy explicitly uses limit orders — SPEC D-047) + slippage model (default 0.05 % per side,
+   configurable; to be replaced by a model built from recorded order-book snapshots). A round trip costs ≈ 0.8 %,
+   so every phase-3 report shows turnover and annual cost drag. Annualization uses **365** days (8760 for hourly).
 5. **Pre-registered evaluation.** Acceptance criteria are fixed before results are seen (see §9).
    The **last 12 months of data are a sealed holdout**: no code may load them until gate G4, and only once.
    Every experiment (parameter set, variant) is logged in `research/EXPERIMENTS.md` so the trial count for
@@ -60,7 +61,13 @@ stop before live trading — that is a successful result of this process, not a 
      `HALTED` + Telegram alert.
 7. **Small, typed, tested.** Python 3.12, type hints everywhere, `mypy --strict` on `core/`, `risk/`, `execution/`.
    No function longer than ~60 lines without a reason. Pure functions for indicators and strategy logic.
-8. **Honesty and push-back.** If a request from Parham (or from the plan) is illogical, unsafe or likely to produce
+8. **Raw data first.** Raw trade ingestion (Tabdeal `/trades` → SQLite) must never depend on any downstream step
+   — candle building, Parquet reads or writes, quality checks, reports. A downstream failure may stop only that
+   step, log at error level (alert) and mark the healthcheck degraded; trades keep being recorded. Reason: Tabdeal
+   returns only ~29 h of trade history, so raw trades are the one dataset we cannot re-download, while everything
+   derived from them can be rebuilt. Enforced by `test_trade_ingestion_survives_downstream_failure` and by a
+   nightly online backup of `trades.sqlite` (14 days, integrity-checked).
+9. **Honesty and push-back.** If a request from Parham (or from the plan) is illogical, unsafe or likely to produce
    an imaginary result, say so clearly, explain why, and propose the correct way. Do not just agree.
    Short push-back goes in the terminal in English; a full written argument goes to `docs/reports/` in Persian.
 

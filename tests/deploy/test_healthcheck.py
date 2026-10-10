@@ -44,6 +44,7 @@ def clean_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         "TBOT_HEARTBEAT_MAX_AGE_SECONDS",
         "TBOT_HEARTBEAT_MAX_CONSECUTIVE_ERRORS",
         "TBOT_HEARTBEAT_MAX_TRADE_STALENESS_SECONDS",
+        "TBOT_HEARTBEAT_MAX_CYCLE_EXCEPTIONS",
     ):
         monkeypatch.delenv(name, raising=False)
     yield
@@ -75,6 +76,68 @@ def test_fresh_heartbeat_with_no_errors_is_healthy() -> None:
 
     assert healthy is True
     assert reason == "ok"
+
+
+def test_last_cycle_error_appended_to_an_otherwise_healthy_reason() -> None:
+    """MINOR-3 (sixth fix round): healthy/unhealthy is unaffected by ``last_cycle_error`` on its
+    own -- a cycle can fail once and recover before the next heartbeat write -- but it IS
+    appended to the diagnostic ``reason`` string whenever present and non-empty, so
+    ``docker inspect`` shows roughly WHY a recent cycle failed even on an otherwise-healthy
+    heartbeat."""
+    now = datetime(2026, 1, 1, 0, 0, 30, tzinfo=UTC)
+    payload = _payload(
+        last_poll_ts="2026-01-01T00:00:00+00:00",
+        consecutive_errors=0,
+        last_cycle_error="RuntimeError: sweep bug",
+    )
+
+    healthy, reason = healthcheck.evaluate_heartbeat(
+        payload, now=now, max_age_seconds=180, max_consecutive_errors=10
+    )
+
+    assert healthy is True
+    assert "RuntimeError: sweep bug" in reason
+
+
+def test_last_cycle_error_appended_to_an_unhealthy_reason_too() -> None:
+    now = datetime(2026, 1, 1, 1, 0, 0, tzinfo=UTC)  # stale -> unhealthy regardless
+    payload = _payload(
+        last_poll_ts="2026-01-01T00:00:00+00:00",
+        consecutive_errors=0,
+        last_cycle_error="RuntimeError: sweep bug",
+    )
+
+    healthy, reason = healthcheck.evaluate_heartbeat(
+        payload, now=now, max_age_seconds=180, max_consecutive_errors=10
+    )
+
+    assert healthy is False
+    assert "old" in reason
+    assert "RuntimeError: sweep bug" in reason
+
+
+def test_absent_last_cycle_error_does_not_change_the_ok_reason() -> None:
+    """Backward compatible: an older heartbeat payload with no ``last_cycle_error`` key at all
+    (or a null one -- a cycle that completed normally) must not change ``reason`` from the
+    plain ``"ok"``."""
+    now = datetime(2026, 1, 1, 0, 0, 30, tzinfo=UTC)
+    payload = _payload(last_poll_ts="2026-01-01T00:00:00+00:00", consecutive_errors=0)
+
+    healthy, reason = healthcheck.evaluate_heartbeat(
+        payload, now=now, max_age_seconds=180, max_consecutive_errors=10
+    )
+
+    assert healthy is True
+    assert reason == "ok"
+
+    payload_with_null = _payload(
+        last_poll_ts="2026-01-01T00:00:00+00:00", consecutive_errors=0, last_cycle_error=None
+    )
+    healthy2, reason2 = healthcheck.evaluate_heartbeat(
+        payload_with_null, now=now, max_age_seconds=180, max_consecutive_errors=10
+    )
+    assert healthy2 is True
+    assert reason2 == "ok"
 
 
 def test_stale_last_poll_ts_is_unhealthy() -> None:
@@ -125,6 +188,88 @@ def test_consecutive_errors_just_under_threshold_is_healthy() -> None:
     )
 
     assert healthy is True
+
+
+# --- evaluate_heartbeat: consecutive_cycle_exceptions (m-3, PR2 review) ------------
+
+
+def test_high_consecutive_cycle_exceptions_is_unhealthy_even_with_zero_consecutive_errors() -> None:
+    """m-3's exact scenario: the poll itself keeps succeeding (consecutive_errors=0), but the
+    sweep (build_due_candles) keeps raising every cycle -- consecutive_errors alone never
+    catches this; consecutive_cycle_exceptions must."""
+    now = datetime(2026, 1, 1, 0, 0, 1, tzinfo=UTC)
+    payload = _payload(
+        last_poll_ts="2026-01-01T00:00:00+00:00",
+        consecutive_errors=0,
+        consecutive_cycle_exceptions=3,
+    )
+
+    healthy, reason = healthcheck.evaluate_heartbeat(
+        payload, now=now, max_age_seconds=180, max_consecutive_errors=10, max_cycle_exceptions=3
+    )
+
+    assert healthy is False
+    assert "consecutive_cycle_exceptions" in reason
+
+
+def test_consecutive_cycle_exceptions_just_under_threshold_is_healthy() -> None:
+    now = datetime(2026, 1, 1, 0, 0, 1, tzinfo=UTC)
+    payload = _payload(
+        last_poll_ts="2026-01-01T00:00:00+00:00",
+        consecutive_errors=0,
+        consecutive_cycle_exceptions=2,
+    )
+
+    healthy, _ = healthcheck.evaluate_heartbeat(
+        payload, now=now, max_age_seconds=180, max_consecutive_errors=10, max_cycle_exceptions=3
+    )
+
+    assert healthy is True
+
+
+def test_missing_consecutive_cycle_exceptions_field_is_healthy_treated_as_unknown() -> None:
+    """An older heartbeat payload (written before m-3 added this field) must not be treated as
+    unhealthy -- absence is unknown, not a failure."""
+    now = datetime(2026, 1, 1, 0, 0, 1, tzinfo=UTC)
+    payload = _payload(last_poll_ts="2026-01-01T00:00:00+00:00", consecutive_errors=0)
+
+    healthy, _ = healthcheck.evaluate_heartbeat(
+        payload, now=now, max_age_seconds=180, max_consecutive_errors=10
+    )
+
+    assert healthy is True
+
+
+def test_malformed_consecutive_cycle_exceptions_is_unhealthy_not_a_crash() -> None:
+    now = datetime(2026, 1, 1, 0, 0, 1, tzinfo=UTC)
+    payload = _payload(
+        last_poll_ts="2026-01-01T00:00:00+00:00",
+        consecutive_errors=0,
+        consecutive_cycle_exceptions="not-an-int",
+    )
+
+    healthy, reason = healthcheck.evaluate_heartbeat(
+        payload, now=now, max_age_seconds=180, max_consecutive_errors=10
+    )
+
+    assert healthy is False
+    assert "consecutive_cycle_exceptions" in reason
+
+
+def test_bool_consecutive_cycle_exceptions_is_unhealthy_not_a_crash() -> None:
+    now = datetime(2026, 1, 1, 0, 0, 1, tzinfo=UTC)
+    payload = _payload(
+        last_poll_ts="2026-01-01T00:00:00+00:00",
+        consecutive_errors=0,
+        consecutive_cycle_exceptions=True,
+    )
+
+    healthy, reason = healthcheck.evaluate_heartbeat(
+        payload, now=now, max_age_seconds=180, max_consecutive_errors=10
+    )
+
+    assert healthy is False
+    assert "consecutive_cycle_exceptions" in reason
 
 
 @pytest.mark.parametrize(

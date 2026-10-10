@@ -9,7 +9,17 @@ Usage::
 
     uv run python scripts/tabdeal_probe.py [--config NAME] [--out PATH]
         [--samples N] [--interval SECONDS] [--symbols SYM [SYM ...]]
-        [--trades-limit-candidates N [N ...]]
+        [--depth-symbols SYM [SYM ...]] [--trades-limit-candidates N [N ...]]
+
+``--samples``/``--interval`` are *rounds*: each round fetches ``/depth`` for every
+``--depth-symbols`` entry back-to-back (so the books are sampled near-simultaneously), not one
+independently-paced loop per symbol. Default ``--depth-symbols`` is ``BTCUSDT BTCIRT USDTIRT`` --
+BTCUSDT is the only symbol the G0 median-spread gate (SPEC section 7) applies to; BTCIRT/USDTIRT
+are measured for comparison only (Parham's request) and are labelled ``comparison_only: true`` in
+the report. A 30-round, 6-hour run matching G0 looks like::
+
+    uv run python scripts/tabdeal_probe.py --samples 30 --interval 720 \\
+        --depth-symbols BTCUSDT BTCIRT USDTIRT
 
 Exit codes:
 
@@ -57,9 +67,14 @@ from tbot.core.types import Clock, SymbolFilters
 # implementation now lives in tbot.data.depth and this script imports it back). The explicit
 # "as <same name>" form is the standard re-export idiom under mypy's no_implicit_reexport.
 from tbot.data.depth import best_bid_ask as best_bid_ask
+from tbot.data.depth import convert_irt_to_usdt as convert_irt_to_usdt
 from tbot.data.depth import cumulative_depth as cumulative_depth
+from tbot.data.depth import implied_price_from_legs as implied_price_from_legs
 from tbot.data.depth import is_saturated as is_saturated
+from tbot.data.depth import median_decimal as median_decimal
 from tbot.data.depth import parse_depth_levels as parse_depth_levels
+from tbot.data.depth import percentile_decimal as percentile_decimal
+from tbot.data.depth import price_basis_bps as price_basis_bps
 from tbot.data.depth import spread_bps_and_pct as spread_bps_and_pct
 from tbot.execution.tabdeal_client import ProbeResult, TabdealClient
 from tbot.monitoring.logging import configure_logging, register_secrets_for_logging
@@ -69,20 +84,29 @@ __all__ = [
     "build_symbol_filters",
     "classify_key_permissions",
     "compute_clock_skew_ms",
+    "compute_round_cross",
+    "convert_irt_to_usdt",
     "cumulative_depth",
     "describe_unreachable_failure",
     "detect_id_space",
     "detect_time_unit",
     "discover_max_trades_limit",
+    "exchange_info_symbols",
     "extract_nonzero_balances",
     "find_base_asset_markets",
     "find_symbol_entry",
     "ids_contiguous_in_window",
     "ids_monotonic_in_time",
+    "implied_price_from_legs",
+    "is_irt_quoted",
     "is_saturated",
     "main",
+    "median_decimal",
+    "percentile_decimal",
+    "price_basis_bps",
     "probe_both_prefixes",
     "spread_bps_and_pct",
+    "summarize_band_sizes",
     "summarize_spreads",
     "trade_activity_stats",
     "trades_window_stats",
@@ -90,6 +114,20 @@ __all__ = [
 
 _DEFAULT_TRADES_LIMIT_CANDIDATES: tuple[int, ...] = (100, 500, 1000, 2000, 5000, 10_000)
 _DEPTH_THRESHOLDS_PCT: tuple[Decimal, ...] = (Decimal("0.001"), Decimal("0.005"), Decimal("0.01"))
+
+# Parham's request: sample BTCIRT and USDTIRT alongside BTCUSDT for comparison. The traded pair
+# stays BTCUSDT (CLAUDE.md section 2) -- it is the only symbol the G0 median-spread gate applies
+# to; the other two are measured for comparison only (see docs/SPEC.md section 7, D-037 area).
+_DEFAULT_DEPTH_SYMBOLS: tuple[str, ...] = ("BTCUSDT", "BTCIRT", "USDTIRT")
+_G0_SYMBOL = "BTCUSDT"
+_USDT_IRT_SYMBOL = "USDTIRT"
+# Measured on the Turkey server, 2026-10-04: `limit=500` already returns the whole book for all
+# three symbols (430/279, 314/94, 225/228 bid/ask levels) and `limit=1000` returns the same -- 500
+# is used, not a larger number, since there is no evidence a bigger `limit` buys anything more.
+_DEPTH_SAMPLE_LIMIT = 500
+# Bands the band-sizing summary (requirement 4) prints prominently for BTCUSDT.
+_HEADLINE_BANDS_PCT: tuple[Decimal, ...] = (Decimal("0.001"), Decimal("0.005"))
+_P10_FRACTION = Decimal("0.10")
 
 
 # ---------------------------------------------------------------------------------
@@ -134,6 +172,78 @@ def summarize_spreads(spreads_bps: Sequence[float]) -> dict[str, float]:
         "p95_bps": p95,
         "min_bps": ordered[0],
         "max_bps": ordered[-1],
+    }
+
+
+def is_irt_quoted(symbol: str) -> bool:
+    """Whether ``symbol``'s quote asset is IRT (e.g. ``BTCIRT``, ``USDTIRT``) -- these are the
+    symbols whose book sizes can be expressed in USDT via a same-round USDTIRT mid."""
+    return symbol.upper().endswith("IRT")
+
+
+def summarize_band_sizes(samples: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Per band-threshold, per-side median/p10 of the fillable size across ``samples`` (each a
+    rendered depth sample dict, see :func:`_render_depth_sample`).
+
+    "Median across samples" is the headline "largest order that fits at the median snapshot";
+    p10 is a bad-but-common snapshot (requirement 4). Reported in base qty and in the symbol's
+    own quote currency always; also in USDT when any sample carries a ``quote_usdt`` figure
+    (IRT-quoted symbols only, and only for rounds where a USDTIRT mid was available).
+    """
+    out: dict[str, Any] = {}
+    for threshold_key in {k for s in samples for k in s.get("depth", {})}:
+        out[threshold_key] = {}
+        for side in ("bid", "ask"):
+            base_vals, quote_vals, usdt_vals = [], [], []
+            for sample in samples:
+                level = sample.get("depth", {}).get(threshold_key, {}).get(side)
+                if level is None:
+                    continue
+                base_vals.append(Decimal(level["base_qty"]))
+                quote_vals.append(Decimal(level["quote_notional"]))
+                if level.get("quote_usdt") is not None:
+                    usdt_vals.append(Decimal(level["quote_usdt"]))
+            entry = {
+                "median_base_qty": _decimal_or_none_str(median_decimal(base_vals)),
+                "p10_base_qty": _decimal_or_none_str(percentile_decimal(base_vals, _P10_FRACTION)),
+                "median_quote_notional": _decimal_or_none_str(median_decimal(quote_vals)),
+                "p10_quote_notional": _decimal_or_none_str(percentile_decimal(quote_vals, _P10_FRACTION)),
+            }
+            if usdt_vals:
+                entry["median_quote_usdt"] = _decimal_or_none_str(median_decimal(usdt_vals))
+                entry["p10_quote_usdt"] = _decimal_or_none_str(percentile_decimal(usdt_vals, _P10_FRACTION))
+            out[threshold_key][side] = entry
+    return out
+
+
+def _decimal_or_none_str(value: Decimal | None) -> str | None:
+    return str(value) if value is not None else None
+
+
+def compute_round_cross(mids: dict[str, Decimal]) -> dict[str, Any] | None:
+    """Implied BTC/USDT cross price (``BTCIRT_mid / USDTIRT_mid``) and its basis vs the directly
+    quoted ``BTCUSDT_mid``, for one sampling round. ``mids`` maps upper-cased symbol to that
+    round's mid price. ``None`` (never raises) when any of the three legs is missing, or when
+    the USDTIRT mid is non-positive -- a round with a bad or missing leg contributes nothing to
+    the cross-rate summary rather than aborting it.
+    """
+    btc_irt_mid = mids.get("BTCIRT")
+    usdt_irt_mid = mids.get(_USDT_IRT_SYMBOL)
+    btc_usdt_mid = mids.get(_G0_SYMBOL)
+    if btc_irt_mid is None or usdt_irt_mid is None or btc_usdt_mid is None:
+        return None
+    implied = implied_price_from_legs(btc_irt_mid, usdt_irt_mid)
+    if implied is None:
+        return None
+    basis_bps = price_basis_bps(implied, btc_usdt_mid)
+    if basis_bps is None:
+        return None
+    return {
+        "btcusdt_mid": str(btc_usdt_mid),
+        "btcirt_mid": str(btc_irt_mid),
+        "usdtirt_mid": str(usdt_irt_mid),
+        "implied_btc_usdt_price": str(implied),
+        "basis_bps": basis_bps,
     }
 
 
@@ -393,11 +503,25 @@ def _normalize_symbol_code(value: str) -> str:
     return value.upper().replace("_", "").replace("-", "")
 
 
+def exchange_info_symbols(exchange_info_body: Any) -> list[Any] | None:
+    """The list of market entries in an ``exchangeInfo`` body.
+
+    Tabdeal returns a bare JSON list of markets (measured from the Turkey server, 2026-10-05:
+    1047 entries), not Binance's ``{"symbols": [...]}`` object; both shapes are accepted.
+    """
+    if isinstance(exchange_info_body, list):
+        return exchange_info_body
+    if isinstance(exchange_info_body, dict):
+        symbols = exchange_info_body.get("symbols")
+        return symbols if isinstance(symbols, list) else None
+    return None
+
+
 def find_symbol_entry(exchange_info_body: Any, base: str, quote: str) -> dict[str, Any] | None:
     """Find the ``exchangeInfo`` entry for ``base+quote``, checking both ``symbol`` and
     ``tabdealSymbol`` fields (docs/SPEC.md open question 4)."""
-    symbols = exchange_info_body.get("symbols") if isinstance(exchange_info_body, dict) else None
-    if not isinstance(symbols, list):
+    symbols = exchange_info_symbols(exchange_info_body)
+    if symbols is None:
         return None
     target = _normalize_symbol_code(f"{base}{quote}")
     for entry in symbols:
@@ -413,8 +537,8 @@ def find_symbol_entry(exchange_info_body: Any, base: str, quote: str) -> dict[st
 def find_base_asset_markets(exchange_info_body: Any, base: str) -> list[dict[str, Any]]:
     """Every market involving ``base`` -- used to report what *does* exist when the expected
     symbol is missing."""
-    symbols = exchange_info_body.get("symbols") if isinstance(exchange_info_body, dict) else None
-    if not isinstance(symbols, list):
+    symbols = exchange_info_symbols(exchange_info_body)
+    if symbols is None:
         return []
     out: list[dict[str, Any]] = []
     for entry in symbols:
@@ -648,6 +772,14 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         "--symbols", nargs="+", default=["BTCUSDT", "ETHUSDT"], help="symbols to probe (default: %(default)s)"
     )
     parser.add_argument(
+        "--depth-symbols",
+        nargs="+",
+        default=list(_DEFAULT_DEPTH_SYMBOLS),
+        help="symbols to sample /depth for, every round, back-to-back (default: %(default)s) -- "
+        "the G0 median-spread gate (SPEC section 7) applies to BTCUSDT only; BTCIRT/USDTIRT are "
+        "comparison_only in the report",
+    )
+    parser.add_argument(
         "--trades-limit-candidates",
         nargs="+",
         type=int,
@@ -714,6 +846,9 @@ def _probe_symbols(client: TabdealClient, args: argparse.Namespace) -> tuple[dic
 
 @dataclass(frozen=True, slots=True)
 class _DepthSampleOk:
+    best_bid: Decimal
+    best_ask: Decimal
+    mid: Decimal
     spread_bps: float
     spread_pct: float
     depth: dict[str, dict[str, dict[str, str]]]
@@ -765,28 +900,64 @@ def _evaluate_depth_sample(result: ProbeResult) -> _DepthSampleOutcome:
             "bid": {"base_qty": str(bid_base), "quote_notional": str(bid_quote)},
             "ask": {"base_qty": str(ask_base), "quote_notional": str(ask_quote)},
         }
-    return _DepthSampleOk(spread_bps=bps, spread_pct=pct, depth=depths)
+    return _DepthSampleOk(
+        best_bid=best_bid, best_ask=best_ask, mid=mid, spread_bps=bps, spread_pct=pct, depth=depths
+    )
+
+
+def _render_depth_sample(
+    symbol: str, outcome: _DepthSampleOk, usdt_irt_mid: Decimal | None
+) -> dict[str, Any]:
+    """One sample's JSON dict: best bid/ask/mid, spread, and per-band base/quote sizes
+    (requirement 2). For an IRT-quoted symbol with a same-round USDTIRT mid available
+    (requirement 3), each level also carries a ``quote_usdt`` conversion of its quote-notional.
+    """
+    depth: dict[str, Any] = outcome.depth
+    if usdt_irt_mid is not None and is_irt_quoted(symbol):
+        depth = {
+            threshold: {
+                side: {
+                    **level,
+                    "quote_usdt": _decimal_or_none_str(
+                        convert_irt_to_usdt(Decimal(level["quote_notional"]), usdt_irt_mid)
+                    ),
+                }
+                for side, level in sides.items()
+            }
+            for threshold, sides in depth.items()
+        }
+    return {
+        "best_bid": str(outcome.best_bid),
+        "best_ask": str(outcome.best_ask),
+        "mid": str(outcome.mid),
+        "spread_bps": outcome.spread_bps,
+        "spread_pct": outcome.spread_pct,
+        "depth": depth,
+    }
 
 
 @dataclass
 class _DepthWindowAccumulator:
-    """Mutable accumulators for :func:`sample_depth_window` -- a plain object instead of a
-    handful of loose ``list`` locals so the per-sample update and the report-rendering steps can
-    each be their own small function."""
+    """Mutable accumulators for one symbol's depth-sampling rounds -- a plain object instead of
+    a handful of loose ``list`` locals so the per-sample update and the report-rendering steps
+    can each be their own small function."""
 
+    symbol: str
     spreads_bps: list[float] = field(default_factory=list)
     cumulative_samples: list[dict[str, Any]] = field(default_factory=list)
     crossed_samples: list[dict[str, str]] = field(default_factory=list)
     successful_sample_timestamps: list[datetime] = field(default_factory=list)
 
-    def record(self, attempt_ts: datetime, outcome: _DepthSampleOutcome) -> None:
+    def record(
+        self, attempt_ts: datetime, outcome: _DepthSampleOutcome, *, usdt_irt_mid: Decimal | None
+    ) -> None:
         if isinstance(outcome, _DepthSampleOk):
             self.spreads_bps.append(outcome.spread_bps)
             self.successful_sample_timestamps.append(attempt_ts)
-            self.cumulative_samples.append(
-                {"spread_bps": outcome.spread_bps, "spread_pct": outcome.spread_pct, "depth": outcome.depth}
-            )
+            self.cumulative_samples.append(_render_depth_sample(self.symbol, outcome, usdt_irt_mid))
         elif isinstance(outcome, _DepthSampleCrossed):
+            # m9a, per-symbol (requirement 5): a crossed book on this symbol never touches any
+            # other symbol's accumulator in the same round.
             self.crossed_samples.append(
                 {"ts": attempt_ts.isoformat(), "best_bid": outcome.best_bid, "best_ask": outcome.best_ask}
             )
@@ -801,6 +972,10 @@ class _DepthWindowAccumulator:
         span = (last_ts - first_ts).total_seconds() if first_ts and last_ts else 0.0
         depth_report["spread_summary"] = summarize_spreads(self.spreads_bps)
         depth_report["samples"] = list(self.cumulative_samples)
+        depth_report["band_summary"] = summarize_band_sizes(self.cumulative_samples)
+        # requirement 1: the G0 median-spread gate (< 0.20%, SPEC section 7) applies to BTCUSDT
+        # only -- BTCIRT/USDTIRT are measured for comparison only and never gate anything.
+        depth_report["comparison_only"] = self.symbol.upper() != _G0_SYMBOL
         # m9a: counted and recorded, not just silently dropped -- Parham can see exactly which
         # samples were crossed and when.
         depth_report["crossed_book_samples"] = list(self.crossed_samples)
@@ -816,67 +991,115 @@ class _DepthWindowAccumulator:
         depth_report["g0_spread_plan_ok"] = len(timestamps) >= 30 and span >= 21_600
 
 
-def sample_depth_window(
+@dataclass
+class _CrossAccumulator:
+    """Mutable accumulator for the implied-BTC cross-rate maths (requirement 3), across rounds."""
+
+    rounds: list[dict[str, Any]] = field(default_factory=list)
+    basis_values_bps: list[float] = field(default_factory=list)
+
+    def record(self, attempt_ts: datetime, cross: dict[str, Any] | None) -> None:
+        if cross is None:
+            return
+        self.rounds.append({"ts": attempt_ts.isoformat(), **cross})
+        self.basis_values_bps.append(cross["basis_bps"])
+
+    def render_into(self, cross_report: dict[str, Any]) -> None:
+        cross_report["rounds"] = list(self.rounds)
+        cross_report["implied_btc_basis_bps_summary"] = summarize_spreads(self.basis_values_bps)
+
+
+def _fetch_round_outcomes(
+    client: TabdealClient,
+    prefix: str,
+    depth_symbols: Sequence[str],
+    first_results: dict[str, ProbeResult],
+    round_index: int,
+) -> dict[str, _DepthSampleOutcome]:
+    """Fetch ``/depth`` for every symbol back-to-back (requirement 1: near-simultaneous books).
+    A failed fetch for one symbol (requirement 5) is just one ``_DepthSampleSkipped`` entry in
+    the returned mapping -- the loop always continues to the next symbol."""
+    outcomes: dict[str, _DepthSampleOutcome] = {}
+    for symbol in depth_symbols:
+        first = first_results.get(symbol)
+        result = (
+            first
+            if round_index == 0 and first is not None and first.ok
+            else client.depth(symbol, limit=_DEPTH_SAMPLE_LIMIT, prefix=prefix)
+        )
+        outcomes[symbol] = _evaluate_depth_sample(result)
+    return outcomes
+
+
+def _mids_from_outcomes(outcomes: dict[str, _DepthSampleOutcome]) -> dict[str, Decimal]:
+    return {
+        symbol: outcome.mid for symbol, outcome in outcomes.items() if isinstance(outcome, _DepthSampleOk)
+    }
+
+
+def sample_depth_rounds(
     client: TabdealClient,
     clock: Clock,
-    symbol: str,
+    depth_symbols: Sequence[str],
     prefix: str,
     *,
     samples: int,
     interval_seconds: float,
-    first_result: ProbeResult | None,
-    depth_report: dict[str, Any],
+    first_results: dict[str, ProbeResult],
+    depth_reports: dict[str, dict[str, Any]],
+    cross_report: dict[str, Any],
     on_progress: Callable[[], None] | None = None,
 ) -> None:
-    """Repeatedly sample ``/depth`` for ``symbol``, mutating ``depth_report`` in place after
-    *every* attempt (m9a) -- not only once the whole loop finishes -- so a caller can persist a
-    partial report to disk at any point during a run that may span hours, via ``on_progress``.
+    """Repeatedly sample ``/depth`` for every symbol in ``depth_symbols`` in one back-to-back
+    "round" per iteration (requirement 1), mutating ``depth_reports``/``cross_report`` in place
+    after *every* round (m9a) -- not only once the whole loop finishes -- so a caller can persist
+    a partial report to disk at any point during a run that may span hours, via ``on_progress``.
 
-    A crossed book on any one sample (m9a) is counted and recorded, never raised: nothing here
-    lets one bad sample out of (say) 30 lose the other 29.
+    A crossed book or a failed fetch on any one symbol in a round (requirement 5) is counted and
+    recorded on that symbol alone; it never aborts the round or drops any other symbol's sample.
     """
-    acc = _DepthWindowAccumulator()
+    accumulators = {symbol: _DepthWindowAccumulator(symbol=symbol) for symbol in depth_symbols}
+    cross_acc = _CrossAccumulator()
+    for symbol, acc in accumulators.items():
+        acc.render_into(depth_reports[symbol])
+    cross_acc.render_into(cross_report)
     for i in range(max(0, samples)):
         attempt_ts = clock.now()
-        result = (
-            first_result
-            if i == 0 and first_result is not None and first_result.ok
-            else client.depth(symbol, limit=100, prefix=prefix)
-        )
-        acc.record(attempt_ts, _evaluate_depth_sample(result))
-        acc.render_into(depth_report)
+        outcomes = _fetch_round_outcomes(client, prefix, depth_symbols, first_results, i)
+        mids = _mids_from_outcomes(outcomes)
+        usdt_irt_mid = mids.get(_USDT_IRT_SYMBOL)
+        for symbol in depth_symbols:
+            accumulators[symbol].record(attempt_ts, outcomes[symbol], usdt_irt_mid=usdt_irt_mid)
+            accumulators[symbol].render_into(depth_reports[symbol])
+        cross_acc.record(attempt_ts, compute_round_cross(mids))
+        cross_acc.render_into(cross_report)
         if on_progress is not None:
             on_progress()
         if i < samples - 1:
             time.sleep(max(0.0, interval_seconds))
-    acc.render_into(depth_report)
 
 
-def _probe_depth(
-    client: TabdealClient,
-    clock: Clock,
-    args: argparse.Namespace,
-    prefix: str,
-    symbol: str,
-    *,
-    depth_report: dict[str, Any],
-    on_progress: Callable[[], None] | None = None,
-) -> None:
-    depth_prefix_summary, depth_chosen = probe_both_prefixes(
-        client, lambda p: client.depth(symbol, limit=100, prefix=p), "depth"
-    )
-    depth_report["prefix_discovery"] = depth_prefix_summary
-    sample_depth_window(
-        client,
-        clock,
-        symbol,
-        prefix,
-        samples=args.samples,
-        interval_seconds=args.interval,
-        first_result=depth_chosen,
-        depth_report=depth_report,
-        on_progress=on_progress,
-    )
+def _make_depth_call(client: TabdealClient, symbol: str) -> Callable[[str], ProbeResult]:
+    """A fresh closure per symbol (never a shared lambda with a late-bound loop variable)."""
+
+    def call(prefix: str) -> ProbeResult:
+        return client.depth(symbol, limit=_DEPTH_SAMPLE_LIMIT, prefix=prefix)
+
+    return call
+
+
+def _discover_depth_prefixes(
+    client: TabdealClient, depth_symbols: Sequence[str]
+) -> tuple[dict[str, dict[str, Any]], dict[str, ProbeResult]]:
+    """Prefix discovery for every depth symbol independently -- nothing observed so far says
+    different symbols must answer on the same prefix, so each gets its own probe."""
+    prefix_summaries: dict[str, dict[str, Any]] = {}
+    first_results: dict[str, ProbeResult] = {}
+    for symbol in depth_symbols:
+        summary, chosen = probe_both_prefixes(client, _make_depth_call(client, symbol), "depth")
+        prefix_summaries[symbol] = summary
+        first_results[symbol] = chosen
+    return prefix_summaries, first_results
 
 
 def _probe_trades(
@@ -978,10 +1201,26 @@ def run_probe(
     report["symbols"] = symbols_report
 
     primary_symbol = args.symbols[0] if args.symbols else "BTCUSDT"
-    depth_report: dict[str, Any] = {}
-    report["depth"] = {primary_symbol: depth_report}
-    _probe_depth(
-        client, clock, args, prefix, primary_symbol, depth_report=depth_report, on_progress=on_depth_progress
+
+    depth_symbols = [s.upper() for s in (args.depth_symbols or list(_DEFAULT_DEPTH_SYMBOLS))]
+    depth_reports: dict[str, dict[str, Any]] = {symbol: {} for symbol in depth_symbols}
+    report["depth"] = depth_reports
+    cross_report: dict[str, Any] = {}
+    report["depth_cross"] = cross_report
+    prefix_summaries, first_results = _discover_depth_prefixes(client, depth_symbols)
+    for symbol in depth_symbols:
+        depth_reports[symbol]["prefix_discovery"] = prefix_summaries[symbol]
+    sample_depth_rounds(
+        client,
+        clock,
+        depth_symbols,
+        prefix,
+        samples=args.samples,
+        interval_seconds=args.interval,
+        first_results=first_results,
+        depth_reports=depth_reports,
+        cross_report=cross_report,
+        on_progress=on_depth_progress,
     )
 
     report["trades"] = _probe_trades(client, args, prefix, primary_symbol)
@@ -1009,7 +1248,8 @@ def _print_symbols_summary(report: dict[str, Any]) -> None:
 
 
 def _print_depth_summary(report: dict[str, Any]) -> None:
-    for symbol, depth_info in report.get("depth", {}).items():
+    depth_section = report.get("depth", {})
+    for symbol, depth_info in depth_section.items():
         summary = depth_info.get("spread_summary", {})
         if summary:
             median_bps = summary.get("median_bps")
@@ -1017,8 +1257,13 @@ def _print_depth_summary(report: dict[str, Any]) -> None:
             print(f"{symbol} spread (bps): median={median_bps:.2f} p95={p95_bps:.2f}")
         span_s = depth_info.get("sampling_span_seconds")
         plan_ok = depth_info.get("g0_spread_plan_ok")
+        # requirement 1: the G0 label (and the <0.20% gate it feeds) is BTCUSDT-only; the other
+        # depth symbols are comparison_only and get a differently-worded (but equally shaped,
+        # for the human reading it) line instead.
+        plan_label = "comparison-only sampling plan"
+        label = plan_label if depth_info.get("comparison_only") else "G0 spread sampling plan"
         print(
-            f"{symbol} G0 spread sampling plan (>=30 samples, >=6h span) ok={plan_ok} "
+            f"{symbol} {label} (>=30 samples, >=6h span) ok={plan_ok} "
             f"(samples={len(depth_info.get('samples', []))}, span_seconds={span_s})"
         )
         crossed_count = depth_info.get("crossed_book_count", 0)
@@ -1026,6 +1271,38 @@ def _print_depth_summary(report: dict[str, Any]) -> None:
             # m9a: a crossed sample is evidence, not noise -- it must be visible in the summary
             # Parham actually reads, not just buried in the JSON.
             print(f"{symbol} WARNING: {crossed_count} crossed-book sample(s) observed (recorded, not fatal)")
+    _print_btcusdt_headline(depth_section.get(_G0_SYMBOL, {}))
+    _print_cross_basis_summary(report.get("depth_cross", {}))
+
+
+def _print_btcusdt_headline(btcusdt_depth_info: dict[str, Any]) -> None:
+    """Requirement 4: print, prominently, the largest BUY/SELL market order that fits within
+    0.1%/0.5% of mid at the median snapshot -- BTCUSDT only, since that is the traded pair."""
+    band_summary = btcusdt_depth_info.get("band_summary", {})
+    for threshold, label in zip(_HEADLINE_BANDS_PCT, ("0.1%", "0.5%"), strict=True):
+        band = band_summary.get(str(threshold))
+        if not band:
+            continue
+        buy = band.get("ask", {}).get("median_quote_notional")
+        sell = band.get("bid", {}).get("median_quote_notional")
+        print(
+            f"BTCUSDT largest BUY market order within {label} of mid at the median snapshot: "
+            f"{buy} USDT"
+        )
+        print(
+            f"BTCUSDT largest SELL market order within {label} of mid at the median snapshot: "
+            f"{sell} USDT"
+        )
+
+
+def _print_cross_basis_summary(cross_report: dict[str, Any]) -> None:
+    summary = cross_report.get("implied_btc_basis_bps_summary", {})
+    if not summary:
+        return
+    print(
+        f"implied BTC/USDT basis (BTCIRT_mid/USDTIRT_mid vs BTCUSDT_mid, bps): "
+        f"median={summary.get('median_bps'):.2f} p95={summary.get('p95_bps'):.2f}"
+    )
 
 
 def _print_trades_summary(trades: dict[str, Any]) -> None:

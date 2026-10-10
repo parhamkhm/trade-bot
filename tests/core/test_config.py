@@ -33,7 +33,8 @@ def test_default_yaml_loads_and_matches_schema():
     config = load_config("default", config_dir=REPO_ROOT / "config")
     assert config.runtime.mode == "backtest"
     assert config.runtime.phase == 0
-    assert config.costs.taker_fee_bps == Decimal("20")
+    assert config.costs.taker_fee_bps == Decimal("35")
+    assert config.costs.maker_fee_bps == Decimal("33")
     assert config.data.symbols == ("BTCUSDT", "ETHUSDT")
     assert Timeframe.H4 in config.data.timeframes
 

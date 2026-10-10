@@ -46,7 +46,17 @@ Decision D-036 amendment (finding m-J, fix round 2): a resulting gap is auto-cla
 ``_classify_fresh_gaps`` -- plus the cross-symbol pass (``apply_cross_symbol_gap_classification``,
 run separately by ``scripts/download_binance.py`` once every configured symbol has been
 ingested). A classification any rule or a human already recorded for a gap's exact window is
-never revisited by a later rule.
+never revisited by a later rule -- except a ``"legacy"`` one (MINOR-4, sixth fix round: a
+non-``unknown`` classification loaded with no recorded ``classified_by`` at all, see
+``store.GapRecord.from_dict``), which ``_classify_fresh_gaps`` re-checks against the current
+rules every time rather than trusting indefinitely. A human's own classification must set
+``classified_by: "manual"`` explicitly in the sidecar to be exempt from that re-check.
+
+NIT (sixth fix round): ``_parse_kline_row``'s close-time classification compares the row's raw
+open/close timestamps as exact integers in the file's own unit (ms or µs), not as ``float``
+seconds -- see ``_row_duration_diff_units``. Comparing ``timedelta.total_seconds()`` floats could
+round a value sitting exactly on the one-unit epsilon boundary to a hair on the wrong side of it
+(measured: ``0.0010000000002 > 0.001``), misclassifying a normal row as ``long`` and dropping it.
 """
 
 from __future__ import annotations
@@ -256,37 +266,54 @@ _EARLY_TOLERANCE_SECONDS = 1.0  # how early close_time may land vs. nominal befo
 def _row_duration_diff_seconds(
     open_dt: datetime, close_raw_dt: datetime, *, close_unit: Literal["ms", "us"], timeframe: Timeframe
 ) -> tuple[float, float]:
-    """Returns ``(duration_seconds, diff_seconds)`` for one row: ``diff_seconds`` is the raw
-    duration minus the expected one (``timeframe.delta`` less one unit epsilon -- see the module
-    docstring's close-time convention). Zero means the row matches the documented convention
-    exactly; positive means the raw ``close_time`` landed *after* the nominal close instant.
+    """Returns ``(duration_seconds, diff_seconds)`` for one row, as ``float`` seconds --
+    informational only (``AnomalyRecord.duration_seconds``), never used for classification; see
+    ``_row_duration_diff_units`` for the exact-integer check that actually decides
+    misaligned/short/normal/long. ``diff_seconds`` is the raw duration minus the expected one
+    (``timeframe.delta`` less one unit epsilon -- see the module docstring's close-time
+    convention). Zero means the row matches the documented convention exactly; positive means the
+    raw ``close_time`` landed *after* the nominal close instant.
     """
-    epsilon = timedelta(milliseconds=1) if close_unit == "ms" else timedelta(microseconds=1)
-    expected_duration_seconds = (timeframe.delta - epsilon).total_seconds()
+    expected_duration_seconds = (timeframe.delta - _unit_timedelta(close_unit)).total_seconds()
     duration_seconds = (close_raw_dt - open_dt).total_seconds()
     return duration_seconds, duration_seconds - expected_duration_seconds
 
 
-def _late_tolerance_seconds(close_unit: Literal["ms", "us"]) -> float:
-    """NIT (fix round): the old code tolerated ``close_time`` landing up to a whole second
-    *after* its nominal close as "normal" -- which can store a row whose raw data extends up to
-    1s past its label, a (tiny) causality violation. The late side now only tolerates the one
-    unit (1ms/1us) epsilon already baked into the convention itself; the early side is unchanged
-    (a thin/short bar is still just "short", not an error).
+def _unit_timedelta(close_unit: Literal["ms", "us"]) -> timedelta:
+    return timedelta(milliseconds=1) if close_unit == "ms" else timedelta(microseconds=1)
+
+
+def _row_duration_diff_units(
+    open_time_raw: int, close_time_raw: int, *, close_unit: Literal["ms", "us"], timeframe: Timeframe
+) -> int:
+    """Exact integer difference, in the row's own raw unit (ms or µs), between its actual
+    duration and the expected one (``timeframe.delta`` less one unit epsilon).
+
+    NIT (sixth fix round): the classification used to compare ``float`` seconds
+    (``timedelta.total_seconds()``), which can round a value sitting exactly on the one-unit
+    epsilon boundary to a hair on the wrong side of it (measured: ``0.0010000000002 > 0.001``),
+    misclassifying a normal row as ``long`` and dropping it. ``open_time_raw``/``close_time_raw``
+    are already integers in one shared unit (``open_unit == close_unit`` is enforced by
+    ``_parse_row_fields`` before this is ever called) -- doing the whole comparison in that unit
+    involves no float at all.
     """
-    epsilon = timedelta(milliseconds=1) if close_unit == "ms" else timedelta(microseconds=1)
-    return epsilon.total_seconds()
+    delta_units = timeframe.delta // _unit_timedelta(close_unit)
+    duration_units = close_time_raw - open_time_raw
+    expected_duration_units = delta_units - 1
+    return duration_units - expected_duration_units
 
 
 def _parse_row_fields(
     line: str,
-) -> tuple[list[str], datetime, datetime, Literal["ms", "us"], int, Decimal] | None:
+) -> tuple[list[str], datetime, datetime, Literal["ms", "us"], int, Decimal, int, int] | None:
     """Parse one CSV row's raw open/close times, converting the epoch ints to UTC datetimes.
 
-    Returns ``(parts, open_dt, close_raw_dt, close_unit, n_trades, volume)``, or ``None`` for a
-    header row (non-numeric ``open_time``). Raises ``TimestampUnitError`` for a genuine
-    open/close unit disagreement within the row -- the one per-row error that still aborts the
-    whole file (every other anomaly is classified by the caller, never raised).
+    Returns ``(parts, open_dt, close_raw_dt, close_unit, n_trades, volume, open_time_raw,
+    close_time_raw)`` -- the last two are the still-integer raw timestamps (sixth fix round, NIT)
+    so the caller can classify the row with exact integer arithmetic instead of ``float`` seconds
+    -- or ``None`` for a header row (non-numeric ``open_time``). Raises ``TimestampUnitError`` for
+    a genuine open/close unit disagreement within the row -- the one per-row error that still
+    aborts the whole file (every other anomaly is classified by the caller, never raised).
     """
     parts = line.split(",")
     if len(parts) < 9:
@@ -302,13 +329,31 @@ def _parse_row_fields(
     if open_unit != close_unit:
         # File-level corruption, not a per-row anomaly: still aborts the whole file.
         raise TimestampUnitError(
-            f"open_time unit ({open_unit}) disagrees with close_time unit ({close_unit}) "
-            f"in row {line!r}"
+            f"open_time unit ({open_unit}) disagrees with close_time unit ({close_unit}) in row {line!r}"
         )
 
     open_dt = to_utc_datetime(open_time_raw, open_unit)
     close_raw_dt = to_utc_datetime(close_time_raw, close_unit)
-    return parts, open_dt, close_raw_dt, close_unit, int(parts[8]), Decimal(parts[5])
+    return (
+        parts,
+        open_dt,
+        close_raw_dt,
+        close_unit,
+        int(parts[8]),
+        Decimal(parts[5]),
+        open_time_raw,
+        close_time_raw,
+    )
+
+
+def _tolerance_units(close_unit: Literal["ms", "us"]) -> tuple[int, int]:
+    """``(early_tolerance_units, late_tolerance_units)`` in the row's own raw unit -- pulled out
+    of ``_parse_kline_row`` purely to keep that function's own branching easy to see at a glance.
+    Late tolerance is the one-unit epsilon itself (exactly 1); early tolerance is
+    ``_EARLY_TOLERANCE_SECONDS`` (1s) expressed in that same unit.
+    """
+    units_per_second = 1000 if close_unit == "ms" else 1_000_000
+    return int(_EARLY_TOLERANCE_SECONDS * units_per_second), 1
 
 
 def _parse_kline_row(
@@ -325,10 +370,15 @@ def _parse_kline_row(
     fields = _parse_row_fields(line)
     if fields is None:
         return None, None
-    parts, open_dt, close_raw_dt, close_unit, n_trades, volume = fields
+    parts, open_dt, close_raw_dt, close_unit, n_trades, volume, open_time_raw, close_time_raw = fields
     nominal_close = open_dt + timeframe.delta  # exact close instant; see module docstring
-    duration_seconds, diff_seconds = _row_duration_diff_seconds(
+    # duration_seconds: informational only (AnomalyRecord.duration_seconds). diff_units (exact
+    # integer arithmetic, NIT sixth fix round) decides the classification below.
+    duration_seconds, _ = _row_duration_diff_seconds(
         open_dt, close_raw_dt, close_unit=close_unit, timeframe=timeframe
+    )
+    diff_units = _row_duration_diff_units(
+        open_time_raw, close_time_raw, close_unit=close_unit, timeframe=timeframe
     )
 
     def _anomaly(classification: str, action: str) -> store_mod.AnomalyRecord:
@@ -357,15 +407,17 @@ def _parse_kline_row(
     if not _is_on_grid(open_dt, timeframe):
         return None, _anomaly("misaligned", "dropped")
 
-    late_tolerance = _late_tolerance_seconds(close_unit)
-    if -_EARLY_TOLERANCE_SECONDS <= diff_seconds <= late_tolerance:
+    # NIT (sixth fix round): exact integer tolerances in the row's own unit, not float seconds --
+    # see _row_duration_diff_units / _tolerance_units.
+    early_tolerance_units, late_tolerance_units = _tolerance_units(close_unit)
+    if -early_tolerance_units <= diff_units <= late_tolerance_units:
         return _record(nominal_close), None  # normal row, no anomaly
 
     if n_trades == 0:
         return None, _anomaly("empty_irregular", "dropped")
-    if diff_seconds < -_EARLY_TOLERANCE_SECONDS:
+    if diff_units < -early_tolerance_units:
         return _record(nominal_close), _anomaly("short", "stored_flagged")  # causal: label >= real data
-    if diff_seconds > late_tolerance:
+    if diff_units > late_tolerance_units:
         return None, _anomaly("long", "dropped")  # data after the label -> look-ahead
     raise ValueError(f"unreachable close_time classification for row {line!r}")  # pragma: no cover
 
@@ -495,6 +547,14 @@ def _classify_fresh_gaps(
     run) already recorded for that exact window is kept untouched (never overwritten -- decision
     D-036 point 4), otherwise ``_classify_gap_from_anomalies`` gets one attempt, otherwise the
     gap stays ``unknown``.
+
+    MINOR-4 (sixth fix round, amends m-J): a previous classification whose ``classified_by`` is
+    ``"legacy"`` (a non-``unknown`` label loaded with no recorded provenance -- see
+    ``store.GapRecord.from_dict``) is NOT trusted the way a genuine ``"manual"`` or current-rule
+    classification is. It gets re-run through ``_classify_gap_from_anomalies`` exactly like a
+    fresh ``unknown`` gap would, falling back to ``"unknown"`` if nothing matches -- a sidecar
+    written before ``classified_by`` existed (or before m-J tightened the rules) must not freeze
+    a possibly over-broad old label beyond this function's reach forever.
     """
     previous_by_window = {(g.from_ts, g.to_ts): g for g in previous_gaps}
     new_gaps: list[store_mod.GapRecord] = []
@@ -502,7 +562,13 @@ def _classify_fresh_gaps(
         from_ts = _as_py_datetime(finding.from_ts)
         to_ts = _as_py_datetime(finding.to_ts)
         previous = previous_by_window.get((from_ts, to_ts))
-        if previous is not None and previous.classification != "unknown":
+        trust_previous = (
+            previous is not None
+            and previous.classification != "unknown"
+            and previous.classified_by != "legacy"
+        )
+        if trust_previous:
+            assert previous is not None  # narrows for mypy; trust_previous already implies this
             classification, classified_by = previous.classification, previous.classified_by
         else:
             auto = _classify_gap_from_anomalies(
