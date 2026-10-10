@@ -1041,3 +1041,100 @@ behind) and again at the end. A run that finds the lock held writes nothing (the
   `in_progress: true`, finishes the rest the next night (every step is idempotent), and the alert fires.
   Time the first real run (`journalctl -u tbot-lbank-backup`, field `seconds`) and adjust.
 - Check it with `cat /var/backups/tbot/lbank/status.json`.
+
+---
+
+## 19. Telegram health-alert monitor (`tbot-health-monitor.service`)
+
+A small separate service on the host (not in any container) that sends you a Telegram message when
+something needs attention. It is **send-only**: it never reads Telegram messages, has no commands
+(no `/halt`), and sends no trade alerts. The recorder containers get no secret and are not changed.
+
+It alerts on four things, with the server's hostname and the UTC time in every message:
+
+1. a recorder stream is stale or erroring (Tabdeal and LBank recorders);
+2. a backup failed, failed its integrity check, is older than 36 h, or its systemd unit is `failed`;
+3. a disk is more than 80 % full (`/`, `/var/lib/docker`, `/var/backups/tbot`);
+4. a recorder container is unhealthy, exited, restarting or missing (or docker itself is down).
+
+A problem is announced once, repeated as a reminder every 6 h while it lasts, and followed by a
+`RESOLVED` message when it clears. One `INFO monitor started` message is sent at every start.
+
+### 19.1 Create the bot (Parham, on his phone, about 2 minutes)
+
+1. In Telegram open **@BotFather**, send `/newbot`, pick a name and a username ending in `bot`.
+2. BotFather replies with a **token** like `123456789:AAxxxxxxxx...`. Treat it like a password:
+   do not paste it in chat, GitHub, or any file inside the repo.
+3. Open a chat with your new bot (search its username) and press **Start**, then send it any
+   message, e.g. `hi`. Telegram only lets a bot see you after you wrote to it first.
+
+### 19.2 Put the two values on the server (root)
+
+The values live only in a root-only file on the server:
+
+```
+install -m 0600 -o root -g root /opt/tbot/trade-bot/deploy/health_monitor.env.example /opt/tbot/health-monitor.env
+nano /opt/tbot/health-monitor.env
+```
+
+Fill in the token after `TBOT_TELEGRAM_BOT_TOKEN=` (no quotes, no spaces). Leave
+`TBOT_TELEGRAM_CHAT_ID=` empty for now, save and exit (`Ctrl+O`, `Enter`, `Ctrl+X`).
+
+### 19.3 Find your chat id
+
+```
+set -a; . /opt/tbot/health-monitor.env; set +a
+python3 /opt/tbot/trade-bot/scripts/telegram_get_chat_id.py
+```
+
+It prints something like `chat_id=123456789  type=private  name=Parham`. The token is read from the
+environment only and never printed. If it says "No chats found", you have not written to the bot yet
+(step 3 above): do that and run it again. Put the number into the env file:
+
+```
+nano /opt/tbot/health-monitor.env       # TBOT_TELEGRAM_CHAT_ID=123456789
+```
+
+### 19.4 Install and start (root)
+
+```
+install -m 0644 /opt/tbot/trade-bot/deploy/systemd/tbot-health-monitor.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now tbot-health-monitor
+```
+
+The monitor uses only the system `python3` (standard library): no uv, no virtualenv, no extra
+packages. It runs from `/opt/tbot/trade-bot`, so after changing that checkout run
+`systemctl restart tbot-health-monitor`. The service never touches the recorder containers.
+
+### 19.5 Test it
+
+```
+systemctl status tbot-health-monitor --no-pager
+journalctl -u tbot-health-monitor -n 30 --no-pager
+```
+
+You should get an `INFO monitor started` message on Telegram within a few seconds. More tests:
+
+```
+set -a; . /opt/tbot/health-monitor.env; set +a
+python3 /opt/tbot/trade-bot/scripts/run_health_monitor.py --send-test   # one test message
+python3 /opt/tbot/trade-bot/scripts/run_health_monitor.py --check       # run the checks once, send nothing
+```
+
+To see a real alert, stop a recorder briefly (`docker stop tbot-lbank-recorder`, wait about 2
+minutes for the `ALERT container:lbank` message, then `docker start tbot-lbank-recorder` and wait
+for `RESOLVED`). The logs are JSON lines in the journal (`journalctl -u tbot-health-monitor -f`);
+the token never appears in them. If Telegram is unreachable the monitor logs an error and retries
+with a growing delay; it does not crash.
+
+### 19.6 Limits and what to add later
+
+- If the **whole server** dies (power, network, provider outage), the monitor dies with it and
+  you hear nothing. That silence is the one failure it cannot report. A cheap fix, not built yet:
+  an external dead-man switch (for example a free healthchecks.io check that the monitor pings
+  every few minutes and that messages you when the pings stop).
+- Alert state is kept in `/var/lib/tbot-health-monitor/state.json` (so a restart does not repeat
+  old alerts). Optional non-secret tuning variables are listed, commented out, in the env file.
+- To rotate the token: revoke it in BotFather (`/revoke`), paste the new one into the env file,
+  `systemctl restart tbot-health-monitor`.

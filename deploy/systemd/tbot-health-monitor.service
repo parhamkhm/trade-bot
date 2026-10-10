@@ -1,0 +1,54 @@
+# Host-side Telegram HEALTH-ALERT monitor (send-only). Separate from every recorder container:
+# the containers receive no Telegram secret and know nothing about it.
+#
+# Type=simple + an internal 60 s loop (not a timer): de-duplication, "RESOLVED" and reminder state
+# live in one process, a slow `docker inspect` can never overlap itself, and Restart=always brings it
+# back after any crash. See deploy/SERVER_SETUP.md section 19.
+#
+# Install (root):
+#   install -m 0644 deploy/systemd/tbot-health-monitor.service /etc/systemd/system/
+#   install -m 0600 -o root -g root deploy/health_monitor.env.example /opt/tbot/health-monitor.env  # then edit
+#   systemctl daemon-reload && systemctl enable --now tbot-health-monitor
+#
+# Runs the stdlib-only monitor with the system python3 straight from the main checkout; it needs
+# neither uv nor a virtualenv.
+[Unit]
+Description=tbot health monitor (Telegram health alerts, send-only)
+Documentation=file:///opt/tbot/trade-bot/deploy/SERVER_SETUP.md
+After=network-online.target docker.service
+Wants=network-online.target
+# Deliberately no Requires=docker.service: the monitor must keep running, and alert, when docker is down.
+
+[Service]
+Type=simple
+# root is needed to run `docker inspect` and read docker volume mountpoints. The hardening below keeps
+# the rest of the filesystem read-only and the process unable to gain privileges.
+User=root
+EnvironmentFile=/opt/tbot/health-monitor.env
+Environment=PYTHONPATH=/opt/tbot/trade-bot/src
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=/opt/tbot/trade-bot
+ExecStart=/usr/bin/python3 /opt/tbot/trade-bot/scripts/run_health_monitor.py
+Restart=always
+RestartSec=10
+# Exit status 2 = missing/invalid token or chat id: restarting every 10 s cannot fix that.
+RestartPreventExitStatus=2
+TimeoutStopSec=15
+
+StateDirectory=tbot-health-monitor
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/tbot-health-monitor
+PrivateTmp=yes
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target
