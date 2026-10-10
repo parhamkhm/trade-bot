@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from scripts.lbank_healthcheck import STREAM_LIMITS_S, evaluate
+from scripts.lbank_healthcheck import STREAM_LIMITS_S, disk_problem, evaluate
 
 NOW = 1_791_637_448_000
 
@@ -44,3 +44,9 @@ def test_just_started_stream_is_healthy() -> None:
         NOW,
     )
     assert ok
+
+
+def test_disk_alarm_at_80_percent() -> None:
+    assert disk_problem(79, 100, 80.0) is None
+    problem = disk_problem(80, 100, 80.0)
+    assert problem is not None and "80.0 %" in problem

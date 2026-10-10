@@ -1,5 +1,5 @@
 [Unit]
-Description=Nightly online backup of the LBank recorder's per-day SQLite files
+Description=Nightly archive (zstd, verified) and online backup of the LBank recorder's per-day SQLite files
 
 [Timer]
 OnCalendar=*-*-* 02:40:00 UTC

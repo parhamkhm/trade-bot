@@ -11,6 +11,7 @@ Writes one SQLite file per UTC day under ``--data-dir`` plus ``heartbeat.json`` 
 from __future__ import annotations
 
 import argparse
+import logging
 import signal
 import sys
 from pathlib import Path
@@ -37,6 +38,9 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     configure_logging(args.log_level)
+    # httpx logs every request at INFO (8,640 depth polls a day alone); keep warnings and errors only
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     recorder = LBankRecorder(RecorderConfig(data_dir=args.data_dir, symbol=args.symbol))
 
     def _stop(signum: int, _frame: FrameType | None) -> None:

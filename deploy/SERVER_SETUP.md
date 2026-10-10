@@ -945,3 +945,67 @@ Before considering the server "done":
       forgetting.
 - [ ] Decided whether CI needs a self-hosted runner or GitHub-hosted is fine for a private
       repo (`docs/SPEC.md` section 9, question 7) — this document does not touch CI.
+
+---
+
+## 18. LBank recorder (pivot step 0)
+
+Raw LBank BTC/USDT spot market data (top-20 order book every 10 s, public trades every 30 s,
+1m/1h/1d klines, BTCUSDT perpetual funding every 60 s), one SQLite file per UTC day. Public
+endpoints only: no API key exists or is read. Order-book history starts **2026-10-10 13:40:00.871 UTC**.
+
+### 18.1 Pinned checkout
+
+The recorder runs from its own checkout, `/opt/tbot/lbank-run`, detached at a fixed commit, not from
+`/opt/tbot/trade-bot`: pulling `main` must never rebuild or restart the raw recorder by accident
+(CLAUDE.md §3.8). Upgrade deliberately, as `tbot`:
+
+```
+cd /opt/tbot/lbank-run && git fetch && git checkout --detach <commit>
+docker compose -f deploy/docker-compose.lbank.yml up -d --build
+```
+
+`docker compose up -d --build` replaces the container, which leaves a recording gap of roughly the
+container restart time (seconds). Note the exact gap from the `depth_snapshots` timestamps when it
+matters.
+
+### 18.2 Install (root, once)
+
+```
+cd /opt/tbot/lbank-run
+install -m 0644 deploy/systemd/tbot-lbank-recorder.service deploy/systemd/tbot-lbank-backup.service \
+    deploy/systemd/tbot-lbank-backup.timer /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now tbot-lbank-recorder.service tbot-lbank-backup.timer
+```
+
+### 18.3 Nightly archive and backup (`deploy/backup_lbank.py`, ~02:40 UTC)
+
+- **Closed days** (ended ≥ 2 h ago, untouched for 2 h): online copy → `integrity_check` → zstd
+  (`lbank-YYYY-MM-DD.sqlite.zst`, read-only, next to the live files) → decompressed again and
+  verified (integrity + identical row counts per table) → copied to `/var/backups/tbot/lbank/`
+  (sha256-checked) → only then is the uncompressed day file removed.
+- **Today's file**: a plain online, integrity-checked copy in `/var/backups/tbot/lbank/`, refreshed
+  nightly, so at most one night of data is ever unbacked.
+- Closed archives never change, so every one is kept (≈ 7–10 MB a day).
+- Check the last run: `journalctl -u tbot-lbank-backup.service -n 5 -o cat` (one JSON line;
+  non-empty `failed` / `corrupt` means look now).
+
+The container healthcheck also turns **unhealthy at ≥ 80 % disk used** (`TBOT_LBANK_DISK_MAX_PCT`).
+It never stops recording.
+
+### 18.4 Weekly copy to Parham's Windows laptop
+
+From PowerShell on the laptop (the root key is already installed there). It copies only the archives
+the laptop does not have yet:
+
+```powershell
+$dst = "C:\trade-bot-backups\lbank"; New-Item -ItemType Directory -Force $dst | Out-Null
+$have = Get-ChildItem $dst -Filter *.zst | ForEach-Object Name
+ssh root@91.228.186.132 "ls -1 /var/backups/tbot/lbank/ | grep -E '^lbank-[0-9-]{10}\.sqlite\.zst$'" |
+  Where-Object { $have -notcontains $_ } |
+  ForEach-Object { scp "root@91.228.186.132:/var/backups/tbot/lbank/$_" "$dst\" }
+```
+
+To read one on the laptop: `zstd -d lbank-2026-10-11.sqlite.zst` (zstd for Windows:
+https://github.com/facebook/zstd/releases), then open the `.sqlite` with any SQLite tool.

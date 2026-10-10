@@ -336,6 +336,8 @@ class LBankRecorder:
     # -- lifecycle --
 
     def start(self) -> None:
+        # the heartbeat may run before any stream has written; it must find its directory
+        self._cfg.data_dir.mkdir(parents=True, exist_ok=True)
         jobs: list[tuple[str, float, Callable[[httpx.Client, DayStore], int]]] = [
             ("depth", self._cfg.depth_interval_s, self._poll_depth),
             ("trades", self._cfg.trades_interval_s, self._poll_trades),
