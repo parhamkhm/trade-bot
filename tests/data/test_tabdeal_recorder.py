@@ -275,6 +275,62 @@ def test_parse_trade_item_missing_is_buyer_maker_defaults_to_false() -> None:
 
 
 # ---------------------------------------------------------------------------------
+# MINOR-3 (PR2 followups): a non-finite id/time (OverflowError on int(...)), or an id outside
+# SQLite's signed-64-bit INTEGER PRIMARY KEY range, must be rejected like any other malformed
+# item -- never raise out of parse_trade_item (which used to abort the whole poll's parse loop)
+# or reach RecorderStore.insert_trades (which used to raise inside the poll's own transaction).
+# ---------------------------------------------------------------------------------
+
+
+def test_parse_trade_item_rejects_infinite_time_without_raising() -> None:
+    now_ms = 1_767_225_600_000
+    item = {"id": 1, "price": "100", "qty": "1", "time": float("inf")}
+    assert parse_trade_item(item, now_ms=now_ms) is None
+
+
+def test_parse_trade_item_rejects_infinite_id_without_raising() -> None:
+    now_ms = 1_767_225_600_000
+    item = {"id": float("inf"), "price": "100", "qty": "1", "time": now_ms}
+    assert parse_trade_item(item, now_ms=now_ms) is None
+
+
+def test_parse_trade_item_rejects_nan_time_without_raising() -> None:
+    now_ms = 1_767_225_600_000
+    item = {"id": 1, "price": "100", "qty": "1", "time": float("nan")}
+    assert parse_trade_item(item, now_ms=now_ms) is None
+
+
+def test_parse_trade_item_rejects_id_at_or_above_sqlite_int64_max() -> None:
+    """SQLite's ``INTEGER PRIMARY KEY`` (``trades.trade_id``) is signed 64-bit -- an id at or
+    above ``2**63`` used to reach ``RecorderStore.insert_trades`` and raise there instead,
+    inside the poll's own transaction, rolling back every other trade in the same poll."""
+    now_ms = 1_767_225_600_000
+    item = {"id": 2**64, "price": "100", "qty": "1", "time": now_ms}
+    assert parse_trade_item(item, now_ms=now_ms) is None
+
+
+def test_parse_trade_item_rejects_negative_id() -> None:
+    now_ms = 1_767_225_600_000
+    item = {"id": -1, "price": "100", "qty": "1", "time": now_ms}
+    assert parse_trade_item(item, now_ms=now_ms) is None
+
+
+def test_parse_trade_item_rejects_the_first_id_beyond_sqlite_int64() -> None:
+    """Exact boundary: 2**63 is one past SQLite's signed 64-bit maximum and must be rejected."""
+    now_ms = 1_767_225_600_000
+    item = {"id": 2**63, "price": "100", "qty": "1", "time": now_ms}
+    assert parse_trade_item(item, now_ms=now_ms) is None
+
+
+def test_parse_trade_item_accepts_the_maximum_valid_sqlite_int64_id() -> None:
+    now_ms = 1_767_225_600_000
+    item = {"id": 2**63 - 1, "price": "100", "qty": "1", "time": now_ms}
+    trade = parse_trade_item(item, now_ms=now_ms)
+    assert trade is not None
+    assert trade.trade_id == 2**63 - 1
+
+
+# ---------------------------------------------------------------------------------
 # poll_trades_once: dedupe / window-overlap / out-of-order / saturation
 # ---------------------------------------------------------------------------------
 
@@ -697,6 +753,49 @@ def test_poll_and_build_due_candles_partial_unparsable_drop_marks_hour_incomplet
     assert len(written) == 1
     assert written[0].n_trades == 2  # ids 1 and 3 only -- the middle item never parsed
     assert written[0].complete is False  # MAJOR M-B: must not claim full coverage
+    client.close()
+    store.close()
+
+
+@respx.mock
+def test_poll_trades_once_overflow_id_or_time_item_does_not_block_other_trades_in_the_same_poll(
+    tmp_path: Path,
+) -> None:
+    """MINOR-3 (PR2 followups): before `parse_trade_item` caught `OverflowError` and bounds-
+    checked `trade_id`, one item with `time=Infinity` raised `OverflowError` out of the parse
+    loop (aborting the whole poll before any trade was inserted), and one item with
+    `id >= 2**63` reached `insert_trades` and raised `sqlite3` IntegrityError/OperationalError
+    *inside* the poll's own transaction, rolling back every other trade in the same batch.
+    Both items must instead take the normal "unparsable item" path -- every OTHER trade in the
+    same poll is still inserted, and the poll itself completes without raising.
+    """
+    # httpx's own `json=` encoder rejects a bare `Infinity` float (`allow_nan=False`), so the
+    # body is built as raw text instead -- `Infinity` is still a token Python's own `json.loads`
+    # (what TabdealClient actually uses to decode a live response) accepts by default.
+    huge_id = 2**64  # id too large for SQLite's signed 64-bit INTEGER PRIMARY KEY
+    body_text = (
+        f'[{{"id": 1, "price": "100.0", "qty": "1.0", "time": {HOUR0_MS + 1_000}}},'
+        f' {{"id": {huge_id}, "price": "100.5", "qty": "1.0", "time": {HOUR0_MS + 2_000}}},'
+        ' {"id": 3, "price": "101.0", "qty": "1.0", "time": Infinity},'  # non-finite time
+        f' {{"id": 4, "price": "102.0", "qty": "1.0", "time": {HOUR0_MS + 4_000}}}]'
+    )
+    respx.get(TRADES_URL).mock(
+        return_value=httpx.Response(
+            200, content=body_text, headers={"content-type": "application/json"}
+        )
+    )
+    clock = FakeClock(start=candles_mod.ms_to_utc(HOUR0_MS + 1_000))
+    client = make_client(clock)
+    store = RecorderStore(tmp_path / "trades.sqlite")
+
+    outcome = poll_trades_once(
+        client, store, symbol="BTCUSDT", limit=500, poll_interval_seconds=5.0, clock=clock
+    )
+
+    assert outcome.n_items_received == 4
+    assert outcome.n_trades == 2  # ids 1 and 4 -- the two malformed items never parsed
+    assert store.total_trade_count() == 2
+    assert {row[0] for row in store._conn.execute("SELECT trade_id FROM trades").fetchall()} == {1, 4}
     client.close()
     store.close()
 
@@ -1841,6 +1940,89 @@ def test_tabdeal_recorder_service_refuses_a_database_recorded_for_another_symbol
         client.close()
 
 
+def test_tabdeal_recorder_service_reconciles_sweep_cursor_on_construction(tmp_path: Path) -> None:
+    """NIT (first-poll reconcile, PR2 followups): before this fix, the SQLite ``sweep_cursor``
+    was only reconciled against Parquet inside ``build_due_candles`` (``_reconcile_sweep_cursor``),
+    which only ever runs AFTER the first poll of a process. A process restarted right after a
+    deploy or a crash would then run its first poll -- and ``_detect_late_trades`` inside that
+    very poll's own transaction -- against a cursor that could still lag what Parquet already
+    shows (e.g. a database that predates ``advance_sweep_cursor`` being called for a
+    candle-written hour, not just a gapped one), so a trade that is late relative to the TRUE
+    last-swept hour but not relative to the stale cursor went undetected as late. The cursor must
+    now also be reconciled once at construction time, before any poll runs at all.
+    """
+    db_path = tmp_path / "trades.sqlite"
+    parquet_root = tmp_path / "parquet"
+    seed_store = RecorderStore(db_path)
+    seed_store.ensure_symbol("BTCUSDT")
+    candles_mod.write_candle(
+        parquet_root,
+        "BTCUSDT",
+        candles_mod.TabdealCandleRecord(
+            ts=candles_mod.ms_to_utc(HOUR0_MS),
+            open=Decimal("1"),
+            high=Decimal("1"),
+            low=Decimal("1"),
+            close=Decimal("1"),
+            volume=Decimal("1"),
+            complete=True,
+            n_trades=1,
+        ),
+    )
+    # Simulates a pre-fix database (or a crash between write_candle and advance_sweep_cursor in
+    # _process_due_hour): a candle is already on disk for HOUR0_MS, but the SQLite cursor never
+    # advanced past it.
+    assert seed_store.last_swept_close_ms("BTCUSDT") is None
+    seed_store.close()
+
+    clock = FakeClock()
+    client = make_client(clock)
+    store = RecorderStore(db_path)
+    try:
+        TabdealRecorderService(
+            client=client,
+            store=store,
+            parquet_root=parquet_root,
+            heartbeat_file=tmp_path / "heartbeat.json",
+            settings=RecorderSettings(symbol="BTCUSDT"),
+            clock=clock,
+        )
+        # Reconciled immediately at construction -- before process_once() has ever run.
+        assert store.last_swept_close_ms("BTCUSDT") == HOUR0_MS
+    finally:
+        store.close()
+        client.close()
+
+
+def test_tabdeal_recorder_service_construction_never_raises_if_reconcile_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The startup reconcile must never block construction -- a read failure (corrupt/unreadable
+    Parquet part, or anything else) is logged and skipped, same as the ordinary per-sweep
+    reconcile already does."""
+    monkeypatch.setattr(
+        trd,
+        "_reconcile_sweep_cursor",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk error")),
+    )
+    clock = FakeClock()
+    client = make_client(clock)
+    store = RecorderStore(tmp_path / "trades.sqlite")
+    try:
+        service = TabdealRecorderService(
+            client=client,
+            store=store,
+            parquet_root=tmp_path / "parquet",
+            heartbeat_file=tmp_path / "heartbeat.json",
+            settings=RecorderSettings(symbol="BTCUSDT"),
+            clock=clock,
+        )
+        assert service is not None
+    finally:
+        store.close()
+        client.close()
+
+
 # ---------------------------------------------------------------------------------
 # MAJOR-3: SQLite writes are transactional
 # ---------------------------------------------------------------------------------
@@ -2793,6 +2975,173 @@ def test_build_due_candles_self_heals_an_unrewritten_late_trades_gap_from_a_prio
 
 
 # ---------------------------------------------------------------------------------
+# MINOR-2 (PR2 followups): _recover_unrewritten_gaps must also retry a sealed-hour
+# "partial_unparsable" rewrite left rewritten=0 (not just "late_trades"), and _apply_gap_rewrites
+# must not let one row's rewrite failure abandon every other row in the same poll.
+# ---------------------------------------------------------------------------------
+
+
+def test_build_due_candles_self_heals_an_unrewritten_partial_unparsable_gap_from_a_prior_crash(
+    tmp_path: Path,
+) -> None:
+    """Same self-healing role as the ``late_trades`` test above, for the OTHER reason
+    ``_persist_poll`` gives a sealed-hour rewrite (m-2, PR2 review): a sealed-hour
+    ``partial_unparsable`` gap row left ``rewritten=0`` by a crash between the poll's
+    transaction committing and its inline correction must also be picked up by
+    ``_recover_unrewritten_gaps`` on the very next sweep -- before this fix, that function only
+    ever called ``store.unrewritten_hour_gaps("late_trades")``, so a ``partial_unparsable`` row
+    in this exact state stayed ``rewritten=0``, and its candle stayed wrong, forever."""
+    store = RecorderStore(tmp_path / "trades.sqlite")
+    store.record_verified_poll(symbol="BTCUSDT", poll_ts_ms=FAR_FUTURE_VERIFIED_MS)
+    parquet_root = tmp_path / "parquet"
+    candles_mod.write_candle(
+        parquet_root,
+        "BTCUSDT",
+        candles_mod.TabdealCandleRecord(
+            ts=candles_mod.ms_to_utc(HOUR0_MS),
+            open=Decimal("1"),
+            high=Decimal("1"),
+            low=Decimal("1"),
+            close=Decimal("1"),
+            volume=Decimal("1"),
+            complete=True,  # wrong: a trade for this hour was dropped and never counted
+            n_trades=1,
+        ),
+    )
+    _seed_trade(store, 1, HOUR0_MS - 1_000)  # the trade the candle above was built from
+    # Simulates the crash: the gap row was committed, but the inline rewrite that should have
+    # followed it (_apply_gap_rewrites, inside poll_trades_once) never ran.
+    rowid = store.record_gap(
+        detected_ts_ms=0, from_id=None, to_id=None, reason="partial_unparsable", hour_close_ms=HOUR0_MS
+    )
+    assert store.unrewritten_hour_gaps("partial_unparsable") == [(rowid, HOUR0_MS)]
+    clock = FakeClock(start=candles_mod.ms_to_utc(HOUR0_MS + 1_000))
+
+    build_due_candles(
+        store, symbol="BTCUSDT", parquet_root=parquet_root, grace_period_seconds=60.0, clock=clock
+    )
+
+    table = candles_mod._read_candles(parquet_root, "BTCUSDT")
+    rows = {row["ts"]: row for row in table.to_pylist()}
+    assert rows[candles_mod.ms_to_utc(HOUR0_MS)]["complete"] is False  # corrected on this sweep
+    assert store.unrewritten_hour_gaps("partial_unparsable") == []  # marked rewritten
+    store.close()
+
+
+def test_apply_gap_rewrites_continues_past_a_failing_row_instead_of_abandoning_the_rest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MINOR-2 (PR2 followups): before this fix, one row's rewrite raising propagated straight
+    out of ``_apply_gap_rewrites``, abandoning every OTHER row still queued for this same poll
+    -- not just correctly leaving the failing row itself ``rewritten=0``, but also silently
+    skipping later rows that would have succeeded. Each row is now independently contained: the
+    failing row stays ``rewritten=0`` for the next sweep to retry, but every other row in the
+    same call still gets attempted regardless. Once every row has been attempted,
+    ``_apply_gap_rewrites`` still raises (so the failure keeps surfacing via the heartbeat, as
+    ``test_trade_ingestion_survives_downstream_failure[late_trade_candle_rewrite]`` requires) --
+    but only AFTER every other row already got its own, independent attempt.
+    """
+    store = RecorderStore(tmp_path / "trades.sqlite")
+    parquet_root = tmp_path / "parquet"
+    real_rewrite = trd._rewrite_hour_for_late_trades
+
+    def _flaky(store_: RecorderStore, parquet_root_: Path, symbol: str, close_ms: int) -> None:
+        if close_ms == HOUR0_MS:
+            raise OSError("transient: disk full / EIO")
+        real_rewrite(store_, parquet_root_, symbol, close_ms)
+
+    monkeypatch.setattr(trd, "_rewrite_hour_for_late_trades", _flaky)
+
+    rowid_a = store.record_gap(
+        detected_ts_ms=0, from_id=None, to_id=None, reason="late_trades", hour_close_ms=HOUR0_MS
+    )
+    rowid_b = store.record_gap(
+        detected_ts_ms=0, from_id=None, to_id=None, reason="late_trades", hour_close_ms=HOUR1_MS
+    )
+
+    with pytest.raises(RuntimeError):
+        trd._apply_gap_rewrites(
+            store, parquet_root, "BTCUSDT", ((rowid_a, HOUR0_MS), (rowid_b, HOUR1_MS))
+        )
+
+    # The failing row (HOUR0_MS) stays unrewritten; the row AFTER it (HOUR1_MS) must still have
+    # been attempted and marked rewritten -- not silently skipped because an earlier row raised.
+    assert store.unrewritten_hour_gaps("late_trades") == [(rowid_a, HOUR0_MS)]
+    store.close()
+
+
+def test_recover_unrewritten_gaps_retries_a_partial_unparsable_row_after_a_transient_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end retry, repro of the reviewer's ``pr2b_m2retry.py``: a sealed-hour
+    ``partial_unparsable`` rewrite fails once (transient I/O error) on one sweep, stays
+    ``rewritten=0``, and the candle stays wrong; a LATER sweep (once the transient condition has
+    cleared) must retry it via ``_recover_unrewritten_gaps`` and finally correct the candle.
+
+    ``build_due_candles`` itself still raises on the failing sweep (surfacing the failure via
+    ``_run_downstream_steps``'s own containment in the real service, the same contract
+    ``test_trade_ingestion_survives_downstream_failure`` already checks for the candle-sweep
+    path in general) -- this test calls it directly, so it catches that one expected raise
+    itself, matching how the real service would.
+    """
+    store = RecorderStore(tmp_path / "trades.sqlite")
+    store.record_verified_poll(symbol="BTCUSDT", poll_ts_ms=FAR_FUTURE_VERIFIED_MS)
+    parquet_root = tmp_path / "parquet"
+    candles_mod.write_candle(
+        parquet_root,
+        "BTCUSDT",
+        candles_mod.TabdealCandleRecord(
+            ts=candles_mod.ms_to_utc(HOUR0_MS),
+            open=Decimal("1"),
+            high=Decimal("1"),
+            low=Decimal("1"),
+            close=Decimal("1"),
+            volume=Decimal("1"),
+            complete=True,
+            n_trades=1,
+        ),
+    )
+    _seed_trade(store, 1, HOUR0_MS - 1_000)
+    rowid = store.record_gap(
+        detected_ts_ms=0, from_id=None, to_id=None, reason="partial_unparsable", hour_close_ms=HOUR0_MS
+    )
+    clock = FakeClock(start=candles_mod.ms_to_utc(HOUR0_MS + 1_000))
+
+    real_rewrite = trd._rewrite_hour_for_late_trades
+    state = {"fail": True}
+
+    def _flaky(store_: RecorderStore, parquet_root_: Path, symbol: str, close_ms: int) -> None:
+        if state["fail"]:
+            raise OSError("transient: disk full / EIO")
+        real_rewrite(store_, parquet_root_, symbol, close_ms)
+
+    monkeypatch.setattr(trd, "_rewrite_hour_for_late_trades", _flaky)
+
+    # Sweep 1: the rewrite attempt fails (transient) -- the gap stays unrewritten and the candle
+    # stays wrong; build_due_candles raises (surfaced by the real service via
+    # _run_downstream_steps's own containment).
+    with pytest.raises(RuntimeError):
+        build_due_candles(
+            store, symbol="BTCUSDT", parquet_root=parquet_root, grace_period_seconds=60.0, clock=clock
+        )
+    assert store.unrewritten_hour_gaps("partial_unparsable") == [(rowid, HOUR0_MS)]
+    table = candles_mod._read_candles(parquet_root, "BTCUSDT")
+    rows = {row["ts"]: row for row in table.to_pylist()}
+    assert rows[candles_mod.ms_to_utc(HOUR0_MS)]["complete"] is True  # not yet corrected
+
+    # Sweep 2: the transient condition clears -- the next sweep must retry and succeed.
+    state["fail"] = False
+    build_due_candles(
+        store, symbol="BTCUSDT", parquet_root=parquet_root, grace_period_seconds=60.0, clock=clock
+    )
+    assert store.unrewritten_hour_gaps("partial_unparsable") == []
+    table = candles_mod._read_candles(parquet_root, "BTCUSDT")
+    rows = {row["ts"]: row for row in table.to_pylist()}
+    assert rows[candles_mod.ms_to_utc(HOUR0_MS)]["complete"] is False  # now corrected
+    store.close()
+
+
+# ---------------------------------------------------------------------------------
 # MINOR-2 (sixth fix round): a partial-unparsable gap is anchored to the dropped item's own
 # (leniently-read) time, not to the hours of the trades that happened to parse in the same poll,
 # and is deduped per (reason, hour_close_ms).
@@ -2826,6 +3175,43 @@ def test_poll_trades_once_anchors_partial_unparsable_gap_to_the_dropped_items_ow
     # The hour the surviving trades (ids 1, 3) actually belong to must NOT be marked incomplete
     # by this mechanism -- has_hour_gap(HOUR1_MS) would wrongly disqualify it otherwise.
     assert store.has_hour_gap(HOUR1_MS) is False
+    client.close()
+    store.close()
+
+
+@respx.mock
+def test_poll_trades_once_dropped_item_with_implausible_own_time_anchors_to_parsed_neighbours(
+    tmp_path: Path,
+) -> None:
+    """m-1 (PR2 review) regression test (PR2 followups): the round-3 reviewer's exact repro --
+    a dropped item whose own ``time`` field is readable but IMPLAUSIBLE (here, a seconds-scale
+    unit bug: dividing a real ms timestamp by 1000 lands it in 1970) must NOT be trusted at face
+    value. Before m-1, ``_lenient_item_time_ms`` had no plausibility check at all, so this used
+    to anchor the gap to a bogus ~1970 hour -- nowhere near the item's real hour, which then got
+    NO gap row and was later swept ``complete=True`` with this trade silently missing. With the
+    implausible own-time rejected, ``_record_partial_unparsable`` falls back to the hour span
+    between the item's nearest successfully-parsed neighbours in response order (ids 1 and 3
+    here, both in the hour closing at HOUR1_MS) -- the correct hour.
+
+    Reverting m-1's plausibility check in ``_lenient_item_time_ms`` makes this test fail: the
+    recorded gap would be at some 1970s-ish ``hour_close_ms``, not ``HOUR1_MS``.
+    """
+    implausible_own_time_ms = (HOUR0_MS + 2_000) // 1000  # unit bug: ms value treated as seconds
+    assert implausible_own_time_ms < trd._MIN_PLAUSIBLE_TRADE_TS_MS  # sanity: genuinely implausible
+    body = [
+        {"id": 1, "price": "100.0", "qty": "1.0", "time": HOUR0_MS + 1_000},
+        # Dropped (missing "id"); its own "time" is readable but implausible.
+        {"price": "100.5", "qty": "1.0", "time": implausible_own_time_ms},
+        {"id": 3, "price": "101.0", "qty": "1.0", "time": HOUR0_MS + 3_000},
+    ]
+    respx.get(TRADES_URL).mock(return_value=httpx.Response(200, json=body))
+    clock = FakeClock(start=candles_mod.ms_to_utc(HOUR1_MS + 61_000))
+    client = make_client(clock)
+    store = RecorderStore(tmp_path / "trades.sqlite")
+
+    poll_trades_once(client, store, symbol="BTCUSDT", limit=500, poll_interval_seconds=5.0, clock=clock)
+
+    assert store.all_gaps() == [(None, None, "partial_unparsable", HOUR1_MS)]
     client.close()
     store.close()
 

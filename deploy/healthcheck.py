@@ -48,12 +48,17 @@ m-3 (PR2 review, ahead of merge): `consecutive_errors` (above) is reset to 0 by
 (`build_due_candles`) then raises on every single cycle (e.g. a corrupt Parquet part) -- that
 failure mode was previously invisible to this script entirely: the file still looked fresh, and
 `consecutive_errors` stayed 0 forever. The payload now also carries
-`consecutive_cycle_exceptions` (int -- consecutive `process_once()` exceptions, including the
-current cycle if it is the one failing; mirrors `TabdealRecorderService.
-_consecutive_cycle_exceptions`, the same counter `run_forever`'s own fatal-exit threshold uses).
-This script fails once it reaches `TBOT_HEARTBEAT_MAX_CYCLE_EXCEPTIONS` (default 3) -- deliberately
-far below `run_forever`'s own `_MAX_CONSECUTIVE_CYCLE_EXCEPTIONS` (20): this is an operational
-early warning via `docker ps`/Telegram-adjacent tooling, not the process's own last-resort exit.
+`consecutive_cycle_exceptions` (int -- consecutive cycles with ANY problem, including the
+current cycle if it is the one failing). Despite its name (kept for payload-contract
+compatibility), this field is fed from `TabdealRecorderService._consecutive_degraded_cycles`, NOT
+`_consecutive_cycle_exceptions` -- the latter counts only genuine `process_once()` exceptions and
+drives `run_forever`'s own backoff/fatal-exit; `_consecutive_degraded_cycles` additionally counts
+a purely downstream-contained failure (sweep, order-book poll, post-commit Parquet rewrite) that
+never raises out of `process_once` at all, which is exactly the sweep-only failure mode this
+field exists to surface to this script. This script fails once it reaches
+`TBOT_HEARTBEAT_MAX_CYCLE_EXCEPTIONS` (default 3) -- deliberately far below `run_forever`'s own
+`_MAX_CONSECUTIVE_CYCLE_EXCEPTIONS` (20): this is an operational early warning via `docker
+ps`/Telegram-adjacent tooling, not the process's own last-resort exit.
 
 m3 default (`TBOT_HEARTBEAT_MAX_TRADE_STALENESS_SECONDS=7200`): measured from the Turkey
 server 2026-10-04, BTCUSDT on Tabdeal is thin -- a 1000-trade/~29h sample had a p99
@@ -186,8 +191,9 @@ def _evaluate_cycle_exceptions(
     m-3: ``consecutive_errors`` alone never catches a sweep-only failure (``build_due_candles``
     raising, e.g. on a corrupt Parquet part) -- the poll itself keeps succeeding every cycle,
     which resets that counter to 0 right before the sweep raises. This field (written by
-    ``TabdealRecorderService.process_once``, mirroring ``_consecutive_cycle_exceptions``,
-    "including the current failing cycle") is the one that climbs instead.
+    ``TabdealRecorderService.process_once``, fed from ``_consecutive_degraded_cycles`` --
+    despite the field's name, NOT ``_consecutive_cycle_exceptions`` -- "including the current
+    failing cycle") is the one that climbs instead.
     """
     if "consecutive_cycle_exceptions" not in payload:
         return None
