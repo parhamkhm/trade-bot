@@ -1009,3 +1009,19 @@ ssh root@91.228.186.132 "ls -1 /var/backups/tbot/lbank/ | grep -E '^lbank-[0-9-]
 
 To read one on the laptop: `zstd -d lbank-2026-10-11.sqlite.zst` (zstd for Windows:
 https://github.com/facebook/zstd/releases), then open the `.sqlite` with any SQLite tool.
+
+### 18.5 Backup status file (`/var/backups/tbot/lbank/status.json`)
+
+Every backup run (except one that finds the lock held) rewrites this file atomically:
+
+```json
+{"ts": "2026-10-12T02:40:31+00:00", "ok": true, "exit_code": 0, "days_archived": ["2026-10-11"],
+ "days_pending": [], "message": "ok", "integrity_ok": true}
+```
+
+- `ok` is false and `days_pending` lists the closed days still not archived whenever archiving failed;
+  the source file is then kept and a full verified copy of it sits in the backup directory.
+- Exit codes: 0 ok, 1 failed (read `message`), 2 corrupt / failed integrity check (`integrity_ok` is
+  false: look now), 3 another run holds `.lock` (nothing touched, `status.json` unchanged; the unit
+  treats 3 as success). Alert on `ok == false` or on a `ts` older than 26 h.
+- Check it with `cat /var/backups/tbot/lbank/status.json`.
