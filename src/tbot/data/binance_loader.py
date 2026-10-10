@@ -81,6 +81,7 @@ from tbot.core.config import DataConfig
 from tbot.core.types import Bar, Timeframe
 from tbot.data import quality as quality_mod
 from tbot.data import store as store_mod
+from tbot.data.live_compare import refuse_live_compare_path
 
 logger = structlog.get_logger(__name__)
 
@@ -1034,6 +1035,7 @@ def load_bars(
     See the module docstring and docs/SPEC.md section 5.2 for the double-lock rule.
     """
     cfg = config or DataConfig()
+    refuse_live_compare_path(cfg.parquet_root, what="parquet_root")  # D-039
     unsealed = _resolve_holdout_access(
         allow_holdout=allow_holdout,
         caller=caller or _caller_tag(),
@@ -1080,6 +1082,7 @@ def load_frame(
     to float64 for research use; ``as_float=False`` keeps exact ``Decimal`` (object dtype).
     """
     cfg = config or DataConfig()
+    refuse_live_compare_path(cfg.parquet_root, what="parquet_root")  # D-039
     unsealed = _resolve_holdout_access(
         allow_holdout=allow_holdout,
         caller=caller or _caller_tag(),
