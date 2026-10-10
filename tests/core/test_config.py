@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 from pydantic import SecretStr, ValidationError
 
-from tbot.core.config import Config, RuntimeConfig, Secrets, load_config
+from tbot.core.config import Config, CostConfig, RuntimeConfig, Secrets, load_config
 from tbot.core.types import Timeframe
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -33,10 +33,20 @@ def test_default_yaml_loads_and_matches_schema():
     config = load_config("default", config_dir=REPO_ROOT / "config")
     assert config.runtime.mode == "backtest"
     assert config.runtime.phase == 0
-    assert config.costs.taker_fee_bps == Decimal("35")
-    assert config.costs.maker_fee_bps == Decimal("33")
+    assert config.costs.taker_fee_bps == Decimal("10")  # LBank spot VIP 0, D-060
+    assert config.costs.maker_fee_bps == Decimal("10")
+    assert config.costs.slippage_bps == Decimal("5")
+    assert config.costs.slippage_provisional is True
+    # the YAML and the code defaults must not drift apart
+    assert config.costs == CostConfig()
     assert config.data.symbols == ("BTCUSDT", "ETHUSDT")
     assert Timeframe.H4 in config.data.timeframes
+
+
+def test_vol_target_is_the_locked_s0_value():
+    # D-063: S0 sizes to 30 % annual vol; 20 %/40 % are robustness variants run via override only
+    config = load_config("default", config_dir=REPO_ROOT / "config")
+    assert config.risk.annual_vol_target == 0.30
 
 
 def test_default_yaml_holdout_is_a_fixed_utc_date():
