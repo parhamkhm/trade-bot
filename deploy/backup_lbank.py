@@ -41,6 +41,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import Protocol
 
@@ -181,11 +182,11 @@ def archive_closed_day(source: Path, dest_dir: Path, staging: Path, codec: Codec
         with contextlib.closing(_ro(source)) as conn:
             if _row_counts(conn) != counts:
                 raise IntegrityError(f"{source.name}: snapshot row counts differ from the source")
-        partial = archive.with_name(archive.name + ".tmp")
-        codec.compress(plain, partial)
-        if archive_counts(partial, check, codec) != counts:
+        pending = archive.with_name(archive.name + ".tmp")
+        codec.compress(plain, pending)
+        if archive_counts(pending, check, codec) != counts:
             raise IntegrityError(f"{archive.name}: decompressed row counts differ from the source")
-        partial.replace(archive)
+        pending.replace(archive)
         _match_owner(archive, source)
         with contextlib.suppress(OSError):
             archive.chmod(0o444)
@@ -272,18 +273,23 @@ def _handle_day(
     source: Path, dest_dir: Path, staging: Path, codec: Codec, now: datetime, out: Summary
 ) -> None:
     archive = source.with_name(source.name + codec.suffix)
+
+    def resume() -> None:
+        _resume(source, archive, dest_dir, staging, codec, now, out)
+
+    def archive_it() -> None:
+        out.archived.append(archive_closed_day(source, dest_dir, staging, codec).name)
+
+    def copy_open() -> None:
+        backup_open_day(source, dest_dir / source.name)
+        out.copied.append(source.name)
+
     if archive.exists():
-        out.attempt(source.name, lambda: _resume(source, archive, dest_dir, staging, codec, now, out))
+        out.attempt(source.name, resume)
     elif is_closed(source, now):
-        out.attempt(
-            source.name,
-            lambda: out.archived.append(archive_closed_day(source, dest_dir, staging, codec).name),
-        )
+        out.attempt(source.name, archive_it)
     elif _needs_copy(source, dest_dir / source.name):
-        out.attempt(
-            source.name,
-            lambda: (backup_open_day(source, dest_dir / source.name), out.copied.append(source.name)),
-        )
+        out.attempt(source.name, copy_open)
     else:
         out.skipped += 1
 
@@ -299,7 +305,7 @@ def run(source_dir: Path, dest_dir: Path, *, codec: Codec | None = None, now: da
         _handle_day(source, dest_dir, staging, codec, now, out)
     for archive in sorted(source_dir.glob(f"lbank-*.sqlite{codec.suffix}")):
         if not (dest_dir / archive.name).exists():  # an earlier night's copy failed: retry it
-            out.attempt(archive.name, lambda a=archive: _copy_archive(a, dest_dir, out))
+            out.attempt(archive.name, partial(_copy_archive, archive, dest_dir, out))
     summary = {"event": "lbank_backup", **out.__dict__, "seconds": round(time.monotonic() - started, 2)}
     print(json.dumps(summary), file=sys.stderr if (out.failed or out.corrupt) else sys.stdout)
     return 2 if out.corrupt else 1 if out.failed else 0
