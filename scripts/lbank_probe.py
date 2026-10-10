@@ -622,9 +622,10 @@ def clock_delta_ms(server_ms: int, sent_at: datetime, received_at: datetime) -> 
     return float(server_ms) - midpoint_ms
 
 
-# Field names: priceAccuracy / quantityAccuracy / minTranQua are the documented ones. The
-# minimum-order-value names are CANDIDATES (not verified against the live response yet); the raw
-# row is always stored so the evaluation can be redone offline with --summarize.
+# Field names: the first entry of each tuple was verified against a live accuracy.do response taken
+# from the Turkey server on 2026-10-10 22:20 UTC (btc_usdt: priceAccuracy 2, quantityAccuracy 5,
+# minTranQua 0.00001, minOrderAmount 1). The later entries are fallbacks only; the raw row is always
+# stored so the evaluation can be redone offline with --summarize.
 ACCURACY_FIELDS: dict[str, tuple[str, ...]] = {
     "price_precision": ("priceAccuracy", "pricePrecision", "price_accuracy"),
     "quantity_precision": ("quantityAccuracy", "quantityPrecision", "quantity_accuracy"),
