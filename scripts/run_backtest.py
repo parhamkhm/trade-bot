@@ -29,7 +29,7 @@ from tbot.backtest.benchmarks import run_benchmarks
 from tbot.backtest.config import BacktestConfig
 from tbot.backtest.engine import run_backtest
 from tbot.backtest.feed import BacktestFeed
-from tbot.backtest.report import build_report, render_markdown
+from tbot.backtest.report import build_report, is_run_invalid, render_markdown
 from tbot.core.config import load_config
 from tbot.core.types import Strategy, SymbolFilters, Timeframe
 from tbot.data.binance_loader import load_bars
@@ -103,7 +103,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     sys.stdout.write(render_markdown(report))
     if args.json is not None:
         args.json.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
-    return 0
+    return 3 if is_run_invalid(report) else 0
 
 
 if __name__ == "__main__":

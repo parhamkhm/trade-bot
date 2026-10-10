@@ -90,6 +90,7 @@ class Ledger:
         self._cycle: _OpenCycle | None = None
         self._cash: Decimal = opening_cash
         self._qty: Decimal = _ZERO
+        self._seen_client_order_ids: set[str] = set()
 
     # -- read side -------------------------------------------------------------------------
 
@@ -129,7 +130,14 @@ class Ledger:
     # -- write side ------------------------------------------------------------------------
 
     def record(self, fill: Fill, quote_asset: str) -> LedgerEntry:
-        """Book ``fill``. Refuses anything that would make cash negative or the position short."""
+        """Book ``fill``. Refuses anything that would make cash negative or the position short, and
+        refuses a ``client_order_id`` already booked (MINOR fix, review round 2): the ledger has no
+        separate fill id, and this ``SimulatedBroker`` fills a MARKET order exactly once, so a repeat
+        ``client_order_id`` can only mean a caller replayed a fill or double-booked one -- never a
+        legitimate second partial fill here. A live broker with real partial fills needs its own,
+        finer-grained fill id before it can reuse this ledger; raising is the safe default until then."""
+        if fill.client_order_id in self._seen_client_order_ids:
+            raise LedgerError(f"client_order_id {fill.client_order_id!r} was already booked (duplicate fill)")
         if fill.fee_asset != quote_asset:
             raise LedgerError(f"only quote-asset fees are supported, got fee_asset={fill.fee_asset!r}")
         notional = fill.price * fill.quantity
@@ -158,6 +166,7 @@ class Ledger:
             qty_after=qty_after,
         )
         self._entries.append(entry)
+        self._seen_client_order_ids.add(fill.client_order_id)
         self._cash, self._qty = cash_after, qty_after
         self._update_cycle(entry)
         return entry

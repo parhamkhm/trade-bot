@@ -19,7 +19,7 @@ from tbot.backtest.metrics import (
     sortino_ratio,
     trade_stats,
 )
-from tbot.core.types import Timeframe
+from tbot.core.types import BarWindow, RegimeState, Timeframe
 from tests.backtest.helpers import Scripted, make_config
 from tests.backtest.test_engine import five_bars
 from tests.sim_helpers import bars_from_closes
@@ -96,7 +96,8 @@ def test_compute_metrics_on_the_five_bar_example() -> None:
     assert m.cagr == pytest.approx((eq[-1] / eq[0]) ** (365 / 4) - 1)
     assert m.max_drawdown == pytest.approx(1 - 9357.475 / 10924.75)
     assert m.max_dd_duration_bars == 3
-    assert m.cagr is not None and m.calmar == pytest.approx(m.cagr / m.max_drawdown)
+    assert m.cagr is not None and m.max_drawdown is not None
+    assert m.calmar == pytest.approx(m.cagr / m.max_drawdown)
     assert m.n_fills == 3
     assert m.fees_paid == pytest.approx(66.4270972275)
     assert m.slippage_cost == pytest.approx(132.4298955)
@@ -130,6 +131,25 @@ def test_metrics_start_at_the_first_decision_bar() -> None:
     assert m.start_equity == 10000.0  # nothing was held before the first decision
 
 
+def test_metrics_are_none_not_a_silent_full_curve_when_no_decision_was_made() -> None:
+    """MINOR fix (review round 2): a run that never gets past warm-up used to fall back to
+    ``first_decision_index or 0``, silently measuring the whole equity curve (flat, undecided) as if it
+    were a real result. It must now report every window-dependent metric as ``None``."""
+    bars = bars_from_closes([100, 101, 102])
+    res = run_backtest(BacktestFeed(bars), Scripted([1.0], warmup_bars=10), make_config(fee="0", slip="0"))
+    assert res.first_decision_index is None
+    m = compute_metrics(res)
+    assert m.n_periods == 0 and m.n_fills == 0
+    assert m.start_equity is None and m.end_equity is None and m.total_return is None
+    assert m.cagr is None and m.vol is None and m.sharpe is None and m.sortino is None
+    assert m.max_drawdown is None and m.max_dd_duration_bars is None and m.calmar is None
+    assert m.time_in_market is None and m.avg_exposure is None
+    assert m.turnover_sides_per_year is None and m.turnover_notional_per_year is None
+    assert m.cost_drag_annual is None
+    assert m.fees_paid == 0.0 and m.slippage_cost == 0.0
+    assert m.trades.n_trades == 0 and m.trades.win_rate is None
+
+
 def test_vol_match_weight() -> None:
     assert vol_match_weight(0.5, 1.0) == (0.5, False)
     assert vol_match_weight(2.0, 1.0) == (1.0, True)
@@ -155,6 +175,33 @@ def test_benchmarks_share_bars_costs_and_start() -> None:
     assert 0.0 < bench.vol_match_weight < 1.0 and not bench.capped
     assert vm.vol < bh.vol
     assert vm.vol == pytest.approx(s.vol, rel=0.25)  # same volatility up to drift and rounding
+
+
+def test_benchmarks_align_to_the_regime_warmup_when_it_is_longer() -> None:
+    """MINOR fix: benchmarks used to align only to ``strategy.warmup_bars``; with a regime overlay whose
+    warm-up is longer, that shifted the benchmark's first decision earlier than the strategy's own
+    (engine-enforced) first decision, so the comparison window was no longer the same bars."""
+
+    class SlowRegime:
+        warmup_bars = 5
+
+        def update(self, window: BarWindow) -> RegimeState:
+            return RegimeState(window.as_of, 1.0, "always on")
+
+    bars = bars_from_closes([100, 101, 102, 103, 104, 105, 106])
+    cfg = make_config(fee="0", slip="0")
+    strat = Scripted([1.0], warmup_bars=2)  # shorter than the regime's warm-up
+    regime = SlowRegime()
+    res = run_backtest(BacktestFeed(bars), strat, cfg, regime=regime)
+    assert res.first_decision_index == 4  # max(2, 5) - 1
+
+    feed = BacktestFeed(bars)
+    bench = run_benchmarks(feed, strat, cfg, res, regime=regime)
+    assert bench.buy_and_hold.first_decision_index == res.first_decision_index
+    assert bench.vol_matched.first_decision_index == res.first_decision_index
+    # without passing regime=, the benchmark aligns to warmup_bars=2 and decides two bars too early
+    no_regime_bench = run_benchmarks(feed, strat, cfg, res)
+    assert no_regime_bench.buy_and_hold.first_decision_index == 1  # strategy.warmup_bars - 1
 
 
 def test_buy_and_hold_benchmark_matches_a_manual_calculation() -> None:

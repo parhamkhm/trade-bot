@@ -123,6 +123,20 @@ def test_ledger_replay_matches_running_state() -> None:
     assert p.ledger.traded_notional == sum((e.notional for e in p.ledger.entries), Dec(0))
 
 
+def test_ledger_rejects_a_duplicate_client_order_id() -> None:
+    """MINOR fix (review round 2): a repeat ``client_order_id`` can only be a replayed/double-booked
+    fill in this engine (a MARKET order fills exactly once), so ``record`` raises rather than silently
+    booking it twice. A failed (raising) call must not itself count as "seen"."""
+    p = make("1000")
+    p.apply_fill(fill(Side.BUY, "10", "1", "0", n=0))
+    with pytest.raises(LedgerError, match="o0"):
+        p.apply_fill(fill(Side.BUY, "10", "1", "0", n=0))
+    assert len(p.ledger.entries) == 1
+    with pytest.raises(LedgerError, match="o0"):
+        p.apply_fill(fill(Side.SELL, "999999", "1", "0", n=0))  # even an otherwise-invalid repeat
+    assert len(p.ledger.entries) == 1 and p.quantity == Dec("1")
+
+
 def test_ledger_rejects_invalid_opening_cash() -> None:
     with pytest.raises(ValueError):
         Ledger(Dec("-1"))

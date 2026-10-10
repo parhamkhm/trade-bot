@@ -38,7 +38,13 @@ _ZERO = Decimal(0)
 
 
 class StubRiskManager:
-    """Deterministic stand-in implementing the ``RiskManager`` protocol (see module docstring)."""
+    """Deterministic stand-in implementing the ``RiskManager`` protocol (see module docstring).
+
+    ``client_order_id`` scheme (``{id_prefix}-{seq:06d}``, a per-instance in-memory counter) is
+    BACKTEST-ONLY. It has no meaning across process restarts and gives no idempotency guarantee for a
+    live OMS, which must generate and persist its own ids (CLAUDE.md section 3.6: "every order carries
+    a unique client_order_id; on timeout, query by that ID"). Do not reuse this id scheme in `live/`.
+    """
 
     def __init__(
         self,

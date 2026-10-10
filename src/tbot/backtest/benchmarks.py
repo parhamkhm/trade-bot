@@ -1,8 +1,12 @@
 """Buy-and-hold and vol-matched buy-and-hold benchmarks.
 
 Both benchmarks run through the SAME engine, broker, fees, slippage, filters and fill model as the strategy
-(no vectorised shortcut), and start deciding at the same bar (``warmup_bars`` of the strategy), so every
-number in a report is measured on identical bars with identical costs.
+(no vectorised shortcut), and start deciding at the same bar as the engine's own effective warm-up --
+``max(strategy.warmup_bars, regime.warmup_bars)`` when a regime overlay is used, via
+``tbot.backtest.engine.effective_warmup_bars`` (MINOR fix: aligning to ``strategy.warmup_bars`` alone used
+to shift the benchmarks' start bar away from the strategy-under-test's actual first decision whenever a
+regime overlay had a longer warm-up). Every number in a report is measured on identical bars with
+identical costs.
 
 Vol-matched buy-and-hold holds a constant weight ``w = min(1, strategy_vol / buy_and_hold_vol)``, i.e. it
 scales buy-and-hold DOWN to the strategy's realised volatility (long-only, no leverage: if the strategy is
@@ -17,10 +21,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from tbot.backtest.config import BacktestConfig
-from tbot.backtest.engine import run_backtest
+from tbot.backtest.engine import effective_warmup_bars, run_backtest
 from tbot.backtest.metrics import compute_metrics
 from tbot.backtest.result import BacktestResult
-from tbot.core.types import DataFeed, Strategy
+from tbot.core.types import DataFeed, RegimeModel, Strategy
 from tbot.strategies.buy_and_hold import BuyAndHold
 
 __all__ = ["BenchmarkSet", "run_benchmarks", "vol_match_weight"]
@@ -48,11 +52,13 @@ def run_benchmarks(
     config: BacktestConfig,
     strategy_result: BacktestResult,
     *,
+    regime: RegimeModel | None = None,
     exec_feed: DataFeed | None = None,
 ) -> BenchmarkSet:
-    bh = run_backtest(feed, BuyAndHold(warmup_bars=strategy.warmup_bars), config, exec_feed=exec_feed)
+    """``regime`` is used only to compute the shared warm-up (see the module docstring); the regime
+    overlay itself is never applied to the benchmarks -- buy-and-hold stays an unscaled baseline."""
+    warmup = effective_warmup_bars(strategy, regime)
+    bh = run_backtest(feed, BuyAndHold(warmup_bars=warmup), config, exec_feed=exec_feed)
     weight, capped = vol_match_weight(compute_metrics(strategy_result).vol, compute_metrics(bh).vol)
-    vm = run_backtest(
-        feed, BuyAndHold(weight=weight, warmup_bars=strategy.warmup_bars), config, exec_feed=exec_feed
-    )
+    vm = run_backtest(feed, BuyAndHold(weight=weight, warmup_bars=warmup), config, exec_feed=exec_feed)
     return BenchmarkSet(bh, vm, weight, capped)

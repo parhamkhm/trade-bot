@@ -3,19 +3,22 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
 from scripts import run_backtest as cli
 from tbot.backtest.benchmarks import run_benchmarks
+from tbot.backtest.config import BacktestConfig
 from tbot.backtest.engine import run_backtest
 from tbot.backtest.feed import BacktestFeed
-from tbot.backtest.report import build_report, render_markdown
+from tbot.backtest.report import build_report, is_run_invalid, render_markdown
+from tbot.core.config import CostConfig
 from tbot.core.types import Bar, Timeframe
 from tests.backtest.helpers import Scripted, make_config
 from tests.backtest.test_engine import five_bars
-from tests.sim_helpers import bars_from_closes
+from tests.sim_helpers import SYMBOL, bars_from_closes, lbank_like_filters, make_bar
 
 
 def test_report_dict_is_json_serialisable_and_complete() -> None:
@@ -62,3 +65,87 @@ def test_cli_end_to_end_on_synthetic_bars(
 def test_cli_rejects_unknown_strategy_name() -> None:
     with pytest.raises(ValueError, match="unknown strategy"):
         cli.make_strategy("nope", 5)
+
+
+# ---------------------------------------------------------------------------------------------
+# MAJOR 2 (review round 2): provisional-slippage flag
+# ---------------------------------------------------------------------------------------------
+
+
+def _config_with_slippage_provisional(provisional: bool, **kwargs: object) -> BacktestConfig:
+    return BacktestConfig(
+        symbol=SYMBOL,
+        timeframe=Timeframe.D1,
+        filters=lbank_like_filters(),
+        costs=CostConfig(
+            taker_fee_bps=Decimal("10"), maker_fee_bps=Decimal("10"), slippage_bps=Decimal("5"),
+            slippage_provisional=provisional,
+        ),
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+
+def test_provisional_slippage_is_flagged_by_default_and_clears_when_measured() -> None:
+    res_provisional = run_backtest(
+        BacktestFeed(five_bars()), Scripted([0.0]), _config_with_slippage_provisional(True)
+    )
+    report = build_report(res_provisional)
+    assert report["costs"]["slippage_provisional"] is True
+    assert any("PROVISIONAL" in c for c in report["caveats"])
+    text = render_markdown(report)
+    assert "PROVISIONAL SLIPPAGE" in text
+
+    res_measured = run_backtest(
+        BacktestFeed(five_bars()), Scripted([0.0]), _config_with_slippage_provisional(False)
+    )
+    measured_report = build_report(res_measured)
+    assert measured_report["costs"]["slippage_provisional"] is False
+    assert not any("PROVISIONAL" in c for c in measured_report["caveats"])
+    assert "PROVISIONAL SLIPPAGE" not in render_markdown(measured_report)
+
+
+# ---------------------------------------------------------------------------------------------
+# MAJOR 3 (review round 2): invalid-run warning and the CLI's non-zero exit
+# ---------------------------------------------------------------------------------------------
+
+
+def test_invalid_run_warning_on_fill_rejections_and_markdown_block() -> None:
+    # sized at close(0)=1000 (ample notional there); bar1 gaps down to an open of 0.0001, so the fill
+    # price collapses and the SAME quantity's notional falls below min_notional only at fill time --
+    # a genuine broker-level rejection, not the risk manager's own (pre-submission) refusal.
+    bars = [make_bar(0, "1000", "1000"), make_bar(1, "0.0001", "0.0001")]
+    res = run_backtest(BacktestFeed(bars), Scripted([1.0]), make_config())
+    assert res.rejections != () and "MIN_NOTIONAL" in res.rejections[0].reason
+    report = build_report(res)
+    assert is_run_invalid(report)
+    assert report["health"]["issues"] != []
+    assert any("rejected" in issue for issue in report["health"]["issues"])
+    assert "INVALID RUN WARNING" in render_markdown(report)
+
+
+def test_clean_run_has_no_issues_and_is_not_flagged_invalid() -> None:
+    res = run_backtest(BacktestFeed(five_bars()), Scripted([0.5, 0.55, 0.0, 0.4, 0.4]), make_config())
+    report = build_report(res)
+    assert report["health"]["issues"] == [] and not is_run_invalid(report)
+    assert "INVALID RUN WARNING" not in render_markdown(report)
+
+
+def test_cli_exits_non_zero_on_an_invalid_run(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # same gap-down construction as the engine-level test above, reached end-to-end through the CLI.
+    bars = [make_bar(0, "1000", "1000"), make_bar(1, "0.0001", "0.0001")]
+
+    def fake_load(symbol: str, timeframe: Timeframe, **_: object) -> list[Bar]:
+        return bars
+
+    monkeypatch.setattr(cli, "load_bars", fake_load)
+    code = cli.main(["--strategy", "buy_and_hold"])
+    assert code == 3
+    assert "INVALID RUN WARNING" in capsys.readouterr().out
+
+
+def test_cli_exits_zero_on_a_clean_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    closes = [100.0 + (i % 7) * 3 + i for i in range(40)]
+    monkeypatch.setattr(cli, "load_bars", lambda *_a, **_k: bars_from_closes(closes))
+    assert cli.main(["--strategy", "buy_and_hold"]) == 0

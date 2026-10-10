@@ -18,6 +18,14 @@ Conventions (fixed here so reports are comparable):
   / years.
 * The comparison window starts at the close of the first decision bar (``first_decision_index``), so the
   strategy and its benchmarks are measured over the same bars (the warm-up is excluded).
+* If no decision was ever made (``first_decision_index is None`` -- the run never got past warm-up),
+  every metric that would otherwise describe that non-existent window is ``None``: ``start_equity``,
+  ``end_equity``, ``total_return``, ``max_drawdown``, ``max_dd_duration_bars``, ``time_in_market`` and
+  ``avg_exposure`` included. A silent ``first_decision_index or 0`` used to fall back to measuring the
+  WHOLE equity curve (warm-up included) in that case, which can look like a real, decided result when
+  the strategy never got a chance to act -- the simple counts (``n_periods=0``, ``n_fills=0``,
+  ``fees_paid=0.0``, an empty ``TradeStats``) stay as plain, well-defined zeros, since those are true
+  statements about an empty window rather than an undefined ratio.
 """
 
 from __future__ import annotations
@@ -147,18 +155,18 @@ def trade_stats(trades: Sequence[TradeRecord]) -> TradeStats:
 class Metrics:
     n_periods: int
     periods_per_year: float
-    start_equity: float
-    end_equity: float
-    total_return: float
+    start_equity: float | None
+    end_equity: float | None
+    total_return: float | None
     cagr: float | None
     vol: float | None
     sharpe: float | None
     sortino: float | None
-    max_drawdown: float
-    max_dd_duration_bars: int
+    max_drawdown: float | None
+    max_dd_duration_bars: int | None
     calmar: float | None
-    time_in_market: float
-    avg_exposure: float
+    time_in_market: float | None
+    avg_exposure: float | None
     n_fills: int
     turnover_sides_per_year: float | None
     turnover_notional_per_year: float | None
@@ -172,12 +180,46 @@ def _safe_div(a: float, b: float) -> float | None:
     return None if b == 0.0 else a / b
 
 
+def _no_decision_metrics(ppy: float) -> Metrics:
+    """The run never got past warm-up: every metric over the (non-existent) decision window is
+    ``None``, never a silent full-curve fallback (see the module docstring)."""
+    return Metrics(
+        n_periods=0,
+        periods_per_year=ppy,
+        start_equity=None,
+        end_equity=None,
+        total_return=None,
+        cagr=None,
+        vol=None,
+        sharpe=None,
+        sortino=None,
+        max_drawdown=None,
+        max_dd_duration_bars=None,
+        calmar=None,
+        time_in_market=None,
+        avg_exposure=None,
+        n_fills=0,
+        turnover_sides_per_year=None,
+        turnover_notional_per_year=None,
+        fees_paid=0.0,
+        slippage_cost=0.0,
+        cost_drag_annual=None,
+        trades=trade_stats(()),
+    )
+
+
 def compute_metrics(result: BacktestResult) -> Metrics:
-    """Metrics for ``result`` over the window that starts at the close of the first decision bar."""
-    start = result.first_decision_index or 0
+    """Metrics for ``result`` over the window that starts at the close of the first decision bar.
+
+    Returns an all-``None`` (bar the plain-zero counts) :class:`Metrics` when
+    ``result.first_decision_index is None`` -- see the module docstring.
+    """
+    ppy = result.config.timeframe.periods_per_year
+    if result.first_decision_index is None:
+        return _no_decision_metrics(ppy)
+    start = result.first_decision_index
     window = result.equity[start:]
     equity = [float(p.equity) for p in window]
-    ppy = result.config.timeframe.periods_per_year
     rets = returns_from_equity(equity)
     n = len(rets)
     years = n / ppy if n else 0.0
