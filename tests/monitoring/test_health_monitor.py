@@ -399,6 +399,56 @@ def test_container_and_stream_problems_share_one_key_and_never_falsely_clear_eac
     assert [(e.kind, e.key) for e in monitor.run_cycle()] == [("resolved", "recorder:lbank")]
 
 
+def test_confirm_cycles_requires_consecutive_bad_cycles_before_alerting(
+    host: Host, tmp_path: Path, clock: Clock
+) -> None:
+    monitor = make_monitor(make_settings(tmp_path, confirm_cycles=3), host, Outbox())
+    host.states["tbot-lbank-recorder"] = container_state(Status="exited", ExitCode=1)
+    assert monitor.run_cycle() == []  # bad cycle 1 of 3: not yet
+    clock.advance(minutes=1)
+    assert monitor.run_cycle() == []  # bad cycle 2 of 3: still not yet
+    clock.advance(minutes=1)
+    assert [e.kind for e in monitor.run_cycle()] == ["alert"]  # bad cycle 3 of 3: now it alerts
+
+
+def test_confirm_cycles_streak_resets_on_a_good_cycle(host: Host, tmp_path: Path, clock: Clock) -> None:
+    monitor = make_monitor(make_settings(tmp_path, confirm_cycles=2), host, Outbox())
+    host.states["tbot-lbank-recorder"] = container_state(Status="exited", ExitCode=1)
+    assert monitor.run_cycle() == []  # bad cycle 1 of 2
+    host.states["tbot-lbank-recorder"] = container_state()  # a good cycle breaks the streak
+    clock.advance(minutes=1)
+    assert monitor.run_cycle() == []
+    host.states["tbot-lbank-recorder"] = container_state(Status="exited", ExitCode=1)
+    clock.advance(minutes=1)
+    assert monitor.run_cycle() == []  # bad again, but this is only cycle 1 of a NEW streak
+    clock.advance(minutes=1)
+    assert [e.kind for e in monitor.run_cycle()] == ["alert"]  # cycle 2 of the new streak
+
+
+def test_docker_down_freezes_an_open_recorder_alert_instead_of_resolving_it(
+    host: Host, tmp_path: Path, clock: Clock
+) -> None:
+    """Review MAJOR 2: when a whole check fails (docker unreachable), every alert it owns must stay
+    open -- the monitor cannot tell if the underlying problem cleared, so it must not claim it did."""
+    settings = make_settings(tmp_path, confirm_cycles=1)
+    monitor = make_monitor(settings, host, Outbox())
+    host.states["tbot-lbank-recorder"] = container_state(Status="exited", ExitCode=1)
+    assert [e.kind for e in monitor.run_cycle()] == ["alert"]
+
+    host.docker_down = True
+    for _ in range(3):  # however long docker stays down, the open alert is neither resolved nor repeated
+        clock.advance(hours=1)
+        events = monitor.run_cycle()
+        assert "recorder:lbank" not in {e.key for e in events if e.kind == "resolved"}
+
+    host.docker_down = False
+    host.states["tbot-lbank-recorder"] = container_state()  # healthy again once docker answers
+    clock.advance(minutes=1)
+    assert monitor.run_cycle() == []  # resolve_cycles=2: first clean cycle
+    clock.advance(minutes=1)
+    assert ("resolved", "recorder:lbank") in [(e.kind, e.key) for e in monitor.run_cycle()]
+
+
 # ---------------------------------------------------------------------------------------------
 # Class 1: stale or erroring stream (independent heartbeat read)
 # ---------------------------------------------------------------------------------------------
