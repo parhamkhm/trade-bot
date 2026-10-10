@@ -53,9 +53,9 @@ class RuntimeConfig(_Base):
 class CostConfig(_Base):
     """Fees and slippage applied in every backtest (CLAUDE.md section 3.4)."""
 
-    taker_fee_bps: Decimal = Decimal("35")  # Tabdeal tier 1, D-047
-    maker_fee_bps: Decimal = Decimal("33")
-    slippage_bps: Decimal = Decimal("5")
+    taker_fee_bps: Decimal = Decimal("10")  # LBank spot VIP 0, verified 2026-10-10, D-060
+    maker_fee_bps: Decimal = Decimal("10")
+    slippage_bps: Decimal = Decimal("5")  # provisional until the LBank G0 probe measures it (D-060)
 
     @field_validator("taker_fee_bps", "maker_fee_bps", "slippage_bps")
     @classmethod
