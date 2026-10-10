@@ -7,6 +7,7 @@ scientific error, not a convenience.
 | # | date (UTC) | phase | strategy / variant | parameters | data range | timeframe | symbol | result (raw numbers) | notes |
 |---|---|---|---|---|---|---|---|---|---|
 | — | — | — | — | — | — | — | — | — | no experiments yet (phase 0–1) |
+| S0 | 2026-10-10 | lock | S0 `sma100_1d` (SMA100 filter, σ̂ vol-target 30 %, fixed 3×ATR20 stop) | fixed in SPEC §7.1, D-063; no search | not yet run | 1d | BTCUSDT | none — registration only, no result computed | locked by Parham before any phase-3 result; lock content first committed in `8736334`; counts as one trial, never selected or tuned; robustness variants (SMA 50/75/150/200, vol target 20 %/40 %) are checks of S0, not extra candidates |
 
 Non-trial computations (no return / Sharpe / drawdown computed, so not counted):
 
