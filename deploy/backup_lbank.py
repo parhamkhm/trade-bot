@@ -33,26 +33,36 @@ conflict and both files are kept. Files named like a day but with an invalid dat
 ``lbank-2026-02-30.sqlite``) are skipped and reported; they never stop the other days.
 
 **One run at a time**: an exclusive non-blocking lock on ``<dest-dir>/.lock`` (``flock``; ``msvcrt``
-on Windows). A second instance does nothing destructive and exits 3. All temp files have unique
-names (pid + random) and are moved into place with an atomic rename.
+on Windows). The holder writes ``"<pid> <start epoch>"`` into the file. A second instance does
+nothing destructive and exits 3 -- unless the holder is dead (the lock is taken over and the run
+proceeds) or has been running longer than ``STUCK_AFTER_S`` = 1800 s = ``TimeoutStartSec`` (then
+exit 4, which systemd does NOT treat as success, so the unit fails visibly). All temp files have
+unique names (pid + random) and are moved into place with an atomic rename.
 
 Exit codes: 0 ok, 1 an operation failed, 2 an integrity/verification check failed (corrupt database or
-archive), 3 another run holds the lock. One JSON line per run on stdout (stderr when not ok).
+archive), 3 another (healthy, recent) run holds the lock, 4 the lock holder is stuck or cannot be
+replaced. One JSON line per run on stdout (stderr when not ok).
 
-``<dest-dir>/status.json`` contract (rewritten atomically at the end of every run except exit 3,
-mode 0644, read by the health monitor)::
+``<dest-dir>/status.json`` contract (written atomically, mode 0644, read by the health monitor).
+It is written **twice per run** (never on exit 3 or 4: the holder owns it): first at the start with
+``in_progress=true, ok=false`` so a run that is killed (SIGTERM / timeout / power loss) leaves a
+visible non-ok status instead of the previous night's OK, then replaced at the end::
 
     {
-      "ts": "2026-10-12T02:41:07.123456+00:00",   # ISO-8601 UTC, end of this run
-      "ok": true,                                  # exit_code == 0
-      "exit_code": 0,                              # 0 ok | 1 failed | 2 corrupt/integrity | (3 never written)
+      "ts": "2026-10-12T02:41:07.123456+00:00",   # ISO-8601 UTC, end of this run (start while in progress)
+      "ok": true,                                  # exit_code == 0 (always false while in progress)
+      "in_progress": false,                        # true only between the start write and the final write
+      "started_ts": "2026-10-12T02:40:01.5+00:00", # ISO-8601 UTC: start of this run
+      "exit_code": 0,                              # 0 ok | 1 failed | 2 corrupt/integrity | null in progress
       "days_archived": ["2026-10-11"],             # days archived or finished during this run
       "days_pending": [],                          # closed days still not archived+backed up (source kept)
       "message": "ok: archived 1, copied 1, skipped 0",   # or the failures, "; "-joined, <= 2000 chars
       "integrity_ok": true                         # false if any integrity check failed; null if none ran
     }
 
-A monitor should alert when ``ok`` is false, ``days_pending`` is non-empty, or ``ts`` is older than
+``in_progress`` and ``started_ts`` are additions; the other keys are unchanged. A monitor should
+alert when ``ok`` is false (but tolerate ``in_progress=true`` for up to 1800 s after ``started_ts``;
+beyond that the run was killed or is stuck), ``days_pending`` is non-empty, or ``ts`` is older than
 ~26 h (the run did not happen).
 """
 
@@ -84,7 +94,8 @@ else:
 
 _NAME_RE = re.compile(r"^lbank-(\d{4}-\d{2}-\d{2})\.sqlite$")
 GRACE = timedelta(hours=2)
-EXIT_OK, EXIT_FAILED, EXIT_CORRUPT, EXIT_LOCKED = 0, 1, 2, 3
+EXIT_OK, EXIT_FAILED, EXIT_CORRUPT, EXIT_LOCKED, EXIT_STUCK = 0, 1, 2, 3, 4
+STUCK_AFTER_S = 1800.0  # = TimeoutStartSec of tbot-lbank-backup.service
 _MESSAGE_MAX = 2000
 
 
@@ -188,8 +199,58 @@ def _sha256(path: Path) -> str:
 # --- run lock ----------------------------------------------------------------------------------
 
 
+_LOCK_OFFSET = 1 << 20  # Windows: lock one byte far beyond the holder text so that text stays readable
+
+
+def _epoch() -> float:
+    return time.time()
+
+
+@dataclass(frozen=True)
+class Holder:
+    """Who wrote the lock file last: the process id and its start time (epoch seconds)."""
+
+    pid: int
+    started: float
+
+
+def read_holder(path: Path) -> Holder | None:
+    """The holder recorded in the lock file, or ``None`` if it is missing, empty or unreadable."""
+    try:
+        pid_text, start_text = path.read_text(encoding="ascii").split()[:2]
+        holder = Holder(int(pid_text), float(start_text))
+    except (OSError, ValueError, UnicodeError):
+        return None
+    return holder if holder.pid > 0 else None
+
+
+def _pid_alive(pid: int) -> bool:
+    if sys.platform == "win32":  # os.kill would TERMINATE the process on Windows
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            return bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(code))) and code.value == 259
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 class RunLock:
-    """Exclusive, non-blocking, process-lifetime lock on a file (released when the process dies)."""
+    """Exclusive, non-blocking, process-lifetime lock on a file (released when the process dies).
+
+    The holder writes ``"<pid> <start epoch>"`` into the file so a second run can tell a healthy
+    holder from a dead or stuck one (see ``run``)."""
 
     def __init__(self, path: Path) -> None:
         self._path = path
@@ -199,7 +260,7 @@ class RunLock:
         fh = self._path.open("a+b")
         try:
             if sys.platform == "win32":
-                fh.seek(0)
+                fh.seek(_LOCK_OFFSET)
                 msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
             else:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -207,14 +268,27 @@ class RunLock:
             fh.close()
             return False
         self._fh = fh
+        with contextlib.suppress(OSError):  # best effort: the lock itself is what protects the run
+            fh.truncate(0)
+            fh.write(f"{os.getpid()} {_epoch():.3f}\n".encode("ascii"))
+            fh.flush()
         return True
+
+    def take_over(self) -> bool:
+        """The recorded holder is dead but the lock is still held (an orphaned descendant kept the
+        descriptor): drop the file so a fresh one (new inode) can be locked."""
+        try:
+            self._path.unlink()
+        except OSError:
+            return False
+        return self.acquire()
 
     def release(self) -> None:
         if self._fh is None:
             return
         with contextlib.suppress(OSError):
             if sys.platform == "win32":
-                self._fh.seek(0)
+                self._fh.seek(_LOCK_OFFSET)
                 msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
             else:
                 fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
@@ -493,15 +567,25 @@ def _resume(
     if is_closed(source, now) and resume_or_conflict(source, archive, dest_dir, staging, codec):
         out.archived.append(archive.name)
     else:
-        out.failed.append(f"{source.name}: conflict, archive {archive.name} already exists; both kept")
+        raise BackupError(f"{source.name}: conflict, archive {archive.name} already exists; both kept")
+
+
+def _dest_is_current_copy(source: Path, dest: Path, source_counts: dict[str, int]) -> bool:
+    """True only if ``dest`` is a readable copy with the source's exact row counts. A missing, stale,
+    truncated or corrupt ``dest`` (any error reading it) simply means it must be copied again."""
+    try:
+        return not _needs_copy(source, dest) and _source_counts(dest) == source_counts
+    except (sqlite3.Error, OSError, IntegrityError):
+        return False
 
 
 def _safeguard(source: Path, dest_dir: Path, out: Summary) -> None:
-    """Archiving a closed day failed: make sure a full, verified plain copy of it is in ``dest_dir``."""
+    """Archiving (or resuming) a closed day failed: make sure a full, verified plain copy of it is in
+    ``dest_dir``."""
     dest = dest_dir / source.name
 
     def full_copy() -> None:
-        if _needs_copy(source, dest) or _source_counts(dest) != _source_counts(source):
+        if not _dest_is_current_copy(source, dest, _source_counts(source)):
             publish_snapshot(source, dest, require_complete=True)
         out.copied.append(f"{source.name} (full copy, archive failed)")
 
@@ -525,7 +609,8 @@ def _handle_day(
         out.copied.append(source.name)
 
     if archive.exists():
-        out.attempt(source.name, resume)
+        if not out.attempt(source.name, resume):  # failed or conflict: the data must still be backed up
+            _safeguard(source, dest_dir, out)
     elif is_closed(source, now):
         if not out.attempt(source.name, archive_it):
             _safeguard(source, dest_dir, out)
@@ -600,21 +685,73 @@ def _process(source_dir: Path, dest_dir: Path, codec: Codec, now: datetime, out:
             continue
         _handle_day(source, dest_dir, staging, codec, now, out)
     for archive in sorted(source_dir.glob(f"lbank-*.sqlite{codec.suffix}")):
-        if not (dest_dir / archive.name).exists():  # an earlier night's copy failed: retry it
+        plain_still_there = archive.with_name(archive.name.removesuffix(codec.suffix)).exists()
+        # An earlier night's copy failed: retry it. Not while the plain file still exists: then the
+        # archive is unverified (the resume path judges it) and must not be copied as if it were good.
+        if not plain_still_there and not (dest_dir / archive.name).exists():
             out.attempt(archive.name, partial(_copy_archive, archive, dest_dir, out))
+
+
+def _lock_busy(lock: RunLock, lock_path: Path) -> tuple[bool, int, str]:
+    """The lock is held. Returns ``(took_over, exit_code, message)``.
+
+    * holder pid dead (an orphan kept the descriptor): take the lock over and run;
+    * holder alive and older than ``STUCK_AFTER_S``: it is stuck, exit 4 (not a success code);
+    * otherwise a normal run is in progress: exit 3."""
+    holder = read_holder(lock_path)
+    if holder is not None and not _pid_alive(holder.pid):
+        if lock.take_over():
+            return True, EXIT_OK, f"took over the lock of dead pid {holder.pid}"
+        return (
+            False,
+            EXIT_STUCK,
+            f"lock held, recorded holder pid {holder.pid} is dead and cannot be replaced",
+        )
+    if holder is not None and _epoch() - holder.started > STUCK_AFTER_S:
+        age = int(_epoch() - holder.started)
+        return (
+            False,
+            EXIT_STUCK,
+            f"lock holder pid {holder.pid} has been running {age} s (> {int(STUCK_AFTER_S)})",
+        )
+    return False, EXIT_LOCKED, "another run holds the lock"
+
+
+def _status_payload(started_ts: str, **fields: object) -> dict[str, object]:
+    base: dict[str, object] = {
+        "ts": datetime.now(UTC).isoformat(),
+        "ok": False,
+        "in_progress": False,
+        "started_ts": started_ts,
+        "exit_code": None,
+        "days_archived": [],
+        "days_pending": [],
+        "message": "",
+        "integrity_ok": None,
+    }
+    return {**base, **fields}
 
 
 def run(source_dir: Path, dest_dir: Path, *, codec: Codec | None = None, now: datetime | None = None) -> int:
     codec = codec or ZstdCli()
     now = now or datetime.now(UTC)
     dest_dir.mkdir(parents=True, exist_ok=True)
-    lock = RunLock(dest_dir / ".lock")
+    lock_path = dest_dir / ".lock"
+    lock = RunLock(lock_path)
     if not lock.acquire():
-        line = {"event": "lbank_backup", "exit_code": EXIT_LOCKED, "message": "another run holds the lock"}
+        took_over, code, message = _lock_busy(lock, lock_path)
+        line = {"event": "lbank_backup", "exit_code": code, "message": message}
         print(json.dumps(line), file=sys.stderr)
-        return EXIT_LOCKED  # status.json is deliberately left as the other run wrote it
+        if not took_over:
+            return code  # status.json is left as the holder wrote it (in_progress, ok=false)
     try:
         started, out = time.monotonic(), Summary()
+        started_ts = datetime.now(UTC).isoformat()
+        # A run that is killed or times out must not leave the previous night's OK behind.
+        _write_status(
+            dest_dir,
+            _status_payload(started_ts, ts=started_ts, in_progress=True, message="run in progress"),
+        )
         pending: list[str] = []
         try:
             _process(source_dir, dest_dir, codec, now, out)
@@ -625,15 +762,15 @@ def run(source_dir: Path, dest_dir: Path, *, codec: Codec | None = None, now: da
         integrity_ok = False if out.corrupt else (True if (out.archived or out.copied) else None)
         _write_status(
             dest_dir,
-            {
-                "ts": datetime.now(UTC).isoformat(),
-                "ok": code == EXIT_OK,
-                "exit_code": code,
-                "days_archived": sorted(n.removeprefix("lbank-")[:10] for n in out.archived),
-                "days_pending": pending,
-                "message": _message(out, code),
-                "integrity_ok": integrity_ok,
-            },
+            _status_payload(
+                started_ts,
+                ok=code == EXIT_OK,
+                exit_code=code,
+                days_archived=sorted(n.removeprefix("lbank-")[:10] for n in out.archived),
+                days_pending=pending,
+                message=_message(out, code),
+                integrity_ok=integrity_ok,
+            ),
         )
         summary = {"event": "lbank_backup", **out.__dict__, "seconds": round(time.monotonic() - started, 2)}
         print(json.dumps(summary), file=sys.stdout if code == EXIT_OK else sys.stderr)

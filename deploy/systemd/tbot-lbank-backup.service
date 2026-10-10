@@ -19,5 +19,8 @@ WorkingDirectory=/opt/tbot/lbank-run
 ExecStart=/bin/sh -c 'VOL=$(docker volume inspect tbot-lbank-data --format "{{ .Mountpoint }}") && exec /usr/bin/python3 /opt/tbot/lbank-run/deploy/backup_lbank.py --source-dir "$VOL/lbank" --dest-dir /var/backups/tbot/lbank'
 TimeoutStartSec=1800
 # Exit codes of backup_lbank.py: 0 ok, 1 failed (see status.json), 2 corrupt / failed integrity check,
-# 3 another run holds the lock (nothing was touched; not a failure of this unit).
+# 3 another (healthy, younger than TimeoutStartSec) run holds the lock (nothing was touched; not a
+# failure of this unit). 4 is deliberately NOT listed: the lock holder is stuck (older than
+# TimeoutStartSec = STUCK_AFTER_S in backup_lbank.py) or cannot be replaced, so the unit must fail.
+# A run killed by this timeout leaves status.json with ok=false, in_progress=true.
 SuccessExitStatus=3

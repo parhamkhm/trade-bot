@@ -1012,16 +1012,32 @@ https://github.com/facebook/zstd/releases), then open the `.sqlite` with any SQL
 
 ### 18.5 Backup status file (`/var/backups/tbot/lbank/status.json`)
 
-Every backup run (except one that finds the lock held) rewrites this file atomically:
+Every backup run writes this file atomically **twice**: at the start (`in_progress: true`,
+`ok: false`, `exit_code: null`, so a run that is killed or times out never leaves last night's OK
+behind) and again at the end. A run that finds the lock held writes nothing (the holder owns it).
 
 ```json
-{"ts": "2026-10-12T02:40:31+00:00", "ok": true, "exit_code": 0, "days_archived": ["2026-10-11"],
+{"ts": "2026-10-12T02:40:31+00:00", "ok": true, "in_progress": false,
+ "started_ts": "2026-10-12T02:40:02+00:00", "exit_code": 0, "days_archived": ["2026-10-11"],
  "days_pending": [], "message": "ok", "integrity_ok": true}
 ```
 
+- `in_progress` and `started_ts` are additions (the other keys are unchanged). `ts` is the end of the
+  run (equal to `started_ts` while in progress).
 - `ok` is false and `days_pending` lists the closed days still not archived whenever archiving failed;
   the source file is then kept and a full verified copy of it sits in the backup directory.
 - Exit codes: 0 ok, 1 failed (read `message`), 2 corrupt / failed integrity check (`integrity_ok` is
-  false: look now), 3 another run holds `.lock` (nothing touched, `status.json` unchanged; the unit
-  treats 3 as success). Alert on `ok == false` or on a `ts` older than 26 h.
+  false: look now), 3 another healthy run holds `.lock` (nothing touched; the unit treats 3 as
+  success), 4 the lock holder has run longer than 1800 s (stuck) or a dead holder's lock could not be
+  replaced (the unit FAILS; `status.json` still shows the holder's `in_progress: true`). The lock file
+  contains `<pid> <start epoch>`; a holder whose pid is dead is taken over automatically.
+- Alert on `ok == false` (tolerate `in_progress: true` for 1800 s after `started_ts`; longer means the
+  run was killed or is stuck), on non-empty `days_pending`, or on a `ts` older than 26 h.
+- Timeout headroom (`TimeoutStartSec=1800`): estimated, not measured (no `zstd` binary on the dev
+  machine). A day file is about 7-10 MB compressed, so roughly 50-100 MB raw; `zstd -19` runs at about
+  3 MB/s per thread, i.e. 20-40 s per day, plus a few sha256 and decompress passes (seconds). Even
+  at 3-5x slowdown from `Nice=19` / idle I/O that is a few minutes per day, so one night plus a backlog
+  of roughly ten closed days fits. After a longer outage the run may time out part-way; it leaves
+  `in_progress: true`, finishes the rest the next night (every step is idempotent), and the alert fires.
+  Time the first real run (`journalctl -u tbot-lbank-backup`, field `seconds`) and adjust.
 - Check it with `cat /var/backups/tbot/lbank/status.json`.
