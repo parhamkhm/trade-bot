@@ -19,8 +19,12 @@ Non-negotiables (CLAUDE.md §3.8, Parham 2026-10-10):
 Trade ids are UUID strings, not increasing integers, so continuity is checked by **time**: a poll is
 continuous if its oldest trade is at or before the newest trade already stored; otherwise the poll is
 logged with ``gap = 1``. That cursor (the newest trade time) is persisted in the ``trade_cursor`` table
-of the day file every poll writes to and reloaded on start-up from today's file, or from the newest
-earlier day file, so a restart (also one across midnight UTC) still flags the hole it caused.
+of the day file every poll writes to and, atomically, in ``<data_dir>/trade_cursor.json``; it is reloaded
+on start-up from today's file, the newest earlier day file or the JSON (newest wins), so a restart (also
+one across midnight UTC, or after yesterday's file was archived and removed) still flags the hole it
+caused. ``gap = 2`` means UNKNOWN: the poll has trades but no cursor exists at all (first poll ever, or
+every source is gone), so continuity cannot be judged; ``prev_max_ts_ms`` is NULL then. (``gap`` is
+NOT NULL in day files already on disk, hence a value instead of NULL.) An empty poll has ``gap = 0``.
 Duplicates within a day file are dropped by the primary key; a trade received on both sides of
 midnight UTC can appear in two day files and is de-duplicated downstream by id.
 
@@ -39,6 +43,7 @@ millisecond or a wall-clock step backwards must never drop a raw row.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -105,7 +110,8 @@ CREATE TABLE IF NOT EXISTS trade_polls (
     max_ts_ms INTEGER,
     prev_max_ts_ms INTEGER,
     gap INTEGER NOT NULL,
-    latency_ms INTEGER NOT NULL
+    latency_ms INTEGER NOT NULL,
+    n_bad INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS klines (
     interval TEXT NOT NULL,
@@ -154,6 +160,16 @@ CREATE TABLE IF NOT EXISTS trades_unparsed (
 # Idempotent column additions for day files created by an older schema (see ``_migrate``).
 _ADDED_COLUMNS = (("trade_polls", "n_bad", "INTEGER NOT NULL DEFAULT 0"),)
 
+# Guards the connect + pragma + executescript + migrate sequence in `DayStore.conn`. Several stream
+# threads (depth, trades, funding, each kline interval) can all open or create the *same* brand-new
+# day file within the same instant, at startup or at the midnight rollover. SQLite's busy_timeout
+# retries ordinary SQLITE_BUSY waits, but creating a file and switching it to WAL for the first time
+# is not reliably covered by that retry on every platform (observed: concurrent first-opens on
+# Windows can still raise "database is locked" even with busy_timeout set first). A single
+# process-wide lock around just the bootstrap step removes the race outright; it costs nothing once
+# a day file is already open, since each `DayStore` then reuses its own connection.
+_OPEN_LOCK = threading.Lock()
+
 _INSERT_DEPTH = (
     "INSERT INTO depth_snapshots (recv_ms, server_ms, symbol, bids, asks, latency_ms)"
     " VALUES (?, ?, ?, ?, ?, ?)"
@@ -168,6 +184,11 @@ _UPSERT_CURSOR = (
 )
 _INSERT_UNPARSED = "INSERT INTO trades_unparsed (recv_ms, reason, raw) VALUES (?, ?, ?)"
 _RAW_MAX_CHARS = 4000
+_CURSOR_FILE = "trade_cursor.json"
+# trade_polls.gap values: 0 continuous (or an empty poll), 1 a hole before this poll, 2 UNKNOWN: this poll
+# has trades but no cursor was available (first poll ever, or the cursor and every day file are gone).
+# The column is NOT NULL in files already on disk, so "unknown" is a value, not NULL; prev_max_ts_ms is NULL.
+GAP_NONE, GAP_HOLE, GAP_UNKNOWN = 0, 1, 2
 _CURSOR_LOOKBACK_DAYS = 7
 _INSERT_FUNDING = (
     "INSERT INTO funding (recv_ms, symbol, funding_rate, next_fee_time_ms, fee_interval_s, marked_price,"
@@ -310,7 +331,36 @@ def _migrate(conn: sqlite3.Connection) -> None:
     for table, column, ddl in _ADDED_COLUMNS:
         existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
         if column not in existing:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+            except sqlite3.OperationalError as exc:
+                # Another stream thread opened the same file a moment earlier (midnight) and won the race.
+                if "duplicate column name" not in str(exc):
+                    raise
+
+
+def _read_cursor_file(data_dir: Path) -> int | None:
+    """The cursor from ``trade_cursor.json`` (independent of the day files), or ``None``."""
+    try:
+        value = json.loads((data_dir / _CURSOR_FILE).read_text(encoding="utf-8"))["max_ts_ms"]
+        return int(value) if not isinstance(value, bool) else None
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _write_cursor_file(data_dir: Path, cursor: int, recv_ms: int) -> None:
+    """Atomically persist the cursor next to the day files (they may be archived and removed)."""
+    path = data_dir / _CURSOR_FILE
+    tmp = data_dir / f"{_CURSOR_FILE}.{os.getpid()}.tmp"
+    try:
+        with tmp.open("w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"max_ts_ms": cursor, "recv_ms": recv_ms}))
+            fh.flush()
+            os.fsync(fh.fileno())
+        tmp.replace(path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _read_cursor(path: Path) -> int | None:
@@ -333,16 +383,27 @@ def load_trade_cursor(data_dir: Path, now_ms: int) -> int | None:
     """The persisted trade cursor: newest trade time seen before this process started.
 
     Looks at today's day file first, then walks back up to a week, so a restart just after midnight
-    still finds the cursor written into yesterday's file. ``None`` means nothing was ever recorded.
+    still finds the cursor written into yesterday's file. ``trade_cursor.json`` (written after every
+    poll, independent of the day files) is also consulted, so a cursor survives yesterday's file having
+    been archived and removed; the newest of the sources wins. ``None`` means no cursor is known.
     """
+    found: list[int] = []
     for back in range(_CURSOR_LOOKBACK_DAYS + 1):
         path = data_dir / f"lbank-{_utc_day(now_ms - back * 86_400_000)}.sqlite"
         if not path.exists():
             continue
-        cursor = _read_cursor(path)
+        try:
+            cursor = _read_cursor(path)
+        except sqlite3.Error:
+            logger.exception("lbank_recorder.cursor_read_failed", file=path.name)
+            continue
         if cursor is not None:
-            return cursor
-    return None
+            found.append(cursor)
+            break
+    from_file = _read_cursor_file(data_dir)
+    if from_file is not None:
+        found.append(from_file)
+    return max(found) if found else None
 
 
 class DayStore:
@@ -361,13 +422,14 @@ class DayStore:
         if self._conn is None or day != self._day:
             self.close()
             self._dir.mkdir(parents=True, exist_ok=True)
-            conn = sqlite3.connect(str(self.path_for(day)), timeout=30.0, isolation_level=None)
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA busy_timeout=30000")
-            conn.executescript(_SCHEMA)
-            _migrate(conn)
-            conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            with _OPEN_LOCK:  # see _OPEN_LOCK: serializes first-open/create against other threads
+                conn = sqlite3.connect(str(self.path_for(day)), timeout=30.0, isolation_level=None)
+                conn.execute("PRAGMA busy_timeout=30000")
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.executescript(_SCHEMA)
+                _migrate(conn)
+                conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             self._conn, self._day = conn, day
         return self._conn
 
@@ -447,6 +509,7 @@ class LBankRecorder:
         self.status: dict[str, StreamStatus] = {}
         self._prev_trade_max_ms: int | None = None
         self._cursor_loaded = False
+        self._persisted_cursor: int | None = None
         self._started_ms = _now_ms()
         self._threads: list[threading.Thread] = []
 
@@ -560,12 +623,21 @@ class LBankRecorder:
             f"{SPOT_BASE_URL}/v2/supplement/trades.do",
             {"symbol": self._cfg.symbol, "size": self._cfg.trades_size},
         )
-        parsed = parse_trades_checked(payload)
+        try:
+            parsed = parse_trades_checked(payload)
+        except ValueError as exc:  # envelope error: keep the evidence before the poll is reported failed
+            self._store_envelope_error(store, recv, payload, exc)
+            raise
         rows = parsed.rows
         times = [r[1] for r in rows]
         lo, hi = (min(times), max(times)) if times else (None, None)
         prev = self._trade_cursor(recv)
-        gap = 1 if (prev is not None and lo is not None and lo > prev) else 0
+        if lo is None:
+            gap = GAP_NONE
+        elif prev is None:
+            gap = GAP_UNKNOWN
+        else:
+            gap = GAP_HOLE if lo > prev else GAP_NONE
         cursor = hi if prev is None else (prev if hi is None else max(prev, hi))
         trade_rows = [(*r, recv) for r in rows]
         n_bad = len(parsed.unparsed)
@@ -578,10 +650,32 @@ class LBankRecorder:
             if cursor is not None:  # persisted in the day file the poll lands in, so it survives restarts
                 conn.execute(_UPSERT_CURSOR, (cursor, recv))
         self._prev_trade_max_ms = cursor
-        if gap:
+        self._persist_cursor_file(cursor, recv)
+        if gap == GAP_HOLE:
             logger.warning("lbank_recorder.trade_gap", prev_max_ms=prev, min_ms=lo)
+        elif gap == GAP_UNKNOWN:
+            logger.info("lbank_recorder.trade_gap_unknown", min_ms=lo)  # no cursor: first poll ever, or lost
         self._note_trade_poll(parsed, changed, recv)
         return changed
+
+    def _store_envelope_error(self, store: DayStore, recv: int, payload: Any, exc: Exception) -> None:
+        """Keep the capped raw body of a response the exchange (or a proxy) answered in a wrong shape."""
+        try:
+            raw = _raw_text(payload)
+            store.write(recv, [(_INSERT_UNPARSED, [(recv, "envelope", raw)])])
+        except Exception:
+            logger.exception("lbank_recorder.envelope_store_failed")
+        logger.error("lbank_recorder.trades_envelope", error=str(exc)[:200], sample=_raw_text(payload)[:300])
+
+    def _persist_cursor_file(self, cursor: int | None, recv: int) -> None:
+        """Best effort: ``trade_cursor.json`` outlives day files that get archived and removed."""
+        if cursor is None or cursor == self._persisted_cursor:
+            return
+        try:
+            _write_cursor_file(self._cfg.data_dir, cursor, recv)
+            self._persisted_cursor = cursor
+        except OSError:
+            logger.exception("lbank_recorder.cursor_file_failed")  # the day file still holds the cursor
 
     def _trade_cursor(self, recv_ms: int) -> int | None:
         """In-memory cursor, loaded once from the day files so a restart does not hide a gap."""

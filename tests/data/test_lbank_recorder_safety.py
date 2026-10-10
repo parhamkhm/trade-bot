@@ -1,9 +1,13 @@
-"""Review-round tests for the LBank recorder: parse failures (M3), persisted trade cursor (M4), migration."""
+"""Review-round tests for the LBank recorder: parse failures (M3), persisted trade cursor (M4), migration,
+plus the second review round: n_bad column races (MINOR 2), trade_cursor.json surviving archived day files
+(MINOR 3) and envelope errors kept in ``trades_unparsed`` (MINOR 6).
+"""
 
 from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -134,7 +138,7 @@ def test_restart_flags_a_gap_when_the_first_poll_does_not_reach_back(
     restarted = _recorder(tmp_path)  # new process: no in-memory cursor
     _poll(restarted, tmp_path, _envelope([_trade("z", T0 + 600_000)]), T0 + 601_000, monkeypatch)
     polls = _rows(tmp_path, "SELECT gap, prev_max_ts_ms FROM trade_polls ORDER BY id")
-    assert polls == [(0, None), (1, T0 - 5000)]
+    assert polls == [(2, None), (1, T0 - 5000)]
 
 
 def test_restart_with_overlapping_window_is_not_a_gap(
@@ -148,7 +152,7 @@ def test_restart_with_overlapping_window_is_not_a_gap(
         T0 + 2000,
         monkeypatch,
     )
-    assert [r[0] for r in _rows(tmp_path, "SELECT gap FROM trade_polls ORDER BY id")] == [0, 0]
+    assert [r[0] for r in _rows(tmp_path, "SELECT gap FROM trade_polls ORDER BY id")] == [2, 0]
 
 
 def test_cursor_is_persisted_and_never_moves_backwards(
@@ -305,3 +309,146 @@ def test_migration_is_idempotent(tmp_path: Path) -> None:
 def test_old_file_without_any_cursor_table_still_yields_a_cursor(tmp_path: Path) -> None:
     _old_format_file(tmp_path / "lbank-2026-10-10.sqlite", T0 - 70_000)
     assert load_trade_cursor(tmp_path, T0) == T0 - 70_000
+
+
+# --- MINOR 2: several threads opening a day file concurrently never corrupt the schema ------------
+
+
+def _open_in_thread(data_dir: Path, recv_ms: int, errors: list[BaseException]) -> None:
+    try:
+        store = DayStore(data_dir)
+        store.conn(recv_ms)
+        store.close()
+    except BaseException as exc:  # pragma: no cover - surfaced via `errors`, not a raised assertion
+        errors.append(exc)
+
+
+def _run_concurrent_openers(data_dir: Path, recv_ms: int, n: int = 8) -> list[BaseException]:
+    errors: list[BaseException] = []
+    threads = [threading.Thread(target=_open_in_thread, args=(data_dir, recv_ms, errors)) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    return errors
+
+
+def test_concurrent_openers_of_a_fresh_day_file_do_not_race(tmp_path: Path) -> None:
+    errors = _run_concurrent_openers(tmp_path, T0)
+    assert errors == []
+    conn = sqlite3.connect(tmp_path / "lbank-2026-10-10.sqlite")
+    assert [r[1] for r in conn.execute("PRAGMA table_info(trade_polls)")].count("n_bad") == 1
+    assert conn.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+    conn.close()
+
+
+def test_concurrent_openers_of_an_old_schema_file_migrate_without_racing(tmp_path: Path) -> None:
+    path = tmp_path / "lbank-2026-10-10.sqlite"
+    _old_format_file(path, T0 - 70_000)
+    errors = _run_concurrent_openers(tmp_path, T0)
+    assert errors == []
+    conn = sqlite3.connect(path)
+    columns = [r[1] for r in conn.execute("PRAGMA table_info(trade_polls)")]
+    assert columns.count("n_bad") == 1 and columns[-1] == "n_bad"
+    assert conn.execute("PRAGMA user_version").fetchone() == (lr.SCHEMA_VERSION,)
+    assert conn.execute("SELECT COUNT(*) FROM trades").fetchone() == (1,)  # the old row survived
+    conn.close()
+
+
+def test_migrate_tolerates_a_duplicate_column_race_directly(tmp_path: Path) -> None:
+    path = tmp_path / "lbank-2026-10-10.sqlite"
+    _old_format_file(path, T0 - 70_000)
+    conn = sqlite3.connect(path)
+    conn.execute("ALTER TABLE trade_polls ADD COLUMN n_bad INTEGER NOT NULL DEFAULT 0")  # another thread won
+    lr._migrate(conn)  # must not raise on "duplicate column name"
+    assert [r[1] for r in conn.execute("PRAGMA table_info(trade_polls)")].count("n_bad") == 1
+    conn.close()
+
+
+def test_migrate_reraises_other_operational_errors(tmp_path: Path) -> None:
+    path = tmp_path / "lbank-2026-10-10.sqlite"
+    _old_format_file(path, T0 - 70_000)
+    conn = sqlite3.connect(path)
+    conn.close()  # a closed connection makes any statement raise, but never "duplicate column name"
+    with pytest.raises(sqlite3.ProgrammingError):
+        lr._migrate(conn)
+
+
+# --- MINOR 3: trade_cursor.json survives yesterday's day file being archived and removed -----------
+
+
+def test_cursor_survives_yesterdays_file_being_archived_and_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _poll(_recorder(tmp_path), tmp_path, _envelope([_trade("a", T0 - 5000)]), T0, monkeypatch)
+    cursor_file = tmp_path / "trade_cursor.json"
+    assert json.loads(cursor_file.read_text(encoding="utf-8"))["max_ts_ms"] == T0 - 5000
+    (tmp_path / "lbank-2026-10-10.sqlite").unlink()  # archived to cold storage and removed overnight
+    restarted = _recorder(tmp_path)  # new process: no in-memory cursor, and no day file to read it from
+    _poll(restarted, tmp_path, _envelope([_trade("z", T0 + 600_000)]), T0 + 601_000, monkeypatch)
+    polls = _rows(tmp_path, "SELECT gap, prev_max_ts_ms FROM trade_polls ORDER BY id")
+    assert polls == [(1, T0 - 5000)]  # a hole, correctly detected from the json cursor, not "unknown"
+    assert load_trade_cursor(tmp_path, T0 + 601_000) == T0 + 600_000
+
+
+def test_cursor_file_is_the_only_source_once_all_day_files_are_gone(tmp_path: Path) -> None:
+    from tbot.data.lbank_recorder import _write_cursor_file
+
+    _write_cursor_file(tmp_path, T0 - 1000, T0)
+    assert load_trade_cursor(tmp_path, T0 + 86_400_000) == T0 - 1000  # well past the week lookback window
+
+
+def test_corrupt_cursor_file_is_ignored_not_fatal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "trade_cursor.json").write_text("{not json", encoding="utf-8")
+    assert load_trade_cursor(tmp_path, T0) is None  # no day file either: genuinely unknown
+    _poll(_recorder(tmp_path), tmp_path, _envelope([_trade("a", T0 - 1000)]), T0, monkeypatch)
+    assert [r[0] for r in _rows(tmp_path, "SELECT gap FROM trade_polls")] == [2]  # unknown, not a crash
+
+
+def test_cursor_file_write_is_atomic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _poll(_recorder(tmp_path), tmp_path, _envelope([_trade("a", T0 - 1000)]), T0, monkeypatch)
+    cursor_path = tmp_path / "trade_cursor.json"
+    assert cursor_path.exists()
+    assert not list(tmp_path.glob("trade_cursor.json.*.tmp"))  # no leftover temp file
+
+
+# --- MINOR 6: envelope errors are kept, with reason "envelope", before the poll raises -------------
+
+
+def test_envelope_error_with_result_false_is_stored_before_raising(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rec = _recorder(tmp_path)
+    body = {"result": "false", "error_code": 10008, "msg": "symbol not found"}
+    with capture_logs() as logs:
+        _poll(rec, tmp_path, body, T0, monkeypatch)
+    unparsed = _rows(tmp_path, "SELECT reason, raw FROM trades_unparsed")
+    assert len(unparsed) == 1
+    reason, raw = unparsed[0]
+    assert reason == "envelope"
+    decoded = json.loads(raw)
+    assert decoded["result"] == "false" and decoded["msg"] == "symbol not found"
+    assert str(decoded["error_code"]) == "10008"  # Decimal round-trips through json.dumps as a string
+    assert rec.status["trades"].consecutive_errors == 1
+    errors = [e for e in logs if e["event"] == "lbank_recorder.trades_envelope"]
+    assert errors and errors[0]["log_level"] == "error" and "10008" in errors[0]["error"]
+
+
+def test_envelope_error_with_missing_data_field_is_stored_with_reason_envelope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rec = _recorder(tmp_path)
+    body = {"result": "true", "error_code": 0}  # no "data" key at all
+    _poll(rec, tmp_path, body, T0, monkeypatch)
+    unparsed = _rows(tmp_path, "SELECT reason, raw FROM trades_unparsed")
+    assert [r[0] for r in unparsed] == ["envelope"]
+    decoded = json.loads(unparsed[0][1])
+    assert decoded["result"] == "true" and str(decoded["error_code"]) == "0" and "data" not in decoded
+
+
+def test_envelope_error_raw_body_is_capped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    rec = _recorder(tmp_path)
+    body = {"result": "false", "error_code": 1, "msg": "x" * 10_000}
+    _poll(rec, tmp_path, body, T0, monkeypatch)
+    raw = _rows(tmp_path, "SELECT raw FROM trades_unparsed")[0][0]
+    assert len(raw) <= lr._RAW_MAX_CHARS

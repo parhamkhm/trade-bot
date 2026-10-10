@@ -172,7 +172,7 @@ def test_each_stream_writes_its_raw_rows(tmp_path: Path) -> None:
         ("bbb", "82834.1"),
     ]
     polls = _rows(tmp_path, "SELECT n_items, n_inserted, gap FROM trade_polls ORDER BY recv_ms")
-    assert polls[0] == (2, 2, 0) and polls[1][1] == 0 and polls[1][2] == 0
+    assert polls[0] == (2, 2, 2) and polls[1][1] == 0 and polls[1][2] == 0
     assert _rows(tmp_path, "SELECT funding_rate, next_fee_time_ms FROM funding") == [
         ("0.0001", 1791648000000)
     ]
@@ -212,7 +212,7 @@ def test_trade_poll_that_does_not_overlap_is_flagged_as_gap(tmp_path: Path) -> N
         rec.run_once("trades", rec._poll_trades, client, store)
         rec.run_once("trades", rec._poll_trades, client, store)
     store.close()
-    assert [r[0] for r in _rows(tmp_path, "SELECT gap FROM trade_polls ORDER BY recv_ms")] == [0, 1]
+    assert [r[0] for r in _rows(tmp_path, "SELECT gap FROM trade_polls ORDER BY recv_ms")] == [2, 1]
 
 
 @respx.mock
