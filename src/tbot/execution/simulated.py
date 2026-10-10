@@ -252,9 +252,7 @@ class SimulatedBroker:
         )
 
     def open_orders(self, symbol: str) -> list[OrderStatus]:
-        return [
-            self.get_order(cid) for cid in self._pending if self._orders[cid].req.symbol == symbol
-        ]
+        return [self.get_order(cid) for cid in self._pending if self._orders[cid].req.symbol == symbol]
 
     def balances(self) -> dict[str, Decimal]:
         return {self._quote: self._cash, self._base: self._qty}

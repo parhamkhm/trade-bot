@@ -48,9 +48,7 @@ def five_bars() -> list[Bar]:
 
 def test_hand_computed_five_bar_example() -> None:
     cfg = make_config()
-    res = run_backtest(
-        BacktestFeed(five_bars()), Scripted([0.5, 0.55, 0.0, 0.4, 0.4]), cfg
-    )
+    res = run_backtest(BacktestFeed(five_bars()), Scripted([0.5, 0.55, 0.0, 0.4, 0.4]), cfg)
     fills = [r.fill for r in res.fills]
     assert [(f.side, f.ts, f.price, f.quantity, f.fee) for f in fills] == [
         (Side.BUY, T_START + timedelta(days=1), Dec("101.00"), Dec("50.00000"), Dec("25.25")),
@@ -268,9 +266,7 @@ def delay_setup() -> tuple[list[Bar], list[Bar]]:
 def test_delay_model_fills_at_first_hourly_open_six_hours_after_the_signal_close() -> None:
     days, hours = delay_setup()
     cfg = make_config(fill_delay=timedelta(hours=6), exec_timeframe=Timeframe.H1)
-    res = run_backtest(
-        BacktestFeed(days), Scripted([0.5, 0.5]), cfg, exec_feed=BacktestFeed(hours)
-    )
+    res = run_backtest(BacktestFeed(days), Scripted([0.5, 0.5]), cfg, exec_feed=BacktestFeed(hours))
     (rec,) = res.fills
     signal_close = T_START + timedelta(days=1)
     assert rec.fill.ts == signal_close + timedelta(hours=6)
@@ -300,8 +296,13 @@ def test_pending_order_blocks_stacking_when_delay_exceeds_signal_spacing() -> No
     cfg = make_config(fill_delay=timedelta(hours=6), exec_timeframe=Timeframe.H1)
     # Signals every day, but a (artificially) 30 h delay keeps the day-0 order pending at the day-1 close.
     cfg = BacktestConfig(
-        symbol=cfg.symbol, timeframe=cfg.timeframe, filters=cfg.filters, costs=cfg.costs,
-        fill_delay=timedelta(hours=30), exec_timeframe=Timeframe.H1, buy_buffer_bps=Dec(0),
+        symbol=cfg.symbol,
+        timeframe=cfg.timeframe,
+        filters=cfg.filters,
+        costs=cfg.costs,
+        fill_delay=timedelta(hours=30),
+        exec_timeframe=Timeframe.H1,
+        buy_buffer_bps=Dec(0),
     )
     res = run_backtest(BacktestFeed(days), Scripted([0.5, 0.9]), cfg, exec_feed=BacktestFeed(hours))
     assert [d.outcome for d in res.decisions] == ["ORDER", "SKIPPED_PENDING_ORDER"]

@@ -50,9 +50,7 @@ def run_benchmarks(
     *,
     exec_feed: DataFeed | None = None,
 ) -> BenchmarkSet:
-    bh = run_backtest(
-        feed, BuyAndHold(warmup_bars=strategy.warmup_bars), config, exec_feed=exec_feed
-    )
+    bh = run_backtest(feed, BuyAndHold(warmup_bars=strategy.warmup_bars), config, exec_feed=exec_feed)
     weight, capped = vol_match_weight(compute_metrics(strategy_result).vol, compute_metrics(bh).vol)
     vm = run_backtest(
         feed, BuyAndHold(weight=weight, warmup_bars=strategy.warmup_bars), config, exec_feed=exec_feed

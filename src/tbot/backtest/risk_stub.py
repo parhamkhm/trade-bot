@@ -74,8 +74,10 @@ class StubRiskManager:
             qty = flt.floor_qty(budget / price)
         elif gap_value < 0:
             side = Side.SELL
-            qty = portfolio.base_qty if intent.target_weight == 0 else flt.floor_qty(
-                min(-gap_value / price, portfolio.base_qty)
+            qty = (
+                portfolio.base_qty
+                if intent.target_weight == 0
+                else flt.floor_qty(min(-gap_value / price, portfolio.base_qty))
             )
         else:
             return Approved(intent, None, "target already met")
