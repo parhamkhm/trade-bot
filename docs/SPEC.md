@@ -264,10 +264,29 @@ Required test kinds (phase-dependent):
 
 These refine `CLAUDE.md` §9 into measurable checks. They may be tightened, never relaxed after seeing data.
 
-**G0 — Foundations.** From the Turkey server: `ping` and `time` succeed; |server clock − local NTP clock| < 1 s;
-`exchangeInfo` lists `BTCUSDT` with status `TRADING` and readable tick/step/min-notional filters;
-median bid/ask spread over ≥ 30 samples spread across ≥ 6 h is < 0.20 %; a signed read endpoint
-(`account`) answers 200 with the read-only key (key has no withdrawal permission and is IP-whitelisted).
+**G0 — Foundations (LBank, D-073).** Measured **from the Turkey server**, public endpoints only, ≥ 30 samples
+spread across ≥ 6 h. Every number carries where and when it was measured.
+- *Pass conditions:*
+  - every spot v2 endpoint (`timestamp`, `accuracy`, `depth`, `supplement/trades`, `kline`, `ticker/24hr`) and
+    the perpetual `marketData` answer 200;
+  - median |LBank server time − local NTP clock| < 1 s;
+  - `accuracy` lists `btc_usdt` with readable price/quantity precision, minimum quantity and minimum order value;
+  - median best bid/ask spread < 0.20 %.
+- *Reported, not gating:*
+  - p50 and p95 latency per endpoint;
+  - kline history depth for 1d, 4h, 1h and 1m;
+  - depth within 0.1 %, 0.5 % and 1 % of mid (median and p10 per side);
+  - the largest market order that fills within 0.1 % and 0.5 % at the median sample. This feeds the
+    **temporary** depth-at-size curve (D-067).
+- *Rate limits are probed conservatively.* The request rate rises step by step from the recorder's normal rate,
+  and probing **stops at the first 429, 418, 403 or other ban-type response**. Headers and codes are recorded.
+  The Turkey server is our only IP, so a ban must never be risked.
+- *Private part* (a signed read of balances and the user's fee rate, with a read-only key): **postponed** until
+  Parham creates a read-only LBank key from an account in his own name (no trading, no withdrawal,
+  IP-whitelisted). It must pass before phase 7a. Until then no private call is made. The verified VIP 0 spot fee
+  (D-060) stands.
+
+*Legacy:* the Tabdeal G0 (public part passed 2026-10-08, `docs/reports/g0-report.md`) is historical.
 
 **G1a — Research data (Binance).** 1h/4h/1d for BTCUSDT and ETHUSDT from 2018-01-01 to `holdout_start`:
 every file checksum-verified, zero duplicate timestamps, zero out-of-order timestamps, and every missing
@@ -276,10 +295,21 @@ unit of every file is detected and normalised (see D-017). Source anomalies are 
 *Pending Parham (D-040), not yet in force:* how to treat reconciliation mismatches that sit in Binance's own
 files (see the phase 0–1 report). Until he decides, the criterion above applies unchanged.
 
-**G1b — Live data (Tabdeal).** The recorder has run ≥ 7 consecutive days with ≥ 99 % of hours complete,
-zero trade-id gaps (*proposed wording, pending Parham — D-037:* zero `window_no_overlap` gaps, because per-symbol
-ids are never contiguous), and `coverage_ratio ≥ 3` on every poll (D-024), and the Binance-vs-Tabdeal BTCUSDT basis
-is measured (median and p95, in bps) over that window. G1a and G1b are decided separately: phase 2 may start once G1a passes (decision D-016).
+**G1b — Live data (LBank, D-073).** The LBank recorder (D-068) has run **≥ 7 consecutive days** healthy:
+- ≥ 99 % of hours have ≥ 99 % of their expected 10 s order-book snapshots;
+- every trade poll overlaps the previous one in time (`gap = 0`). Any `gap = 1` or `gap = 2` poll is
+  explained in the G1b report (restart, exchange outage);
+- funding and klines have no stream silent beyond its healthcheck limit;
+- every nightly archive and backup succeeded.
+
+The Binance-vs-LBank BTC/USDT basis (median and p95, in bps, on 1h closes) is measured over the same window.
+LBank bars come from the recorder; they are stored apart from research data and the research loader cannot read
+them (D-074). The Binance side needs bars after `holdout_start`: a separate live-compare fetch limited to the
+G1b window is **proposed, pending Parham (D-039)**. Until he decides, the basis is reported only from data he
+approves.
+
+G1a and G1b are decided separately: phase 2 may start once G1a passes (D-016). *Legacy:* the Tabdeal G1b
+definition (D-024, D-037) is historical.
 
 **G2 — Engine.** Truncation test passes exactly; a hand-computed 5-bar example matches the engine to the
 cent; buy-and-hold and SMA-filter equity curves match an independent vectorbt run to ≤ 0.1 % final equity;
@@ -336,7 +366,7 @@ Fixed before any phase-3 result. Nothing in this section may be tuned after resu
 parameter below is a fixed number.
 
 **S0 — locked default.** One strategy, fully specified here, never tuned on phase-3 results.
-**LOCKED by Parham on 2026-10-10 (D-062).** The lock commit is recorded in `research/EXPERIMENTS.md`. Every
+**LOCKED by Parham on 2026-10-10 (D-063).** The lock commit is recorded in `research/EXPERIMENTS.md`. Every
 number below is fixed.
 
 `sma100_1d`, BTCUSDT, Binance 1d bars (a bar's `ts` is its close, 00:00 UTC).
@@ -422,7 +452,7 @@ same trial count as every other non-S0 contender (see "Deflated Sharpe" below).
 over the evaluation window = the **paper and live days after the challenger's lock date** — the commit date of
 the challenger's frozen entry in `research/EXPERIMENTS.md` — (historical
 walk-forward days all predate the lock and do not count), minimum 365 days:
-(a) **Sharpe-difference test (D-063, replaces the fixed 0.10 DSR margin).** A one-sided Ledoit–Wolf (2008)
+(a) **Sharpe-difference test (D-064, replaces the fixed 0.10 DSR margin).** A one-sided Ledoit–Wolf (2008)
 test of `H0: SR_challenger − SR_champion ≤ 0` on the two daily net return series over **the same days**:
   - the series are paper returns for the challenger, and the champion's realised returns (paper or live, after
     all costs);

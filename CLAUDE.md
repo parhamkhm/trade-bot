@@ -18,12 +18,12 @@ stop before live trading — that is a successful result of this process, not a 
 
 | Topic | Decision |
 |---|---|
-| Market / exchange | Crypto, **LBank spot** (public REST v2; ccxt for the broker adapter). Tabdeal is **legacy** (code and data kept, not traded) — pivot approved by Parham 2026-10-10 |
+| Market / exchange | Crypto, **LBank spot** (public REST v2; ccxt for the broker adapter). Tabdeal is **legacy** (code and data kept, not traded) — pivot approved by Parham 2026-10-10 (SPEC D-062) |
 | Capital | **Only capital Parham can afford to lose is ever placed on the exchange.** Jurisdiction, account-freeze and withdrawal-delay risks are accepted by Parham (SPEC D-065) |
 | Pair | BTC/USDT spot (ETH/USDT used only as a robustness check, not traded) |
 | Direction | Long or flat. No shorting, no leverage, no margin, no futures |
 | Timeframes | Signals on 1d and 4h bars. No scalping / sub-hour strategies. (The hourly order-book-imbalance strategy #7 is paper/shadow only and is evaluated first as an execution filter) |
-| Base strategy | Locked default **S0 = SMA100 trend filter + volatility-targeted sizing + fixed 3×ATR20 stop** (SPEC §7.1, D-062). Candidates: the seven-strategy universe with small pre-fixed parameter grids (D-069), trend following first |
+| Base strategy | Locked default **S0 = SMA100 trend filter + volatility-targeted sizing + fixed 3×ATR20 stop** (SPEC §7.1, D-063). Candidates: the seven-strategy universe with small pre-fixed parameter grids (D-069), trend following first |
 | Regime layer | Simple, causal (realized-vol percentile + trend strength e.g. efficiency ratio/ADX), plus a **funding-rate risk-off overlay** (D-066: Binance funding as the declared backtest proxy, thresholds set on Binance history only, LBank funding live). It **scales exposure or gates entries**; it does NOT hard-switch strategies; kept only if it beats no-overlay out of sample |
 | Research data | Binance public klines (data.binance.vision) |
 | Live data | LBank klines, public trades and order-book snapshots, recorded raw by the LBank recorder (per-day SQLite). LBank bars are stored **separately** from research data; the research loader never reads them. Signals use Binance bars; execution on LBank. Costs come from **measured order-book depth, never reported volume** (D-067) |
@@ -65,7 +65,7 @@ stop before live trading — that is a successful result of this process, not a 
    - Secrets only in `.env` on the server (never in the repo, logs, tracebacks, chat or Telegram).
    - LBank API key: created by Parham **only from an account in his own name**; **no withdrawal and no trading
      permission**, IP-whitelisted to the server's static IP, read-only until phase 5b. Until it exists, no private
-     LBank call is made (the private G0 part is postponed, D-064).
+     LBank call is made (the private G0 part is postponed, D-073).
    - Every order carries a unique `client_order_id`; on timeout, query by that ID — never blindly resend.
    - Any mismatch between internal state and the exchange (balances, open orders, position) → trading state
      `HALTED` + Telegram alert.
@@ -212,11 +212,11 @@ filters before submission; orders below min-notional are refused by the RiskMana
   not increasing integers → dedupe by id, continuity by **time** overlap.
 - Reported 24 h volume is likely partly inflated; liquidity is judged by **measured order-book depth** only.
 - Rate limits: probe **conservatively**, stop at the first 429 or ban-type response — the Turkey server is our
-  only IP (D-064). Client-side token bucket + exponential backoff on 429/5xx.
+  only IP (D-073). Client-side token bucket + exponential backoff on 429/5xx.
 - Adapter: `ccxt` (exact version pinned in `uv.lock`) for the broker side, read-only methods only; the order-code
   guardrail also blocks ccxt's order/cancel/edit/margin/transfer methods in snake_case **and camelCase** (D-075).
   Direct REST is used where ccxt is slow or incomplete (the recorder).
-- Private API: postponed until Parham creates a read-only key from an account in his own name (D-064).
+- Private API: postponed until Parham creates a read-only key from an account in his own name (D-073).
 
 **Legacy — Tabdeal (not traded; code and data kept).** Notes, client and recorder remain in
 `docs/vendor/tabdeal-api-notes.md`, `src/tbot/execution/tabdeal_client.py`, `src/tbot/data/tabdeal_recorder.py`.
