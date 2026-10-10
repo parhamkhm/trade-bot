@@ -9,13 +9,18 @@ runtime:
   log_level: INFO
 
 costs:
-  # Real Tabdeal fee table, Parham's account tier 1 (30-day volume < 1,000 USDT), decision D-047:
-  # taker 0.35 %, maker 0.33 % per side. Backtests assume TAKER unless a strategy explicitly uses
-  # limit orders. The x2 cost stress test (G3) therefore means 70 bps per side.
-  # Still to verify: whether USDT-quoted markets use the same table.
-  taker_fee_bps: "35"
-  maker_fee_bps: "33"
+  # LBank SPOT fee table, VERIFIED from Parham's VIP 0 account on 2026-10-10, decision D-060
+  # (supersedes D-047, which was Tabdeal): taker 0.10 %, maker 0.10 % per side. Pre-registered before
+  # any strategy result. Backtests assume TAKER unless a strategy explicitly uses limit orders.
+  # The x2 cost stress test (G3) therefore means 20 bps fee per side.
+  taker_fee_bps: "10"
+  maker_fee_bps: "10"
+  # PROVISIONAL placeholder: spread and slippage must come from the LBank G0 probe (order-book
+  # snapshots from the Turkey server), not from an assumption. Replace before any phase-3 result.
   slippage_bps: "5"
+  # While true, every backtest report is headed "PROVISIONAL SLIPPAGE" and no gate (G2 excepted) may be
+  # decided on its numbers. Set to false only together with the measured depth-at-size model (D-060).
+  slippage_provisional: true
 
 data:
   parquet_root: data/parquet
@@ -31,6 +36,8 @@ data:
   # CANONICAL_HOLDOUT_START, and a mismatch here is refused and logged (D-026, D-030).
   holdout_start: 2025-10-01T00:00:00Z
 
+# Legacy Tabdeal section (D-062): kept so existing code and tests load; LBank settings arrive with the
+# LBank client. Nothing here is traded.
 exchange:
   base_url: https://api1.tabdeal.org
   read_prefix: /r/api/v1
@@ -42,7 +49,7 @@ exchange:
 
 risk:
   max_exposure: 1.0
-  annual_vol_target: 0.20
+  annual_vol_target: 0.30
   max_daily_loss_pct: 0.10
   max_orders_per_hour: 6
   max_data_age_seconds: 900
