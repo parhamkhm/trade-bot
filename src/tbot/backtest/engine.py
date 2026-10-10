@@ -18,6 +18,8 @@ and the broker are simulated. No stops are modelled here (SPEC section 7.1 stop 
 
 from __future__ import annotations
 
+import contextlib
+import os
 from collections.abc import Iterator
 from datetime import datetime
 from decimal import Decimal
@@ -44,12 +46,25 @@ from tbot.core.types import (
     Strategy,
     TargetIntent,
 )
-from tbot.execution.simulated import ExecutionReport, FillRecord, OrderRejection, SimulatedBroker
+from tbot.data.binance_loader import (
+    HOLDOUT_UNSEAL_ENV,
+    HOLDOUT_UNSEAL_VALUE,
+    HoldoutLockError,
+    is_holdout_sealed,
+    log_holdout_event,
+)
+from tbot.execution.simulated import (
+    ExecutionReport,
+    FillRecord,
+    OrderRejection,
+    ResizeRecord,
+    SimulatedBroker,
+)
 from tbot.portfolio.allocator import Allocator, PassThroughAllocator
 from tbot.portfolio.portfolio import EquityPoint, Portfolio
 from tbot.strategies.base import validate_strategy
 
-__all__ = ["EngineError", "run_backtest"]
+__all__ = ["EngineError", "effective_warmup_bars", "run_backtest"]
 
 _ZERO = Decimal(0)
 
@@ -66,6 +81,31 @@ def _fast_window(symbol: str, bars: tuple[Bar, ...], bar: Bar) -> BarWindow:
     object.__setattr__(window, "timeframe", bar.timeframe)
     object.__setattr__(window, "bars", bars)
     return window
+
+
+def effective_warmup_bars(strategy: Strategy, regime: RegimeModel | None) -> int:
+    """The bar count the engine actually waits for before the first decision: whichever of the
+    strategy's and the regime's warm-up is larger. Benchmarks must align to this, not to
+    ``strategy.warmup_bars`` alone, or a regime overlay with a longer warm-up shifts their start
+    relative to the strategy under test and the comparison window stops being the same bars."""
+    return max(strategy.warmup_bars, regime.warmup_bars if regime is not None else 1)
+
+
+def _check_not_sealed(bar: Bar, *, allow_holdout: bool, caller: str) -> None:
+    if not is_holdout_sealed(bar.ts):
+        return
+    env_matches = os.environ.get(HOLDOUT_UNSEAL_ENV) == HOLDOUT_UNSEAL_VALUE
+    unsealed = allow_holdout and env_matches
+    outcome = "unsealed" if unsealed else "refused: locks mismatched or absent"
+    # best-effort: an installed package with no repo root above it has nowhere to log
+    with contextlib.suppress(RuntimeError):
+        log_holdout_event(caller=caller, reason="backtest engine bar guard", outcome=outcome)
+    if not unsealed:
+        raise HoldoutLockError(
+            f"a bar closing at {bar.ts.isoformat()} falls in the sealed holdout; this engine-level "
+            "guard catches it even from a custom DataFeed that does not enforce the seal itself "
+            "(SPEC section 5.2, both locks required)"
+        )
 
 
 class _Peekable:
@@ -115,11 +155,12 @@ class _Run:
             initial_cash=config.initial_cash,
             fill_delay=config.fill_delay,
         )
-        self.warmup = max(strategy.warmup_bars, regime.warmup_bars if regime is not None else 1)
+        self.warmup = effective_warmup_bars(strategy, regime)
         self.history: list[Bar] = []
         self.equity: list[EquityPoint] = []
         self.fills: list[FillRecord] = []
         self.rejections: list[OrderRejection] = []
+        self.resizes: list[ResizeRecord] = []
         self.decisions: list[DecisionRecord] = []
         self.first_decision: int | None = None
 
@@ -131,6 +172,7 @@ class _Run:
             self.portfolio.apply_fill(rec.fill)
             self.fills.append(rec)
         self.rejections.extend(report.rejections)
+        self.resizes.extend(report.resizes)
 
     # -- step 2: mark ------------------------------------------------------------------------
 
@@ -189,6 +231,7 @@ class _Run:
             equity=tuple(self.equity),
             fills=tuple(self.fills),
             rejections=tuple(self.rejections),
+            resizes=tuple(self.resizes),
             decisions=tuple(self.decisions),
             trades=self.portfolio.trades,
             first_decision_index=self.first_decision,
@@ -208,6 +251,7 @@ def run_backtest(
     risk: RiskManager | None = None,
     allocator: Allocator | None = None,
     exec_feed: DataFeed | None = None,
+    allow_holdout: bool = False,
 ) -> BacktestResult:
     """Run one backtest and return positions per bar, fills, equity curve, trades and costs.
 
@@ -215,6 +259,11 @@ def run_backtest(
     bars (``config.exec_timeframe``) at whose opens orders fill; it is required exactly when
     ``config.exec_timeframe`` is set (the manual-delay model). Without it, orders fill at the next signal
     bar's open. ``risk`` defaults to the phase-2 ``StubRiskManager``.
+
+    Every bar pulled from ``feed`` or ``exec_feed`` is checked against the sealed holdout here, in the
+    engine, not only in ``BacktestFeed``: a custom ``DataFeed`` that skips that check (or a live-replay
+    feed built later) cannot bypass the seal just by not calling it. ``allow_holdout`` is the same
+    first lock ``BacktestFeed`` takes; the second lock is the ``TBOT_UNSEAL_HOLDOUT=G4`` env var.
     """
     validate_strategy(strategy)
     if (exec_feed is None) != (config.exec_timeframe is None):
@@ -234,7 +283,9 @@ def run_backtest(
         if previous is not None and bar.ts <= previous.ts:
             raise EngineError(f"feed went backwards: {bar.ts} after {previous.ts}")
         previous = bar
+        _check_not_sealed(bar, allow_holdout=allow_holdout, caller="run_backtest:signal_feed")
         for exec_bar in cursor.pop_until(bar.ts) if cursor is not None else (bar,):
+            _check_not_sealed(exec_bar, allow_holdout=allow_holdout, caller="run_backtest:exec_feed")
             run.execute(exec_bar)
         run.history.append(bar)
         run.mark(bar)

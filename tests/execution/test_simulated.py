@@ -153,15 +153,68 @@ def test_min_notional_checked_at_fill() -> None:
     assert b.balances()["USDT"] == Dec("10000")
 
 
-def test_insufficient_funds_and_no_short_rejected_at_fill() -> None:
+def test_buy_is_resized_down_rather_than_rejected_when_cash_falls_short() -> None:
+    """A BUY whose requested quantity cash no longer covers at fill time is CAPPED, not rejected (the
+    delay-mode BLOCKER fix): a manual trader sizes when placing the order, so the broker mirrors that
+    at fill time instead of refusing the whole order over a price move. SELLs get no such treatment."""
     b = broker("100")
     b.submit(req("big", Side.BUY, "10"))
     b.submit(req("short", Side.SELL, "1"))
     rep = b.advance(make_bar(1, "100", "100"))
+    (rec,) = rep.fills
+    # price 100.05 (5 bps slip), unit cost 100.05 * 1.0035 = 100.400175, cash 100 -> floor to step
+    assert rec.fill.client_order_id == "big" and rec.fill.quantity == Dec("0.99601")
+    assert rec.fill.price == Dec("100.05")
+    (resize,) = rep.resizes
+    assert resize.client_order_id == "big"
+    assert resize.requested_quantity == Dec("10") and resize.filled_quantity == Dec("0.99601")
+    assert "moved" in resize.reason
+    assert [r.client_order_id for r in rep.rejections] == ["short"]  # SELL still rejected whole
+    assert "INSUFFICIENT_FUNDS" in rep.rejections[0].reason
+    assert b.balances()["BTC"] == Dec("0.99601")
+
+
+def test_buy_resized_to_zero_or_below_min_qty_is_still_rejected() -> None:
+    """The resize can land below a tradable size; that must reject (never fill a dust order), but the
+    ``ResizeRecord`` is still emitted so the report shows *why* (price moved), not just a bare refusal."""
+    b = broker("0.000001", fee="0", slip="0")  # below one step at price 1: floors to zero
+    b.submit(req("dust", Side.BUY, "1"))
+    rep = b.advance(make_bar(1, "1", "1"))
     assert rep.fills == ()
-    assert [r.client_order_id for r in rep.rejections] == ["big", "short"]
-    assert all("INSUFFICIENT_FUNDS" in r.reason for r in rep.rejections)
-    assert b.balances() == {"USDT": Dec("100"), "BTC": Dec("0")}
+    (resize,) = rep.resizes
+    assert resize.filled_quantity == Dec("0")
+    assert "ZERO_QUANTITY" in rep.rejections[0].reason
+
+
+def test_buy_resize_does_not_trigger_when_cash_was_sized_correctly() -> None:
+    """Sanity check for the next-open fill model: when cash was sized correctly at close(t) (the
+    stub risk manager's job), the fill-time cap must never trigger, so ordinary runs are unaffected --
+    the same setup as the hand-computed 5-bar example's first fill (fee 50 bps, slippage 100 bps)."""
+    b = broker(fee="50", slip="100")
+    b.submit(req("a", Side.BUY, "50"))
+    rep = b.advance(make_bar(1, "100", "100"))
+    assert rep.resizes == ()
+    assert rep.fills[0].fill.quantity == Dec("50") and rep.fills[0].fill.price == Dec("101.00")
+
+
+def test_gap_fill_is_flagged_when_the_fill_lands_after_the_expected_delay() -> None:
+    b = broker(fee="0", slip="0", delay=timedelta(hours=6))
+    b.submit(req("a", Side.BUY, "1"))
+    created = T_START + timedelta(days=1)
+    # the 05:00 and 06:00 bars are missing (a feed gap): the first bar at/after the 6h deadline is 07:00
+    for h in (0, 1, 2, 3, 4, 7):
+        bar = make_bar(0, "100", "100", tf=Timeframe.H1, start=created + timedelta(hours=h))
+        rep = b.advance(bar)
+        if rep.fills:
+            assert rep.fills[0].gap_fill is True
+            assert rep.fills[0].fill.ts == created + timedelta(hours=7)
+
+
+def test_no_gap_fill_flag_on_a_contiguous_feed() -> None:
+    b = broker(fee="0", slip="0")
+    b.submit(req("a", Side.BUY, "1"))
+    (rec,) = b.advance(make_bar(1, "100", "100")).fills
+    assert rec.gap_fill is False
 
 
 def test_cancel_and_unknown_order() -> None:

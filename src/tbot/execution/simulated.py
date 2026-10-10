@@ -14,6 +14,14 @@ is handed each execution bar as it becomes available:
 * Quantity must already be a multiple of the step size, at least ``min_qty`` and at most ``max_qty``
   (checked at submit); the fill-time notional must reach ``min_notional``. Violations are rejected,
   never silently rounded -- exactly what the live exchange will do with the same ``SymbolFilters``.
+* **A BUY is resized, never rejected outright, when the price has moved against it since it was sized**
+  (manual-delay fills, D-051: the risk manager sizes at ``close(t)``, but the fill price is read minutes
+  or hours later). At fill time the quantity is capped at
+  ``floor_to_step(cash / (fill_price * (1 + taker_fee_rate)))`` -- the most the current cash can still
+  afford at the actual fill price, mirroring what a manual trader does when placing the order. Every
+  resize is reported as an explicit :class:`ResizeRecord` (requested vs. filled quantity, reason), never
+  silently. A SELL is never capped this way: it is rejected whole if the position does not cover it,
+  exactly as before -- a long-only book has no symmetric "resize down" for an exit.
 * LIMIT orders are rejected: SPEC defines no limit-fill semantics yet (needs a maker/queue model).
 
 Fees and slippage come from ``FeeSchedule`` / ``SlippageModel`` objects built from configuration.
@@ -47,6 +55,7 @@ __all__ = [
     "FillRecord",
     "FlatSlippage",
     "OrderRejection",
+    "ResizeRecord",
     "SimulatedBroker",
     "SlippageContext",
     "SlippageModel",
@@ -141,6 +150,7 @@ class FillRecord:
     fill: Fill
     reference_price: Decimal  # the open the fill was priced from, before slippage
     slippage_cost: Decimal  # quote asset, >= 0: |fill price - reference| * quantity (incl. tick rounding)
+    gap_fill: bool = False  # bar.open_ts != created_ts + fill_delay: the feed had a gap at the deadline
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,11 +161,25 @@ class OrderRejection:
 
 
 @dataclass(frozen=True, slots=True)
+class ResizeRecord:
+    """A BUY whose quantity was capped down at fill time because cash no longer covered the amount it
+    was sized at (see the module docstring). Logged whether the resized order then filled or was still
+    rejected (e.g. the resized quantity fell below ``min_qty``/``min_notional``)."""
+
+    client_order_id: str
+    ts: datetime
+    requested_quantity: Decimal
+    filled_quantity: Decimal
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
 class ExecutionReport:
     """What happened to pending orders when one execution bar was processed."""
 
     fills: tuple[FillRecord, ...] = ()
     rejections: tuple[OrderRejection, ...] = ()
+    resizes: tuple[ResizeRecord, ...] = ()
 
 
 # ---------------------------------------------------------------------------------
@@ -272,19 +296,22 @@ class SimulatedBroker:
         self._last_bar_ts = bar.ts
         fills: list[FillRecord] = []
         rejections: list[OrderRejection] = []
+        resizes: list[ResizeRecord] = []
         still_pending: list[str] = []
         for cid in self._pending:
             order = self._orders[cid]
             if bar.open_ts < order.req.created_ts + self._delay:
                 still_pending.append(cid)
                 continue
-            outcome = self._fill_at_open(order, bar)
+            outcome, resize = self._fill_at_open(order, bar)
+            if resize is not None:
+                resizes.append(resize)
             if isinstance(outcome, FillRecord):
                 fills.append(outcome)
             else:
                 rejections.append(outcome)
         self._pending = still_pending
-        return ExecutionReport(tuple(fills), tuple(rejections))
+        return ExecutionReport(tuple(fills), tuple(rejections), tuple(resizes))
 
     # -- internals -------------------------------------------------------------------------
 
@@ -323,22 +350,44 @@ class SimulatedBroker:
         raw = bar.open * (1 - bps / _BPS)
         return (raw / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
 
-    def _fill_at_open(self, order: _Order, bar: Bar) -> FillRecord | OrderRejection:
+    def _resolve_buy_quantity(self, req: OrderRequest, price: Decimal) -> tuple[Decimal, str | None]:
+        """Cap a BUY's quantity to what current cash affords at the actual fill price (module docstring).
+        SELLs are never touched here. Returns ``(quantity, resize_reason)``; ``resize_reason`` is ``None``
+        when the full requested quantity is still affordable."""
+        if req.side is not Side.BUY:
+            return req.quantity, None
+        unit_cost = price * (1 + self._fees.taker_bps / _BPS)
+        if unit_cost <= 0:
+            return req.quantity, None
+        max_qty = self._filters.floor_qty(self._cash / unit_cost)
+        if max_qty >= req.quantity:
+            return req.quantity, None
+        return max(max_qty, _ZERO), "price moved since the order was sized: cash no longer covers it"
+
+    def _fill_at_open(
+        self, order: _Order, bar: Bar
+    ) -> tuple[FillRecord | OrderRejection, ResizeRecord | None]:
         req = order.req
         price = self._fill_price(req.side, req.quantity, bar)
-        notional = price * req.quantity
+        quantity, resize_reason = self._resolve_buy_quantity(req, price)
+        resize = (
+            ResizeRecord(req.client_order_id, bar.open_ts, req.quantity, quantity, resize_reason or "resized")
+            if quantity != req.quantity
+            else None
+        )
+        notional = price * quantity
         fee = self._fees.fee(notional)
-        reason = self._fill_problem(req, price, notional, fee)
+        reason = self._fill_problem(req, quantity, price, notional, fee)
         if reason is not None:
             order.state, order.last_ts = OrderState.REJECTED, bar.open_ts
-            return OrderRejection(req.client_order_id, bar.open_ts, reason)
+            return OrderRejection(req.client_order_id, bar.open_ts, reason), resize
         if req.side is Side.BUY:
             self._cash -= notional + fee
-            self._qty += req.quantity
+            self._qty += quantity
         else:
             self._cash += notional - fee
-            self._qty -= req.quantity
-        order.state, order.filled_qty = OrderState.FILLED, req.quantity
+            self._qty -= quantity
+        order.state, order.filled_qty = OrderState.FILLED, quantity
         order.avg_price, order.last_ts = price, bar.open_ts
         fill = Fill(
             client_order_id=req.client_order_id,
@@ -346,18 +395,27 @@ class SimulatedBroker:
             side=req.side,
             ts=bar.open_ts,
             price=price,
-            quantity=req.quantity,
+            quantity=quantity,
             fee=fee,
             fee_asset=self._quote,
             exchange_order_id=order.exchange_order_id,
         )
-        return FillRecord(fill, bar.open, abs(price - bar.open) * req.quantity)
+        expected_ts = req.created_ts + self._delay
+        gap = bar.open_ts != expected_ts
+        record = FillRecord(fill, bar.open, abs(price - bar.open) * quantity, gap_fill=gap)
+        return record, resize
 
-    def _fill_problem(self, req: OrderRequest, price: Decimal, notional: Decimal, fee: Decimal) -> str | None:
-        if not self._filters.passes_notional(price, req.quantity):
+    def _fill_problem(
+        self, req: OrderRequest, quantity: Decimal, price: Decimal, notional: Decimal, fee: Decimal
+    ) -> str | None:
+        if req.side is Side.BUY and quantity <= 0:
+            return "ZERO_QUANTITY: cash no longer covers even one step at the fill price"
+        if req.side is Side.BUY and quantity < self._filters.min_qty:
+            return f"MIN_QUANTITY: {quantity} < {self._filters.min_qty} after resizing to available cash"
+        if not self._filters.passes_notional(price, quantity):
             return f"MIN_NOTIONAL: {notional} < {self._filters.min_notional}"
         if req.side is Side.BUY and notional + fee > self._cash:
             return f"INSUFFICIENT_FUNDS: need {notional + fee}, have {self._cash} {self._quote}"
-        if req.side is Side.SELL and req.quantity > self._qty:
-            return f"INSUFFICIENT_FUNDS: need {req.quantity}, have {self._qty} {self._base}"
+        if req.side is Side.SELL and quantity > self._qty:
+            return f"INSUFFICIENT_FUNDS: need {quantity}, have {self._qty} {self._base}"
         return None

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from datetime import timedelta
 from decimal import Decimal
 
@@ -78,6 +79,46 @@ def test_hand_computed_five_bar_example() -> None:
     assert [d.outcome for d in res.decisions] == ["ORDER", "NO_ACTION", "ORDER", "ORDER", "NO_ACTION"]
     assert res.first_decision_index == 0 and res.unfilled_order_ids == ()
     assert res.rejections == ()
+    assert res.resizes == ()  # next-open mode, correctly-sized fills: the fill-time cap never triggers
+
+
+# ---------------------------------------------------------------------------------------------
+# custom DataFeed bypassing its own checks -- the engine must still catch it (engine.py:230-235)
+# ---------------------------------------------------------------------------------------------
+
+
+class _RawFeed:
+    """A minimal ``DataFeed`` that does none of ``BacktestFeed``'s own validation."""
+
+    def __init__(self, bars: list[Bar]) -> None:
+        self._bars = bars
+
+    def bars(self, symbol: str, timeframe: Timeframe) -> Iterator[Bar]:  # noqa: ARG002
+        return iter(self._bars)
+
+
+def test_engine_rejects_a_custom_feed_that_goes_backwards() -> None:
+    bars = bars_from_closes([100, 101, 102])
+    out_of_order = [bars[0], bars[2], bars[1]]
+    with pytest.raises(EngineError, match="backwards"):
+        run_backtest(_RawFeed(out_of_order), Scripted([0.0]), make_config())
+
+
+def test_engine_rejects_a_custom_feed_that_yields_a_foreign_symbol() -> None:
+    bars = bars_from_closes([100, 101, 102])
+    foreign = list(bars)
+    foreign[1] = Bar(
+        symbol="ETHUSDT",
+        timeframe=foreign[1].timeframe,
+        ts=foreign[1].ts,
+        open=foreign[1].open,
+        high=foreign[1].high,
+        low=foreign[1].low,
+        close=foreign[1].close,
+        volume=foreign[1].volume,
+    )
+    with pytest.raises(EngineError, match="ETHUSDT"):
+        run_backtest(_RawFeed(foreign), Scripted([0.0]), make_config())
 
 
 # ---------------------------------------------------------------------------------------------
@@ -278,6 +319,31 @@ def test_delay_model_fills_at_first_hourly_open_six_hours_after_the_signal_close
     assert res.equity[1].quantity == Dec("40.32258")
 
 
+def test_delay_mode_buy_resizes_and_fills_in_a_rising_market() -> None:
+    """BLOCKER from the Phase 2a review: the stub sizes the quantity at close(t) (10 bps buffer in the
+    real stub, 0 here for a cleaner repro); if the price keeps rising during the 6h manual delay, the
+    fill-time price is higher than what was sized for. The OLD broker rejected the BUY outright every
+    time (INSUFFICIENT_FUNDS) -- weight 1.0 in a rising market never entered. The FIX resizes the BUY
+    down to what cash still affords at the fill price instead of rejecting it."""
+    day0 = make_bar(0, "100", "100")
+    day1 = make_bar(0, "100", "104.8", start=day0.ts)  # opens exactly where day0 closes, no gap
+    hours = hour_bars_for_day(day1, [str(Decimal("100") + Decimal("0.2") * h) for h in range(24)])
+    cfg = make_config(
+        fee="50", slip="100", buffer="0", fill_delay=timedelta(hours=6), exec_timeframe=Timeframe.H1
+    )
+    res = run_backtest(BacktestFeed([day0, day1]), Scripted([1.0, 1.0]), cfg, exec_feed=BacktestFeed(hours))
+    assert len(res.fills) == 1  # must fill -- the old code produced zero fills and an INSUFFICIENT_FUNDS
+    fill = res.fills[0].fill
+    assert fill.ts == day0.ts + timedelta(hours=6)
+    assert fill.quantity == Dec("97.34150")  # capped by cash at the fill price, not the sized 98.51731
+    assert res.rejections == ()
+    (resize,) = res.resizes  # the resize is logged, with the requested and the actually filled quantity
+    assert resize.requested_quantity == Dec("98.51731")
+    assert resize.filled_quantity == Dec("97.34150")
+    assert "moved" in resize.reason
+    assert res.equity[1].quantity == Dec("97.34150") and res.equity[1].quantity > 0
+
+
 def test_delay_requires_exec_feed_and_finer_timeframe() -> None:
     days, _ = delay_setup()
     with pytest.raises(ValueError, match="exec_timeframe"):
@@ -334,7 +400,7 @@ def test_feed_is_reiterable() -> None:
 
 def test_sealed_holdout_bars_are_refused(monkeypatch: pytest.MonkeyPatch) -> None:
     start = CANONICAL_HOLDOUT_START - timedelta(days=2)
-    bars = [make_bar(i, "100", "100", start=start) for i in range(4)]  # last bars open inside the holdout
+    bars = [make_bar(i, "100", "100", start=start) for i in range(4)]  # last bar closes inside the holdout
     monkeypatch.delenv("TBOT_UNSEAL_HOLDOUT", raising=False)
     with pytest.raises(HoldoutLockError):
         BacktestFeed(bars)
@@ -344,7 +410,29 @@ def test_sealed_holdout_bars_are_refused(monkeypatch: pytest.MonkeyPatch) -> Non
     with pytest.raises(HoldoutLockError):
         BacktestFeed(bars)  # the other lock alone is not enough either
     assert len(BacktestFeed(bars, allow_holdout=True)) == 4
-    before = [make_bar(i, "100", "100", start=start) for i in range(2)]  # ends exactly at the boundary
+    # the shared predicate is by CLOSE time (``ts``), matching the loader (SPEC: "ts < holdout_start"):
+    # a bar whose close is exactly the boundary is already sealed, so "before" must close strictly earlier.
+    before = [make_bar(i, "100", "100", start=start - timedelta(days=1)) for i in range(2)]
     monkeypatch.delenv("TBOT_UNSEAL_HOLDOUT")
-    assert before[-1].ts == CANONICAL_HOLDOUT_START
+    assert before[-1].ts == CANONICAL_HOLDOUT_START - timedelta(days=1)
     assert len(BacktestFeed(before)) == 2
+    at_boundary = [make_bar(0, "100", "100", start=CANONICAL_HOLDOUT_START - timedelta(days=1))]
+    assert at_boundary[0].ts == CANONICAL_HOLDOUT_START
+    with pytest.raises(HoldoutLockError):
+        BacktestFeed(at_boundary)  # closing exactly at the boundary is already sealed, not "before" it
+
+
+def test_engine_level_holdout_guard_catches_a_custom_feed_that_skips_its_own_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A custom ``DataFeed`` (not ``BacktestFeed``) does none of the seal checking on its own; the
+    engine's own per-bar guard must still catch it, so the seal cannot be bypassed just by writing a
+    feed that does not call ``BacktestFeed.__init__``."""
+    sealed = [make_bar(0, "100", "100", start=CANONICAL_HOLDOUT_START)]
+    monkeypatch.delenv("TBOT_UNSEAL_HOLDOUT", raising=False)
+    with pytest.raises(HoldoutLockError):
+        run_backtest(_RawFeed(sealed), Scripted([0.0]), make_config())
+    with pytest.raises(HoldoutLockError):
+        run_backtest(_RawFeed(sealed), Scripted([0.0]), make_config(), allow_holdout=True)  # one lock
+    monkeypatch.setenv("TBOT_UNSEAL_HOLDOUT", "G4")
+    assert run_backtest(_RawFeed(sealed), Scripted([0.0]), make_config(), allow_holdout=True).n_bars == 1

@@ -7,7 +7,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from tbot.backtest.config import BacktestConfig
-from tbot.execution.simulated import FillRecord, OrderRejection
+from tbot.execution.simulated import FillRecord, OrderRejection, ResizeRecord
 from tbot.portfolio.ledger import TradeRecord
 from tbot.portfolio.portfolio import EquityPoint
 
@@ -41,6 +41,7 @@ class BacktestResult:
     equity: tuple[EquityPoint, ...]  # one per signal bar, marked at that bar's CLOSE
     fills: tuple[FillRecord, ...]
     rejections: tuple[OrderRejection, ...]  # orders the broker rejected at fill time
+    resizes: tuple[ResizeRecord, ...]  # BUYs capped down at fill time because cash fell short (D-051)
     decisions: tuple[DecisionRecord, ...]
     trades: tuple[TradeRecord, ...]  # closed flat -> flat round trips
     first_decision_index: int | None  # index into ``equity`` of the first bar a strategy decision was made
