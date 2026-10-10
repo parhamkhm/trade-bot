@@ -1,0 +1,80 @@
+{
+  "sample": {
+    "start": "2020-01-01T00:00:00+00:00",
+    "end_exclusive": "2025-10-01T00:00:00+00:00",
+    "years": 5.753
+  },
+  "n_funding_events": 6300,
+  "funding_always_long_pct_per_year": 13.17,
+  "funding_while_s0_long_pct_per_year": 11.97,
+  "s0": {
+    "rule": "close > SMA100 (1d), long/flat, weight 1.0, no stop",
+    "sides": 85,
+    "sides_per_year": 14.8,
+    "time_in_market_pct": 62.7
+  },
+  "scenarios": {
+    "perp_taker": {
+      "fee_saving_per_side_bps": 4.0,
+      "fee_saving_pct_per_year": 0.59,
+      "net_cost_of_perp_vs_spot_pct_per_year": 11.38,
+      "breakeven_sides_per_year": 299.0
+    },
+    "perp_maker": {
+      "fee_saving_per_side_bps": 8.0,
+      "fee_saving_pct_per_year": 1.18,
+      "net_cost_of_perp_vs_spot_pct_per_year": 10.79,
+      "breakeven_sides_per_year": 150.0
+    }
+  },
+  "by_year": [
+    {
+      "year": "2020",
+      "funding_always_long_pct": 17.24,
+      "funding_while_s0_long_pct": 18.17,
+      "s0_time_in_market_pct": 81.7,
+      "s0_sides": 15,
+      "share_of_8h_periods_positive_pct": 85.7
+    },
+    {
+      "year": "2021",
+      "funding_always_long_pct": 30.61,
+      "funding_while_s0_long_pct": 28.94,
+      "s0_time_in_market_pct": 68.8,
+      "s0_sides": 13,
+      "share_of_8h_periods_positive_pct": 92.7
+    },
+    {
+      "year": "2022",
+      "funding_always_long_pct": 4.16,
+      "funding_while_s0_long_pct": 0.56,
+      "s0_time_in_market_pct": 7.1,
+      "s0_sides": 8,
+      "share_of_8h_periods_positive_pct": 77.9
+    },
+    {
+      "year": "2023",
+      "funding_always_long_pct": 7.87,
+      "funding_while_s0_long_pct": 7.16,
+      "s0_time_in_market_pct": 75.6,
+      "s0_sides": 13,
+      "share_of_8h_periods_positive_pct": 89.9
+    },
+    {
+      "year": "2024",
+      "funding_always_long_pct": 11.96,
+      "funding_while_s0_long_pct": 11.03,
+      "s0_time_in_market_pct": 76.0,
+      "s0_sides": 18,
+      "share_of_8h_periods_positive_pct": 91.6
+    },
+    {
+      "year": "2025 (partial)",
+      "funding_always_long_pct": 3.95,
+      "funding_while_s0_long_pct": 3.01,
+      "s0_time_in_market_pct": 68.5,
+      "s0_sides": 18,
+      "share_of_8h_periods_positive_pct": 88.3
+    }
+  ]
+}

@@ -120,7 +120,8 @@ Secrets are `SecretStr`; they must never appear in logs, tracebacks, reports or 
 all three hold: `TBOT_LIVE_TRADING=true` **and** `runtime.phase >= 6` **and** `runtime.mode == "live"`.
 Loading a config with `mode: live` and `phase < 6` is a validation error. No other code may decide this.
 
-Key defaults: taker fee 35 bps, maker fee 33 bps per side (Tabdeal tier 1, D-047), slippage 5 bps per side, `requests_per_second: 5`,
+Key defaults: taker fee 10 bps, maker fee 10 bps per side (LBank spot VIP 0, verified, D-060), slippage 5 bps per side
+(provisional until the LBank G0 probe measures spread and slippage, D-060), `requests_per_second: 5`,
 `recv_window_ms: 5000`, `max_data_age_seconds: 900`, `annual_vol_target: 0.20`, `max_exposure: 1.0`.
 
 ---
@@ -284,8 +285,8 @@ fees and slippage appear in the ledger and reduce returns by the expected amount
 **G3 — Strategy (out-of-sample, after costs).** `maxDD ≤ 0.60 × maxDD(buy-and-hold)`,
 `Sharpe ≥ 0.80 × Sharpe(buy-and-hold)`, `PBO < 0.30`, Deflated Sharpe > 0 at the 95 % level using the trial
 count from `research/EXPERIMENTS.md`; neighbouring parameter sets (±1 grid step) keep ≥ 70 % of the Sharpe
-(no knife-edge optimum); ETH/USDT Sharpe > 0 with the same rules; fees and slippage ×2 (i.e. 70 bps taker fee + 10 bps slippage per
-side, D-047) keep the strategy profitable net of costs. Every phase-3 report states annual turnover and the
+(no knife-edge optimum); ETH/USDT Sharpe > 0 with the same rules; fees and slippage ×2 (i.e. 20 bps taker fee per side plus twice the
+slippage measured by the LBank G0 probe, D-060) keep the strategy profitable net of costs. Every phase-3 report states annual turnover and the
 annual cost drag (fees + slippage, % of equity per year) next to the returns.
 
 **G4 — Risk + regime + holdout.** The regime overlay is kept only if it improves OOS Sharpe, or cuts maxDD
@@ -353,13 +354,15 @@ drawdown exceeds the 95th percentile of the bootstrap distribution. Capital scal
 | D-046 | The G0 probe also samples BTCIRT and USDTIRT depth each round, for comparison only (the traded pair stays BTCUSDT), reports fillable BUY/SELL size within 0.1 % / 0.5 % of mid (median and p10 across samples) and the implied BTC/USDT basis (BTCIRT/USDTIRT vs BTCUSDT) | Parham's request: execution capacity and the IRT market as context for G0 |
 | D-047 | **Fees (supersedes D-018):** Tabdeal tier 1 (30-day volume < 1,000 USDT) taker 35 bps, maker 33 bps per side (tier 2: 35/31, tier 3: 33/28, tier 4: 31/26). Backtests assume taker unless a strategy explicitly uses limit orders; the G3 ×2 stress means 70 bps per side. Phase-3 reports must show turnover and annual cost drag. Whether USDT markets use the same table is still to verify | Parham's fee-table review (2026-10-06). A pre-registration update made **before any strategy result** exists — it tightens, never loosens: a round trip now costs ≈ 0.8 % (2 × 35 bps fee + spread/slippage), which leaves only slow, low-turnover variants realistic |
 | D-053 | PR #2 review round: the late-trade / sealed-hour cursor lives in SQLite only (`sweep_cursor`, advanced after each written candle and reconciled with Parquet once per sweep, outside the poll transaction) — no Parquet access on the trade-ingestion path. Every downstream step (candle sweep, post-commit candle rewrites, order-book snapshot, heartbeat write) is isolated: a failure is logged at error level and counted in the heartbeat's `consecutive_cycle_exceptions` (healthcheck fails at 3), never via backoff or process exit. An unparsable item's gap anchors to its own plausible time, else its parsed neighbours' hour span | CLAUDE.md §3.8 (raw data first). Review M-1: one unreadable Parquet part stopped all trade recording, and Tabdeal keeps only ~29 h of history |
+| D-060 | **Fees (supersedes D-047 for the traded venue):** LBank **spot**, Parham's VIP 0 account, verified 2026-10-10: taker 10 bps, maker 10 bps per side (VIP1 8/8, VIP2 7/6.5, VIP3 6/5, VIP4 5/4, VIP5 4/3, VIP6 3.5/2, SVIP 3/0). Backtests assume taker unless a strategy explicitly uses limit orders; the G3 ×2 stress means **20 bps per side**. Spread and slippage are **not assumed**: the 5 bps slippage default is a provisional placeholder that the LBank G0 probe's measured spread/depth replaces before any phase-3 result. The perpetual table (taker 6 / maker 2 bps at VIP 0) is recorded in `docs/COMPARISON.md` only — we do not trade it (D-061) | The venue changed (Tabdeal → LBank) and the fee is read from the account, not guessed. This **lowers** the cost assumption (35 → 10 bps), which D-047 said pre-registration must not do after results are seen; it is legitimate here only because no strategy result exists yet (no row in `research/EXPERIMENTS.md`) and the number is a verified fact of the new venue, not a choice. From now on fees may only change to a newly verified schedule, never to rescue a result |
+| D-061 | **We stay on spot; no perpetual, even unleveraged.** Typical long funding is about 0.01 % per 8 h, i.e. roughly 11 % a year, and more in euphoric markets — far above the perpetual's fee saving, and a perpetual adds liquidation/ADL risk. Binance BTCUSDT funding, 2020-01 to 2025-09 (pre-holdout, 6,300 events, `research/funding_vs_spot_fees.py`): an always-long perpetual paid **13.2 % a year** (17.2 / 30.6 / 4.2 / 7.9 / 12.0 % in 2020–2024, 4.0 % in Jan–Sep 2025; longs paid in ~88 % of 8 h periods). Held only while the S0 proxy (close > SMA100, 1d, 62.7 % in the market) is long, it still paid **12.0 % a year**, because funding is highest in the bull trends a trend follower holds. S0 traded 14.8 sides a year, so the fee saving is only **0.6 % a year** (perp taker 6 vs spot 10 bps) or **1.2 %** (perp maker 2 bps): the perpetual costs **10.8–11.4 % a year more** than spot. Breakeven needs 150–300 sides a year, 10–20× S0's turnover. Volatility targeting scales both sides by the same weight, so the conclusion does not change | Parham's request 2026-10-10: back the spot decision with data, not intuition. Caveats: Binance funding is the stand-in; LBank perpetual funding is recorded from 2026-10-10 13:39:59 UTC and its correlation with Binance is reported once they overlap. The S0 proxy has no stop yet (S0 questions open); a stop adds turnover but stays far below breakeven. This is a cost computation, not a strategy trial (no return metric), so it is not in the trial count |
 
 ---
 
 ## 9. Open questions (need Parham or the probe to answer)
 
-1. ~~Tabdeal fee tier~~ — answered by Parham (D-047): tier 1, taker 35 / maker 33 bps. Still open: whether
-   USDT-quoted markets use the same table.
+1. ~~Fee tier~~ — answered by Parham: LBank spot VIP 0, taker 10 / maker 10 bps, verified from his account
+   (D-060; supersedes the Tabdeal answer in D-047). Spread and slippage: from the LBank G0 probe.
 2. **Real `exchangeInfo` filters** for BTCUSDT/ETHUSDT (tick, step, min-notional) — unknown until G0.
 3. **Rate limits** (undocumented). Start at 5 req/s; the probe reports observed headers and any 429.
 4. **Does any endpoint require `tabdealSymbol=BTC_USDT`** instead of `symbol=BTCUSDT`?
