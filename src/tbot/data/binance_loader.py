@@ -98,9 +98,11 @@ __all__ = [
     "checksum_url",
     "detect_timestamp_unit",
     "ingest_symbol_timeframe",
+    "is_holdout_sealed",
     "latest_complete_month",
     "load_bars",
     "load_frame",
+    "log_holdout_event",
     "monthly_zip_name",
     "monthly_zip_url",
     "months_between",
@@ -931,6 +933,16 @@ def _resolve_repo_root(start: Path | None = None) -> Path:
     )
 
 
+def is_holdout_sealed(ts: datetime) -> bool:
+    """Single predicate for "is this bar CLOSE time inside the sealed holdout" (SPEC section 5.2: the
+    default loader returns only bars with ``ts < holdout_start``, so a sealed bar is ``ts >=
+    holdout_start``). ``load_bars``/``load_frame`` below and ``tbot.backtest.feed.BacktestFeed`` and
+    the backtest engine's own per-bar guard all call this one function, so the boundary cannot quietly
+    diverge between the data layer and the backtest layer (it did before: the feed used to check the
+    OPEN time of only the last bar, the loader checked the CLOSE time of every bar)."""
+    return ts >= CANONICAL_HOLDOUT_START
+
+
 def _default_holdout_log_path() -> Path:
     return _resolve_repo_root() / "research" / "HOLDOUT_LOG.md"
 
@@ -947,6 +959,15 @@ def _append_holdout_log(log_path: Path, *, caller: str, reason: str, outcome: st
         )
     with log_path.open("a", encoding="utf-8") as fh:
         fh.write(row)
+
+
+def log_holdout_event(*, caller: str, reason: str, outcome: str, log_path: Path | None = None) -> None:
+    """Append one row to the holdout log for a caller with no ``DataConfig`` of its own -- the backtest
+    feed and engine, which have only ``allow_holdout``/the env var, not a full ``_resolve_holdout_access``
+    call. Resolves the default log path the same lazy way ``_resolve_holdout_access`` does, so a plain
+    read never needs to; this is the only other function that writes to the holdout log."""
+    resolved_path = log_path if log_path is not None else _default_holdout_log_path()
+    _append_holdout_log(resolved_path, caller=caller, reason=reason, outcome=outcome)
 
 
 def _resolve_holdout_access(
@@ -1048,7 +1069,7 @@ def load_bars(
     )
     records = store_mod.table_to_records(table)
     if not unsealed:
-        records = [r for r in records if r.ts < CANONICAL_HOLDOUT_START]
+        records = [r for r in records if not is_holdout_sealed(r.ts)]
     return [
         Bar(
             symbol=symbol,
@@ -1095,7 +1116,8 @@ def load_frame(
     )
     df = table.to_pandas()
     if not unsealed and not df.empty:
-        df = df.loc[df["ts"] < CANONICAL_HOLDOUT_START].reset_index(drop=True)
+        sealed = df["ts"].map(is_holdout_sealed).astype(bool)  # the one shared predicate
+        df = df.loc[~sealed].reset_index(drop=True)
     if as_float:
         for column in ("open", "high", "low", "close", "volume", "quote_volume"):
             df[column] = df[column].astype(float)
