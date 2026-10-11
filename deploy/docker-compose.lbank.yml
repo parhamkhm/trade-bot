@@ -1,0 +1,44 @@
+# Compose project for the LBank raw market-data recorder (pivot plan, step 0).
+# Separate project, container, image tag and named volume from the Tabdeal recorder, so the two can
+# run side by side and be stopped independently. Public endpoints only: no env_file, no credentials.
+# No `ports:` -- the recorder only makes outbound calls (Docker-published ports bypass ufw).
+#
+# Validate with: docker compose -f deploy/docker-compose.lbank.yml config
+
+name: tbot-lbank
+
+services:
+  lbank-recorder:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: tbot-lbank-recorder:latest
+    container_name: tbot-lbank-recorder
+    restart: unless-stopped
+    stop_grace_period: 30s
+    entrypoint: ["python", "-m", "scripts.record_lbank", "--data-dir", "/app/data/lbank"]
+    environment:
+      TZ: UTC
+      TBOT_LBANK_HEARTBEAT_FILE: /app/data/lbank/heartbeat.json
+    volumes:
+      - tbot-lbank-data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-m", "scripts.lbank_healthcheck"]
+      interval: 30s
+      timeout: 10s
+      start_period: 90s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+volumes:
+  tbot-lbank-data:
+    name: tbot-lbank-data
