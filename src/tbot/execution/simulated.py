@@ -457,8 +457,8 @@ class SimulatedBroker:
         SELLs are never capped. A BUY is capped to what cash affords at the fill price, and the price is
         then re-derived at the capped quantity (a size-dependent slippage model prices a smaller order
         better); this repeats until the quantity is stable. The quantity only ever shrinks, so the loop
-        ends; if the bound is hit anyway the last candidate is returned unconfirmed and ``_fill_problem``
-        rejects it rather than letting the books go negative."""
+        ends; if the bound is hit anyway the last candidate is returned unconfirmed: it still fills when cash
+        affords it at its own price, and ``_fill_problem`` rejects it otherwise, so the books never go negative."""
         quantity = req.quantity
         price = self._fill_price(req.side, quantity, bar)
         if req.side is not Side.BUY:
