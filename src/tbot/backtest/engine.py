@@ -166,6 +166,7 @@ class _Run:
             quote_asset=config.quote_asset,
             initial_cash=config.initial_cash,
             fill_delay=config.fill_delay,
+            resize_anomaly_threshold=config.resize_anomaly_threshold,
         )
         self.warmup = effective_warmup_bars(strategy, regime)
         self.history: list[Bar] = []
@@ -287,6 +288,7 @@ def run_backtest(
         else None
     )
     guard = _SealGuard(allow_holdout=allow_holdout)
+    exec_timeframe = config.exec_timeframe or config.timeframe  # the bars orders actually fill on
     previous: Bar | None = None
     for bar in feed.bars(config.symbol, config.timeframe):
         if bar.symbol != config.symbol or bar.timeframe != config.timeframe:
@@ -298,6 +300,11 @@ def run_backtest(
         previous = bar
         guard.check(bar, caller="run_backtest:signal_feed")
         for exec_bar in cursor.pop_until(bar.ts) if cursor is not None else (bar,):
+            if exec_bar.symbol != config.symbol or exec_bar.timeframe != exec_timeframe:
+                raise EngineError(
+                    f"exec feed yielded {exec_bar.symbol}/{exec_bar.timeframe}, "
+                    f"expected {config.symbol}/{exec_timeframe}"
+                )
             guard.check(exec_bar, caller="run_backtest:exec_feed")
             run.execute(exec_bar)
         run.history.append(bar)

@@ -15,11 +15,19 @@ from tbot.backtest.engine import EngineError, _fast_window, run_backtest
 from tbot.backtest.feed import BacktestFeed, FeedError
 from tbot.backtest.report import build_report, is_run_invalid
 from tbot.backtest.result import BacktestResult
+from tbot.backtest.risk_stub import StubRiskManager
 from tbot.core.types import Bar, BarWindow, RegimeState, Side, TargetIntent, Timeframe
 from tbot.data.binance_loader import CANONICAL_HOLDOUT_START, HoldoutLockError
 from tbot.strategies.base import StrategyRegistrationError
 from tests.backtest.helpers import CountingFeed, Recorder, Scripted, make_config
-from tests.sim_helpers import SYMBOL, T_START, bars_from_closes, hour_bars_for_day, make_bar
+from tests.sim_helpers import (
+    SYMBOL,
+    T_START,
+    bars_from_closes,
+    hour_bars_for_day,
+    lbank_like_filters,
+    make_bar,
+)
 
 Dec = Decimal
 
@@ -313,7 +321,8 @@ def test_delay_model_fills_at_first_hourly_open_six_hours_after_the_signal_close
     res = run_backtest(BacktestFeed(days), Scripted([0.5, 0.5]), cfg, exec_feed=BacktestFeed(hours))
     (rec,) = res.fills
     signal_close = T_START + timedelta(days=1)
-    assert rec.fill.ts == signal_close + timedelta(hours=6)
+    assert rec.fill.ts == signal_close + timedelta(hours=6)  # exactly close + 6 h on contiguous 1h data
+    assert rec.gap_fill is False
     assert rec.reference_price == Dec("130")  # open of the 06:00 hourly bar
     assert rec.fill.price == Dec("131.30")  # adverse +1 %
     # sized at the signal close (124): 5000 / 124 = 40.32258 (floored to the step size)
@@ -323,11 +332,11 @@ def test_delay_model_fills_at_first_hourly_open_six_hours_after_the_signal_close
 
 
 def test_delay_mode_buy_resizes_and_fills_in_a_rising_market() -> None:
-    """BLOCKER from the Phase 2a review: the stub sizes the quantity at close(t) (10 bps buffer in the
-    real stub, 0 here for a cleaner repro); if the price keeps rising during the 6h manual delay, the
-    fill-time price is higher than what was sized for. The OLD broker rejected the BUY outright every
-    time (INSUFFICIENT_FUNDS) -- weight 1.0 in a rising market never entered. The FIX resizes the BUY
-    down to what cash still affords at the fill price instead of rejecting it."""
+    """BLOCKER from the Phase 2a review: the stub sizes the quantity at close(t); if the price keeps
+    rising during the 6h manual delay, the fill-time price is higher than what was sized for. The OLD
+    broker rejected the BUY outright every time (INSUFFICIENT_FUNDS) -- weight 1.0 in a rising market never
+    entered. The FIX resizes the BUY down to what cash still affords at the fill price instead of
+    rejecting it. (Since 2026-10-11 next-open mode does the same, see the gap-up tests below.)"""
     day0 = make_bar(0, "100", "100")
     day1 = make_bar(0, "100", "104.8", start=day0.ts)  # opens exactly where day0 closes, no gap
     hours = hour_bars_for_day(day1, [str(Decimal("100") + Decimal("0.2") * h) for h in range(24)])
@@ -343,24 +352,164 @@ def test_delay_mode_buy_resizes_and_fills_in_a_rising_market() -> None:
     (resize,) = res.resizes  # the resize is logged, with the requested and the actually filled quantity
     assert resize.requested_quantity == Dec("98.51731")
     assert resize.filled_quantity == Dec("97.34150")
-    assert "moved" in resize.reason
+    # 0.2 %/h for 6 h plus 1 % slippage is a 1.19 % cap: above the 1 % threshold, so it is an ANOMALY
+    # (a mis-sizing symptom, not a price move) and the run is flagged INVALID -- but still not rejected.
+    assert resize.kind == "anomaly" and resize.reason.startswith("anomaly")
     assert res.equity[1].quantity == Dec("97.34150") and res.equity[1].quantity > 0
+    report = build_report(res)
+    assert report["health"]["resizes_anomaly"] == 1 and report["health"]["resizes_price_move"] == 0
+    assert is_run_invalid(report) and report["health"]["fill_rejections"] == 0
 
 
-def test_next_open_mode_keeps_the_exchange_like_rejection_in_a_rising_market() -> None:
-    """Counterpart of the delay-mode resize test (coordinator decision): with fill_delay == 0 the BUY is NOT
-    resized. The same kind of price move (the next open gaps above what the order was sized for) leaves the
-    order rejected whole with INSUFFICIENT_FUNDS, counted in ``rejections``, with no ResizeRecord, and the
-    report flags the run as invalid."""
+def test_delay_mode_realistic_drift_is_a_price_move_resize_and_not_invalid() -> None:
+    """The same rising market at a realistic 0.02 %/h (opens 100.00 ... 100.46): over the 6 h delay the
+    price drifts 0.12 %, the BUY is capped by 0.13 % of the requested quantity: a price_move."""
     day0 = make_bar(0, "100", "100")
-    day1 = make_bar(0, "105", "105", start=day0.ts)  # gaps +5 %, far above the 1.5 % cost buffer
-    cfg = make_config(fee="50", slip="100", buffer="0")
-    res = run_backtest(BacktestFeed([day0, day1]), Scripted([1.0, 1.0]), cfg)
-    assert res.fills == () and res.resizes == ()
-    (rej,) = res.rejections
-    assert "INSUFFICIENT_FUNDS" in rej.reason
-    assert res.equity[1].quantity == 0
-    assert is_run_invalid(build_report(res))
+    day1 = make_bar(0, "100", "100.48", start=day0.ts)
+    hours = hour_bars_for_day(day1, [str(Decimal("100") + Decimal("0.02") * h) for h in range(24)])
+    cfg = make_config(fee="35", slip="5", fill_delay=timedelta(hours=6), exec_timeframe=Timeframe.H1)
+    res = run_backtest(BacktestFeed([day0, day1]), Scripted([1.0, 1.0]), cfg, exec_feed=BacktestFeed(hours))
+    assert res.rejections == ()
+    (resize,) = res.resizes
+    # open 100.12 -> *1.0005 = 100.17006 -> ceil tick 100.18; unit cost 100.18 * 1.0035 = 100.53063
+    assert resize.requested_quantity == Dec("99.60142")
+    assert resize.filled_quantity == Dec("99.47217")  # floor_5(10000 / 100.53063)
+    assert resize.kind == "price_move" and resize.reason.startswith("price_move")
+    (rec,) = res.fills
+    assert rec.fill.price == Dec("100.18") and rec.fill.fee == Dec("34.8779269671")
+    report = build_report(res)
+    assert report["health"]["resizes"] == 1 and report["health"]["resizes_price_move"] == 1
+    assert report["health"]["resizes_anomaly"] == 0
+    assert not is_run_invalid(report)
+
+
+def gap_up_run(gap: str, delay: timedelta) -> tuple[BacktestResult, Decimal]:
+    """Sized at close(0) = 100 with fee 35 bps, slippage 5 bps and NO extra buffer; the fill price is then
+    100 * (1 + gap): at the next open (``delay == 0``) or at the open of the 06:00 hourly bar (6 h delay),
+    where the price has jumped from 100 to the gapped level. Returns the result and the fill-time open."""
+    fill_open = Dec("100") * (1 + Dec(gap) / 100)
+    day0 = make_bar(0, "100", "100")
+    if delay == timedelta(0):
+        day1 = make_bar(0, str(fill_open), str(fill_open), start=day0.ts)
+        res0 = run_backtest(BacktestFeed([day0, day1]), Scripted([1.0, 1.0]), make_config(fee="35", slip="5"))
+        return res0, fill_open
+    day1 = make_bar(0, "100", str(fill_open), start=day0.ts)
+    opens = ["100"] * 6 + [str(fill_open)] * 18
+    cfg = make_config(fee="35", slip="5", fill_delay=delay, exec_timeframe=Timeframe.H1)
+    exec_feed = BacktestFeed(hour_bars_for_day(day1, opens))
+    res = run_backtest(BacktestFeed([day0, day1]), Scripted([1.0, 1.0]), cfg, exec_feed=exec_feed)
+    return res, fill_open
+
+
+@pytest.mark.parametrize("delay", [timedelta(0), timedelta(hours=6)], ids=["next_open", "delay_6h"])
+@pytest.mark.parametrize(
+    ("gap", "price", "quantity", "fee", "cash", "kind"),
+    [
+        # +0.43 %: the largest real open gap in the data. open 100.43 -> 100.480215 -> ceil tick 100.49;
+        # unit cost 100.49 * 1.0035 = 100.841715; floor_5(10000 / 100.841715) = 99.16531
+        ("0.43", "100.49", "99.16531", "34.87792700665", "0.00007109335", "price_move"),
+        # +5 %: open 105 -> 105.0525 -> 105.06; unit cost 105.06 * 1.0035 = 105.42771; 10000/that -> 94.85172
+        ("5", "105.06", "94.85172", "34.8779259612", "0.0003708388", "anomaly"),
+    ],
+)
+def test_gap_up_open_is_capped_not_rejected_in_both_fill_modes(
+    delay: timedelta, gap: str, price: str, quantity: str, fee: str, cash: str, kind: str
+) -> None:
+    """(a) D-051 as revised 2026-10-11: a BUY is sized at fill time from the real fill price and the cash on
+    hand in BOTH modes. A gap-up between sizing (close 100, requested 99.60142) and the fill never produces
+    INSUFFICIENT_FUNDS; the cap is logged as a ResizeRecord, the position is filled, fee and cash are exact.
+    Item 4: the +0.43 % gap (0.44 % of the quantity) is a price_move and the run stays valid; the +5 % gap
+    (4.8 % of the quantity) is an anomaly and marks the run INVALID -- still with zero rejections."""
+    res, _ = gap_up_run(gap, delay)
+    assert res.rejections == ()
+    (resize,) = res.resizes
+    assert resize.requested_quantity == Dec("99.60142")  # floor_5(10000 / (1.0005 * 1.0035) / 100)
+    assert resize.filled_quantity == Dec(quantity)
+    (rec,) = res.fills
+    assert rec.fill.price == Dec(price) and rec.fill.quantity == Dec(quantity)
+    assert rec.fill.fee == Dec(fee)
+    assert rec.fill.price * rec.fill.quantity * Dec("35") / Dec(10000) == rec.fill.fee
+    assert res.equity[1].quantity == Dec(quantity)
+    assert res.equity[1].cash == Dec("10000") - rec.fill.price * rec.fill.quantity - rec.fill.fee == Dec(cash)
+    assert res.fees_paid == Dec(fee)
+    assert resize.kind == kind and resize.reason.startswith(kind)
+    health = build_report(res)["health"]
+    assert health["resizes"] == 1 and health["fill_rejections"] == 0
+    assert health["resizes_price_move"] == (1 if kind == "price_move" else 0)
+    assert health["resizes_anomaly"] == (1 if kind == "anomaly" else 0)
+    assert is_run_invalid(build_report(res)) is (kind == "anomaly")
+
+
+def test_buy_buffer_defaults_to_zero() -> None:
+    """The stub's sizing divisor already includes fee and slippage and the broker caps at fill time, so the
+    default extra buffer is 0 (it was 10 bps before the 2026-10-11 decision)."""
+    cfg = BacktestConfig(
+        symbol=SYMBOL,
+        timeframe=Timeframe.D1,
+        filters=lbank_like_filters(),
+        costs=make_config().costs,
+    )
+    assert cfg.buy_buffer_bps == 0
+    stub = StubRiskManager(taker_fee_bps=Dec("35"), slippage_bps=Dec("5"))
+    assert stub._cost_factor == Dec("1.0005") * Dec("1.0035")
+
+
+@pytest.mark.parametrize("exec_tf", [Timeframe.H4, Timeframe.D1])
+def test_delay_mode_refuses_coarser_than_hourly_exec_bars(exec_tf: Timeframe) -> None:
+    """Item 1: with 4h/1d execution bars the 6 h delay would silently stretch (fill at the first bar OPENING
+    at or after close + 6 h = up to 24 h later). The config refuses it instead of accepting it."""
+    with pytest.raises(ValueError, match=r"1h|finer"):
+        BacktestConfig(
+            symbol=SYMBOL,
+            timeframe=Timeframe.D1,
+            filters=lbank_like_filters(),
+            costs=make_config().costs,
+            fill_delay=timedelta(hours=6),
+            exec_timeframe=exec_tf,
+        )
+
+
+def test_engine_refuses_an_exec_feed_that_yields_the_wrong_timeframe() -> None:
+    """Item 1, engine level: a custom exec feed that ignores the requested timeframe and hands back daily bars
+    (the config says 1h) is an EngineError, never a silently stretched delay."""
+    days, _ = delay_setup()
+    cfg = make_config(fill_delay=timedelta(hours=6), exec_timeframe=Timeframe.H1)
+    with pytest.raises(EngineError, match="exec feed yielded"):
+        run_backtest(BacktestFeed(days), Scripted([0.5]), cfg, exec_feed=_RawFeed(days))
+
+
+@pytest.mark.parametrize("delay", [timedelta(0), timedelta(hours=6)], ids=["next_open", "delay_6h"])
+def test_exit_after_a_resized_buy_sells_exactly_the_held_quantity(delay: timedelta) -> None:
+    """Item 2: the exit is sized from the ACTUAL held quantity (the portfolio is booked from fills, which
+    carry the capped quantity -- engine.py `_Run.execute`), not from the originally requested one. The BUY
+    is capped by a +0.43 % gap, the next signal flattens: the SELL is exactly the held 99.16531."""
+    day0 = make_bar(0, "100", "100")
+    if delay == timedelta(0):
+        day1 = make_bar(0, "100.43", "100.43", start=day0.ts)
+        day2 = make_bar(0, "100.43", "100.43", start=day1.ts)
+        res = run_backtest(
+            BacktestFeed([day0, day1, day2]), Scripted([1.0, 0.0, 0.0]), make_config(fee="35", slip="5")
+        )
+    else:
+        day1 = make_bar(0, "100", "100.43", start=day0.ts)
+        day2 = make_bar(0, "100.43", "100.43", start=day1.ts)
+        hours = hour_bars_for_day(day1, ["100"] * 6 + ["100.43"] * 18) + hour_bars_for_day(
+            day2, ["100.43"] * 24
+        )
+        cfg = make_config(fee="35", slip="5", fill_delay=delay, exec_timeframe=Timeframe.H1)
+        res = run_backtest(
+            BacktestFeed([day0, day1, day2]), Scripted([1.0, 0.0, 0.0]), cfg, exec_feed=BacktestFeed(hours)
+        )
+    assert res.rejections == ()
+    (resize,) = res.resizes  # only the BUY was resized
+    buy, sell = (r.fill for r in res.fills)
+    assert (buy.side, sell.side) == (Side.BUY, Side.SELL)
+    assert buy.quantity == resize.filled_quantity == Dec("99.16531") < resize.requested_quantity
+    assert sell.quantity == buy.quantity  # exactly what was held, not the requested 99.60142
+    assert res.equity[1].quantity == Dec("99.16531") and res.equity[2].quantity == Dec(0)
+    assert res.unfilled_order_ids == ()
+    (trade,) = res.trades
+    assert trade.quantity == Dec("99.16531")
 
 
 def test_delay_requires_exec_feed_and_finer_timeframe() -> None:

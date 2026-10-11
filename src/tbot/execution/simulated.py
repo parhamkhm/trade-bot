@@ -14,17 +14,28 @@ is handed each execution bar as it becomes available:
 * Quantity must already be a multiple of the step size, at least ``min_qty`` and at most ``max_qty``
   (checked at submit); the fill-time notional must reach ``min_notional``. Violations are rejected,
   never silently rounded -- exactly what the live exchange will do with the same ``SymbolFilters``.
-* **Manual-delay mode only (``fill_delay > 0``, D-051): a BUY is resized, not rejected outright, when the
-  price has moved against it since it was sized** (the risk manager sizes at ``close(t)``, but the fill
-  price is read minutes or hours later). At fill time the quantity is capped at
-  ``floor_to_step(cash / (fill_price * (1 + taker_fee_rate)))`` -- the most the current cash can still
-  afford at the actual fill price, mirroring what a manual trader does when placing the order. Every
-  resize is reported as an explicit :class:`ResizeRecord` (requested vs. filled quantity, reason), never
-  silently, and is queryable per order via :meth:`SimulatedBroker.resize_of`.
-* In next-open mode (``fill_delay == 0``) there is NO resize: an automated market order that the exchange
-  cannot cover is rejected (``INSUFFICIENT_FUNDS``), counted as a fill rejection and flagged by the
-  report's INVALID RUN rule. A SELL is never capped in either mode: it is rejected whole if the position
-  does not cover it -- a long-only book has no symmetric "resize down" for an exit.
+* **In BOTH fill modes (next-open and manual delay, D-051) a BUY is sized at fill time, not rejected, when
+  the price has moved against it since the risk manager sized it at ``close(t)``.** At fill time the
+  quantity is capped at ``floor_to_step(cash / (fill_price * (1 + taker_fee_rate)))`` -- the most the
+  current cash can still afford at the actual fill price. This mirrors live behaviour: an automated market
+  buy is sized at the open from the real price and the real cash (quote-amount market buy), and a manual
+  order is sized when it is placed. Every cap is reported as an explicit :class:`ResizeRecord` (requested
+  vs. filled quantity, reason, kind), never silently, is counted in the report, and is queryable per order
+  via :meth:`SimulatedBroker.resize_of`. A cap that leaves zero, or less than ``min_qty`` /
+  ``min_notional``, is still rejected (and counted as a fill rejection, which the report's INVALID RUN rule
+  flags).
+* The fill price is re-derived at the FINAL capped quantity (the slippage model may be size dependent, e.g.
+  the depth curve of SPEC section 7): cap, re-price, re-check affordability, repeat until the quantity is
+  stable (at most ``_MAX_CAP_ITERATIONS`` rounds; the quantity only ever shrinks). The books are never
+  overdrawn: if no stable quantity is found, the order is rejected with ``INSUFFICIENT_FUNDS``.
+* Resize kinds: the fraction of the REQUESTED quantity capped away is compared with
+  ``resize_anomaly_threshold`` (default 1 %; the largest real open-vs-close gap in the data is 0.43 %).
+  ``"price_move"`` (fraction <= threshold) is ordinary price movement between sizing and fill;
+  ``"anomaly"`` (fraction > threshold) means the order was sized wrongly, not that the price moved. The
+  broker still fills an anomaly (the cap itself is correct), but the backtest report flags the run as
+  INVALID exactly as it does for a fill rejection.
+* A SELL is never capped in either mode: it is rejected whole if the position does not cover it -- a
+  long-only book has no symmetric "resize down" for an exit.
 * LIMIT orders are rejected: SPEC defines no limit-fill semantics yet (needs a maker/queue model).
 
 Fees and slippage come from ``FeeSchedule`` / ``SlippageModel`` objects built from configuration.
@@ -36,7 +47,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
-from typing import Protocol
+from typing import Literal, Protocol
 
 from tbot.core.config import CostConfig
 from tbot.core.types import (
@@ -58,6 +69,7 @@ __all__ = [
     "FillRecord",
     "FlatSlippage",
     "OrderRejection",
+    "ResizeKind",
     "ResizeRecord",
     "SimulatedBroker",
     "SlippageContext",
@@ -67,6 +79,11 @@ __all__ = [
 
 _BPS = Decimal(10_000)
 _ZERO = Decimal(0)
+_ONE = Decimal(1)
+DEFAULT_RESIZE_ANOMALY_THRESHOLD = Decimal("0.01")
+_MAX_CAP_ITERATIONS = 8  # cap -> re-price -> re-check rounds; the quantity only shrinks, so this is generous
+
+ResizeKind = Literal["price_move", "anomaly"]
 
 
 class BrokerError(RuntimeError):
@@ -167,13 +184,22 @@ class OrderRejection:
 class ResizeRecord:
     """A BUY whose quantity was capped down at fill time because cash no longer covered the amount it
     was sized at (see the module docstring). Logged whether the resized order then filled or was still
-    rejected (e.g. the resized quantity fell below ``min_qty``/``min_notional``)."""
+    rejected (e.g. the resized quantity fell below ``min_qty``/``min_notional``).
+
+    ``kind`` is ``"price_move"`` when the capped fraction of the requested quantity is at most the broker's
+    ``resize_anomaly_threshold`` and ``"anomaly"`` above it (a sizing bug, not price movement)."""
 
     client_order_id: str
     ts: datetime
     requested_quantity: Decimal
     filled_quantity: Decimal
     reason: str
+    kind: ResizeKind
+
+    @property
+    def capped_fraction(self) -> Decimal:
+        """Share of the requested quantity that was capped away, in ``[0, 1]``."""
+        return (self.requested_quantity - self.filled_quantity) / self.requested_quantity
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,9 +240,13 @@ class SimulatedBroker:
         quote_asset: str,
         initial_cash: Decimal,
         fill_delay: timedelta = timedelta(0),
+        resize_anomaly_threshold: Decimal = DEFAULT_RESIZE_ANOMALY_THRESHOLD,
     ) -> None:
         if fill_delay < timedelta(0):
             raise ValueError("fill_delay must be >= 0")
+        if not resize_anomaly_threshold.is_finite() or not _ZERO <= resize_anomaly_threshold <= _ONE:
+            raise ValueError("resize_anomaly_threshold must be a Decimal in [0, 1]")
+        self._anomaly_threshold = resize_anomaly_threshold
         if base_asset == quote_asset:
             raise ValueError("base_asset and quote_asset must differ")
         self._filters = filters
@@ -266,8 +296,8 @@ class SimulatedBroker:
     def get_order(self, client_order_id: str) -> OrderStatus:
         """Current status of an order.
 
-        ``quantity`` is always the REQUESTED quantity. A BUY that was resized at fill time (manual-delay
-        mode only, see the module docstring) is reported as ``FILLED`` with ``filled_quantity < quantity``
+        ``quantity`` is always the REQUESTED quantity. A BUY that was capped at fill time (both fill modes,
+        see the module docstring) is reported as ``FILLED`` with ``filled_quantity < quantity``
         (``remaining`` is then the resized-away amount, NOT working on the book; nothing is left pending).
         ``OrderStatus`` has no resized flag (``core/types.py`` is frozen for this agent), so use
         :meth:`resize_of` / :meth:`was_resized` to tell a resized fill from any other state.
@@ -369,32 +399,56 @@ class SimulatedBroker:
         raw = bar.open * (1 - bps / _BPS)
         return (raw / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
 
-    def _resolve_buy_quantity(self, req: OrderRequest, price: Decimal) -> tuple[Decimal, str | None]:
-        """Cap a BUY's quantity to what current cash affords at the actual fill price (module docstring).
-        Only in manual-delay mode (``fill_delay > 0``); in next-open mode and for SELLs the requested
-        quantity is returned untouched. Returns ``(quantity, resize_reason)``; ``resize_reason`` is
-        ``None`` when the full requested quantity is used."""
-        if req.side is not Side.BUY or self._delay <= timedelta(0):
-            return req.quantity, None
+    def _affordable_quantity(self, price: Decimal) -> Decimal:
+        """Most the current cash buys at ``price`` including the taker fee, floored to the step size."""
         unit_cost = price * (1 + self._fees.taker_bps / _BPS)
-        if unit_cost <= 0:
-            return req.quantity, None
-        max_qty = self._filters.floor_qty(self._cash / unit_cost)
-        if max_qty >= req.quantity:
-            return req.quantity, None
-        return max(max_qty, _ZERO), "price moved since the order was sized: cash no longer covers it"
+        return self._filters.floor_qty(self._cash / unit_cost)
+
+    def _size_at_fill(self, req: OrderRequest, bar: Bar) -> tuple[Decimal, Decimal]:
+        """Final ``(quantity, fill_price)`` for an order at this bar's open (module docstring).
+
+        SELLs are never capped. A BUY is capped to what cash affords at the fill price, and the price is
+        then re-derived at the capped quantity (a size-dependent slippage model prices a smaller order
+        better); this repeats until the quantity is stable. The quantity only ever shrinks, so the loop
+        ends; if the bound is hit anyway the last candidate is returned unconfirmed and ``_fill_problem``
+        rejects it rather than letting the books go negative."""
+        quantity = req.quantity
+        price = self._fill_price(req.side, quantity, bar)
+        if req.side is not Side.BUY:
+            return quantity, price
+        for _ in range(_MAX_CAP_ITERATIONS):
+            affordable = self._affordable_quantity(price)
+            if affordable >= quantity:
+                break
+            quantity = affordable
+            if quantity <= _ZERO:
+                break
+            price = self._fill_price(req.side, quantity, bar)
+        return quantity, price
+
+    def _resize_record(self, req: OrderRequest, bar: Bar, quantity: Decimal) -> ResizeRecord:
+        fraction = (req.quantity - quantity) / req.quantity
+        threshold = self._anomaly_threshold
+        if fraction > threshold:
+            kind: ResizeKind = "anomaly"
+            reason = (
+                f"anomaly: {fraction:.2%} of the requested quantity was capped away, more than the "
+                f"{threshold:.2%} price-move threshold; the order was mis-sized, the price did not just move"
+            )
+        else:
+            kind = "price_move"
+            reason = (
+                f"price_move: the price moved since the order was sized; {fraction:.3%} of the requested "
+                "quantity was capped to what cash affords at the fill price"
+            )
+        return ResizeRecord(req.client_order_id, bar.open_ts, req.quantity, quantity, reason, kind)
 
     def _fill_at_open(
         self, order: _Order, bar: Bar
     ) -> tuple[FillRecord | OrderRejection, ResizeRecord | None]:
         req = order.req
-        price = self._fill_price(req.side, req.quantity, bar)
-        quantity, resize_reason = self._resolve_buy_quantity(req, price)
-        resize = (
-            ResizeRecord(req.client_order_id, bar.open_ts, req.quantity, quantity, resize_reason or "resized")
-            if quantity != req.quantity
-            else None
-        )
+        quantity, price = self._size_at_fill(req, bar)
+        resize = self._resize_record(req, bar, quantity) if quantity != req.quantity else None
         order.resize = resize
         notional = price * quantity
         fee = self._fees.fee(notional)
