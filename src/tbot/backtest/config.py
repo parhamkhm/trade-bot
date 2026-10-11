@@ -26,7 +26,9 @@ class BacktestConfig:
       or after ``close(t) + fill_delay`` plus slippage.
 
     In BOTH models a BUY is capped at fill time to what cash affords at the real fill price (SPEC D-051 as
-    revised 2026-10-11); a cap above ``resize_anomaly_threshold`` marks the run invalid.
+    revised 2026-10-11). The cap is classified by cause: a request that was affordable at the signal-bar
+    close it was sized at is a ``price_move`` (valid run, however large the move); one that was not even
+    affordable there is a sizing bug, an ``anomaly``, and marks the run invalid.
 
     ``slippage_model`` is the hook for the depth-at-size model of SPEC section 7 (calibrated in phase 3);
     until one is supplied, the flat ``costs.slippage_bps`` placeholder applies.
@@ -47,9 +49,6 @@ class BacktestConfig:
     # Default 0: the stub's sizing divisor already includes slippage and the taker fee, and the broker caps
     # a BUY at fill time to what cash affords at the real fill price in both fill modes.
     buy_buffer_bps: Decimal = Decimal(0)
-    # A fill-time BUY cap larger than this fraction of the requested quantity is a sizing bug, not price
-    # movement (the largest real open-vs-close gap in the data is 0.43 %): the report marks the run INVALID.
-    resize_anomaly_threshold: Decimal = Decimal("0.01")
 
     def __post_init__(self) -> None:
         if self.filters.symbol != self.symbol:
@@ -73,8 +72,6 @@ class BacktestConfig:
                 f"fill_delay > 0 requires exec_timeframe = 1h (got {self.exec_timeframe}): coarser "
                 "execution bars would stretch the delay"
             )
-        if not self.resize_anomaly_threshold.is_finite() or not 0 <= self.resize_anomaly_threshold <= 1:
-            raise ValueError("resize_anomaly_threshold must be a Decimal in [0, 1]")
         if not 0.0 <= self.drift_tolerance < 1.0:
             raise ValueError("drift_tolerance must be in [0, 1)")
         if self.buy_buffer_bps < 0:

@@ -166,7 +166,6 @@ class _Run:
             quote_asset=config.quote_asset,
             initial_cash=config.initial_cash,
             fill_delay=config.fill_delay,
-            resize_anomaly_threshold=config.resize_anomaly_threshold,
         )
         self.warmup = effective_warmup_bars(strategy, regime)
         self.history: list[Bar] = []
@@ -221,13 +220,17 @@ class _Run:
 
     def _route(self, intent: TargetIntent, bar: Bar) -> None:
         market = MarketState(self.config.symbol, bar.ts, bar.close, self.config.filters)
-        decision = self.risk.evaluate(intent, self.portfolio.view(bar.ts, bar.close), market)
+        view = self.portfolio.view(bar.ts, bar.close)
+        decision = self.risk.evaluate(intent, view, market)
         if not isinstance(decision, Approved):
             self._log(intent, REFUSED, f"{decision.reason.value}: {decision.detail}")
         elif decision.order is None:
             self._log(intent, NO_ACTION, decision.note)
         else:
-            ack = self.broker.submit(decision.order)
+            # Backtest-only sizing reference (OrderRequest is frozen and has no such field): the risk manager
+            # sized this order at the signal close with this cash. The broker uses it to tell a fill-time cap
+            # caused by price movement from one caused by a sizing bug.
+            ack = self.broker.submit(decision.order, sizing_price=bar.close, sizing_cash=view.cash_quote)
             outcome = ORDER if ack.accepted else SUBMIT_REJECTED
             self._log(intent, outcome, ack.message or decision.note, decision.order.client_order_id)
 

@@ -3,11 +3,23 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Sequence
+from dataclasses import replace
 from decimal import Decimal
 
 from tbot.backtest.config import BacktestConfig
+from tbot.backtest.risk_stub import StubRiskManager
 from tbot.core.config import CostConfig
-from tbot.core.types import Bar, BarWindow, TargetIntent, Timeframe
+from tbot.core.types import (
+    Approved,
+    Bar,
+    BarWindow,
+    MarketState,
+    PortfolioView,
+    RiskDecision,
+    Side,
+    TargetIntent,
+    Timeframe,
+)
 from tests.sim_helpers import SYMBOL, lbank_like_filters
 
 Dec = Decimal
@@ -48,6 +60,27 @@ class Scripted:
 
     def stop_price(self, window: BarWindow, entry_price: Decimal) -> Decimal:  # noqa: ARG002
         return entry_price / 2
+
+
+class OversizedRisk:
+    """A BUGGY risk manager: the stub's BUY quantity multiplied by ``factor`` (default 2x), i.e. orders
+    that cash could not cover even at the price they were sized at. Used to provoke the sizing-bug anomaly."""
+
+    def __init__(self, config: BacktestConfig, factor: int = 2) -> None:
+        self._stub = StubRiskManager(
+            taker_fee_bps=config.costs.taker_fee_bps,
+            slippage_bps=config.costs.slippage_bps,
+            buy_buffer_bps=config.buy_buffer_bps,
+            drift_tolerance=config.drift_tolerance,
+        )
+        self._factor = factor
+
+    def evaluate(self, intent: TargetIntent, portfolio: PortfolioView, market: MarketState) -> RiskDecision:
+        decision = self._stub.evaluate(intent, portfolio, market)
+        if isinstance(decision, Approved) and decision.order is not None and decision.order.side is Side.BUY:
+            big = replace(decision.order, quantity=decision.order.quantity * self._factor)
+            return Approved(decision.intent, big, decision.note)
+        return decision
 
 
 class Recorder:

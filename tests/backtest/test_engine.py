@@ -19,7 +19,7 @@ from tbot.backtest.risk_stub import StubRiskManager
 from tbot.core.types import Bar, BarWindow, RegimeState, Side, TargetIntent, Timeframe
 from tbot.data.binance_loader import CANONICAL_HOLDOUT_START, HoldoutLockError
 from tbot.strategies.base import StrategyRegistrationError
-from tests.backtest.helpers import CountingFeed, Recorder, Scripted, make_config
+from tests.backtest.helpers import CountingFeed, OversizedRisk, Recorder, Scripted, make_config
 from tests.sim_helpers import (
     SYMBOL,
     T_START,
@@ -352,13 +352,14 @@ def test_delay_mode_buy_resizes_and_fills_in_a_rising_market() -> None:
     (resize,) = res.resizes  # the resize is logged, with the requested and the actually filled quantity
     assert resize.requested_quantity == Dec("98.51731")
     assert resize.filled_quantity == Dec("97.34150")
-    # 0.2 %/h for 6 h plus 1 % slippage is a 1.19 % cap: above the 1 % threshold, so it is an ANOMALY
-    # (a mis-sizing symptom, not a price move) and the run is flagged INVALID -- but still not rejected.
-    assert resize.kind == "anomaly" and resize.reason.startswith("anomaly")
+    # 0.2 %/h for 6 h plus 1 % slippage is a 1.19 % cap. By the cause-based rule that is a price_move: the BUY
+    # was affordable at the close it was sized at (100), the price then rose, and the run stays valid.
+    assert resize.kind == "price_move" and resize.reason.startswith("price_move")
+    assert resize.sizing_price == Dec("100") and resize.sizing_cash == Dec("10000")
     assert res.equity[1].quantity == Dec("97.34150") and res.equity[1].quantity > 0
     report = build_report(res)
-    assert report["health"]["resizes_anomaly"] == 1 and report["health"]["resizes_price_move"] == 0
-    assert is_run_invalid(report) and report["health"]["fill_rejections"] == 0
+    assert report["health"]["resizes_anomaly"] == 0 and report["health"]["resizes_price_move"] == 1
+    assert not is_run_invalid(report) and report["health"]["fill_rejections"] == 0
 
 
 def test_delay_mode_realistic_drift_is_a_price_move_resize_and_not_invalid() -> None:
@@ -403,23 +404,27 @@ def gap_up_run(gap: str, delay: timedelta) -> tuple[BacktestResult, Decimal]:
 
 @pytest.mark.parametrize("delay", [timedelta(0), timedelta(hours=6)], ids=["next_open", "delay_6h"])
 @pytest.mark.parametrize(
-    ("gap", "price", "quantity", "fee", "cash", "kind"),
+    ("gap", "price", "quantity", "fee", "cash"),
     [
         # +0.43 %: the largest real open gap in the data. open 100.43 -> 100.480215 -> ceil tick 100.49;
         # unit cost 100.49 * 1.0035 = 100.841715; floor_5(10000 / 100.841715) = 99.16531
-        ("0.43", "100.49", "99.16531", "34.87792700665", "0.00007109335", "price_move"),
-        # +5 %: open 105 -> 105.0525 -> 105.06; unit cost 105.06 * 1.0035 = 105.42771; 10000/that -> 94.85172
-        ("5", "105.06", "94.85172", "34.8779259612", "0.0003708388", "anomaly"),
+        ("0.43", "100.49", "99.16531", "34.87792700665", "0.00007109335"),
+        # +5 %: open 105 -> 105.0525 -> 105.06; unit cost 105.06 * 1.0035 = 105.42771; 10000/that -> 94.85172.
+        # Under the old fixed threshold this was an "anomaly"; by cause it is a price_move.
+        ("5", "105.06", "94.85172", "34.8779259612", "0.0003708388"),
+        # +2.5 % and +3 %: the size of the large real 6 h moves (BTC dropped/jumped 2-3 % inside a 6 h delay)
+        ("2.5", "102.56", "97.16382", "34.8779248272", "0.0006959728"),
+        ("3", "103.06", "96.69243", "34.8779264253", "0.0002377747"),
     ],
 )
 def test_gap_up_open_is_capped_not_rejected_in_both_fill_modes(
-    delay: timedelta, gap: str, price: str, quantity: str, fee: str, cash: str, kind: str
+    delay: timedelta, gap: str, price: str, quantity: str, fee: str, cash: str
 ) -> None:
     """(a) D-051 as revised 2026-10-11: a BUY is sized at fill time from the real fill price and the cash on
     hand in BOTH modes. A gap-up between sizing (close 100, requested 99.60142) and the fill never produces
     INSUFFICIENT_FUNDS; the cap is logged as a ResizeRecord, the position is filled, fee and cash are exact.
-    Item 4: the +0.43 % gap (0.44 % of the quantity) is a price_move and the run stays valid; the +5 % gap
-    (4.8 % of the quantity) is an anomaly and marks the run INVALID -- still with zero rejections."""
+    Both the +0.43 % gap (0.44 % of the quantity) and the +5 % gap (4.8 %) are price_move resizes: the
+    order was affordable at the sizing close (100), only the price moved. No anomaly, the run stays valid."""
     res, _ = gap_up_run(gap, delay)
     assert res.rejections == ()
     (resize,) = res.resizes
@@ -432,12 +437,47 @@ def test_gap_up_open_is_capped_not_rejected_in_both_fill_modes(
     assert res.equity[1].quantity == Dec(quantity)
     assert res.equity[1].cash == Dec("10000") - rec.fill.price * rec.fill.quantity - rec.fill.fee == Dec(cash)
     assert res.fees_paid == Dec(fee)
-    assert resize.kind == kind and resize.reason.startswith(kind)
+    assert resize.kind == "price_move" and resize.reason.startswith("price_move")
+    assert resize.sizing_price == Dec("100") and resize.sizing_cash == Dec("10000")
     health = build_report(res)["health"]
     assert health["resizes"] == 1 and health["fill_rejections"] == 0
-    assert health["resizes_price_move"] == (1 if kind == "price_move" else 0)
-    assert health["resizes_anomaly"] == (1 if kind == "anomaly" else 0)
-    assert is_run_invalid(build_report(res)) is (kind == "anomaly")
+    assert health["resizes_price_move"] == 1 and health["resizes_anomaly"] == 0
+    assert not is_run_invalid(build_report(res))
+
+
+def oversized_run(delay: timedelta) -> BacktestResult:
+    """A sizing BUG: a risk manager that asks for 2x what cash covers (sized at close 100, cash 10 000), in
+    next-open or 6 h delay mode. The prices do not move at all (open == close == 100)."""
+    day0, day1 = make_bar(0, "100", "100"), make_bar(0, "100", "100", start=make_bar(0, "100", "100").ts)
+    if delay == timedelta(0):
+        cfg = make_config(fee="35", slip="5")
+        return run_backtest(BacktestFeed([day0, day1]), Scripted([1.0, 1.0]), cfg, risk=OversizedRisk(cfg))
+    cfg = make_config(fee="35", slip="5", fill_delay=delay, exec_timeframe=Timeframe.H1)
+    exec_feed = BacktestFeed(hour_bars_for_day(day1, ["100"] * 24))
+    return run_backtest(
+        BacktestFeed([day0, day1]), Scripted([1.0, 1.0]), cfg, risk=OversizedRisk(cfg), exec_feed=exec_feed
+    )
+
+
+@pytest.mark.parametrize("delay", [timedelta(0), timedelta(hours=6)], ids=["next_open", "delay_6h"])
+def test_unaffordable_request_at_the_sizing_price_is_an_anomaly_and_invalidates_the_run(
+    delay: timedelta,
+) -> None:
+    """Sizing-bug cause: the requested 199.20284 BTC (2 x 99.60142) costs 19 990 USDT at the sizing close of
+    100, twice the 10 000 of cash. The broker still caps and fills it (no INSUFFICIENT_FUNDS rejection) but
+    the resize is an anomaly and the run is INVALID, with no price movement involved at all."""
+    res = oversized_run(delay)
+    assert res.rejections == ()
+    (resize,) = res.resizes
+    assert resize.requested_quantity == Dec("199.20284") and resize.kind == "anomaly"
+    assert "not affordable even at the sizing price" in resize.reason
+    assert resize.sizing_price == Dec("100") and resize.sizing_cash == Dec("10000")
+    assert resize.filled_quantity == Dec("99.60142")  # 100 * 1.0005 -> 100.05; 10000 / (100.05 * 1.0035)
+    (rec,) = res.fills
+    assert rec.fill.quantity == resize.filled_quantity
+    report = build_report(res)
+    assert report["health"]["resizes_anomaly"] == 1 and report["health"]["resizes_price_move"] == 0
+    assert report["health"]["fill_rejections"] == 0 and is_run_invalid(report)
 
 
 def test_buy_buffer_defaults_to_zero() -> None:

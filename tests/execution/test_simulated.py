@@ -198,7 +198,7 @@ def test_buy_is_capped_rather_than_rejected_when_cash_falls_short(delay: timedel
     fill modes (live: a market buy is sized at the open from the real price and cash; a manual order is
     sized when placed). SELLs get no such treatment."""
     b = broker("100", delay=delay)
-    b.submit(req("big", Side.BUY, "10"))
+    b.submit(req("big", Side.BUY, "10"), sizing_price=Dec("100"), sizing_cash=Dec("100"))  # 10 BTC, 100 USDT
     b.submit(req("short", Side.SELL, "1"))
     rep = b.advance(fill_bar(delay, "100"))
     (rec,) = rep.fills
@@ -213,7 +213,7 @@ def test_buy_is_capped_rather_than_rejected_when_cash_falls_short(delay: timedel
     (resize,) = rep.resizes
     assert resize.client_order_id == "big"
     assert resize.requested_quantity == Dec("10") and resize.filled_quantity == Dec("0.99601")
-    assert resize.kind == "anomaly" and resize.reason.startswith("anomaly")  # 90 % capped away
+    assert resize.kind == "anomaly" and resize.reason.startswith("anomaly")  # 1000 USDT requested vs 100 cash
     assert resize.capped_fraction == Dec("0.900399")
     assert [r.client_order_id for r in rep.rejections] == ["short"]  # SELL still rejected whole
     assert "INSUFFICIENT_FUNDS" in rep.rejections[0].reason
@@ -319,61 +319,124 @@ def test_buy_capped_below_min_notional_is_still_rejected(delay: timedelta) -> No
     assert b.balances() == {"USDT": Dec("0.5"), "BTC": Dec("0")}
 
 
+# Resize kinds are decided by CAUSE (Parham, 2026-10-11): affordable at the sizing price => price_move,
+# however large the move; not affordable even there => anomaly (sizing bug); no sizing reference => anomaly
+# (fail safe).
+
+
 @MODES
 @pytest.mark.parametrize(
-    ("open_", "quantity", "kind"),
+    ("open_", "quantity"),
     [
         # sized at close 100 (99.60142); open 100.43 -> price 100.49 -> 99.16531: 0.44 % capped
-        ("100.43", "99.16531", "price_move"),
-        # open 105 -> price 105.06 -> 94.85172: 4.77 % capped
-        ("105", "94.85172", "anomaly"),
+        ("100.43", "99.16531"),
+        # open 105 -> price 105.06 -> 94.85172: 4.77 % capped; not an anomaly (affordable at 100).
+        ("105", "94.85172"),
+        # +2.5 % (the size of a large real 6 h move): open 102.5 -> 102.55125 -> 102.56; unit cost
+        # 102.56 * 1.0035 = 102.91896; floor_5(10000 / 102.91896) = 97.16382
+        ("102.5", "97.16382"),
     ],
 )
-def test_resize_kind_is_price_move_below_and_anomaly_above_the_threshold(
-    delay: timedelta, open_: str, quantity: str, kind: str
+def test_price_move_cap_is_not_an_anomaly_whatever_the_size(
+    delay: timedelta, open_: str, quantity: str
 ) -> None:
     b = broker("10000", delay=delay)
-    b.submit(req("a", Side.BUY, "99.60142"))
+    b.submit(req("a", Side.BUY, "99.60142"), sizing_price=Dec("100"), sizing_cash=Dec("10000"))
     rep = b.advance(fill_bar(delay, open_))
     assert rep.rejections == ()
     (resize,) = rep.resizes
-    assert resize.filled_quantity == Dec(quantity) and resize.kind == kind
-    assert resize.reason.startswith(kind)
-    assert resize.reason.startswith("anomaly") == (kind == "anomaly")
+    assert resize.kind == "price_move" and resize.reason.startswith("price_move")
+    assert resize.sizing_price == Dec("100") and resize.sizing_cash == Dec("10000")
+    # the reason states the cause with the numbers: requested cost at the sizing price vs cash at sizing
+    # requested cost at the sizing price: 99.60142 * 100 * 1.0035 = 9995.002497000 <= cash 10000
+    assert "9995.002497000" in resize.reason and "cash at sizing 10000" in resize.reason
+    assert resize.requested_quantity == Dec("99.60142") and resize.filled_quantity == Dec(quantity)
     assert b.resize_of("a") == resize
 
 
-def test_threshold_boundary_a_cap_of_exactly_the_threshold_is_a_price_move() -> None:
-    """The rule is `capped fraction > threshold` => anomaly, so exactly 1 % is still a price move."""
-    exact = broker("99", fee="0", slip="0")  # 99 / 100 = 0.99 of a requested 1.00000: capped fraction 0.01
-    exact.submit(req("a", Side.BUY, "1"))
-    (resize,) = exact.advance(make_bar(1, "100", "100")).resizes
-    assert resize.capped_fraction == Dec("0.01") and resize.kind == "price_move"
-    over = broker("98.99", fee="0", slip="0")  # floor_5(0.9899) -> capped fraction 0.0101
-    over.submit(req("a", Side.BUY, "1"))
-    (resize,) = over.advance(make_bar(1, "100", "100")).resizes
-    assert resize.capped_fraction == Dec("0.0101") and resize.kind == "anomaly"
+@MODES
+def test_request_not_affordable_at_the_sizing_price_is_an_anomaly(delay: timedelta) -> None:
+    """A request of 2x cash is a sizing bug whatever the price does afterwards: anomaly, and the broker still
+    fills the capped order (no INSUFFICIENT_FUNDS)."""
+    b = broker("10000", fee="0", slip="0", delay=delay)
+    b.submit(req("big", Side.BUY, "200"), sizing_price=Dec("100"), sizing_cash=Dec("10000"))  # 20000 > 10000
+    rep = b.advance(fill_bar(delay, "100"))
+    assert rep.rejections == ()
+    (rec,) = rep.fills
+    assert rec.fill.quantity == Dec("100")
+    (resize,) = rep.resizes
+    assert resize.kind == "anomaly" and resize.reason.startswith("anomaly")
+    assert "not affordable even at the sizing price" in resize.reason
+    assert resize.sizing_price == Dec("100") and resize.sizing_cash == Dec("10000")
 
 
-def test_custom_threshold_reclassifies_and_is_validated() -> None:
-    def with_threshold(value: Dec) -> SimulatedBroker:
-        return SimulatedBroker(
+@MODES
+def test_fail_safe_no_sizing_reference_is_an_anomaly(delay: timedelta) -> None:
+    """A direct broker user with no sizing reference cannot prove the cap was a price move: anomaly."""
+    b = broker("10000", delay=delay)
+    b.submit(req("a", Side.BUY, "99.60142"))  # would be an ordinary price_move if the reference were known
+    rep = b.advance(fill_bar(delay, "100.43"))
+    (resize,) = rep.resizes
+    assert resize.kind == "anomaly" and "no sizing reference" in resize.reason
+    assert resize.sizing_price is None and resize.sizing_cash is None
+    assert rep.rejections == () and rep.fills[0].fill.quantity == Dec("99.16531")
+
+
+def test_affordability_boundary_exactly_cash_is_a_price_move() -> None:
+    """The rule is `cost > cash` => anomaly, so a request costing exactly the cash is still affordable."""
+    for qty, kind in (("1", "price_move"), ("1.00001", "anomaly")):
+        b = broker("100", fee="0", slip="0")
+        b.submit(req("a", Side.BUY, qty), sizing_price=Dec("100"), sizing_cash=Dec("100"))
+        (resize,) = b.advance(make_bar(1, "101", "101")).resizes  # price moved up: cap to floor_5(100 / 101)
+        assert resize.kind == kind, qty
+
+
+def test_taker_fee_is_part_of_the_affordability_test() -> None:
+    """1 BTC at 100 costs exactly 100 without fees (affordable) but 100.35 with the 35 bps taker fee."""
+    b = broker("100", fee="35", slip="0")
+    b.submit(req("a", Side.BUY, "1"), sizing_price=Dec("100"), sizing_cash=Dec("100"))
+    (resize,) = b.advance(make_bar(1, "100", "100")).resizes
+    assert resize.kind == "anomaly" and "= 100.3500 USDT vs cash at sizing 100 USDT" in resize.reason
+
+
+def test_sizing_reference_must_be_complete_and_sane() -> None:
+    b = broker()
+    with pytest.raises(ValueError, match="together"):
+        b.submit(req("a", Side.BUY, "1"), sizing_price=Dec("100"))
+    with pytest.raises(ValueError, match="together"):
+        b.submit(req("b", Side.BUY, "1"), sizing_cash=Dec("100"))
+    for bad_price in (Dec("0"), Dec("-1"), Dec("NaN")):
+        with pytest.raises(ValueError, match="sizing_price"):
+            b.submit(req("c", Side.BUY, "1"), sizing_price=bad_price, sizing_cash=Dec("100"))
+    with pytest.raises(ValueError, match="sizing_cash"):
+        b.submit(req("d", Side.BUY, "1"), sizing_price=Dec("100"), sizing_cash=Dec("-1"))
+    assert b.open_orders(SYMBOL) == []  # nothing was created by the refused calls
+
+
+def test_duplicate_submit_ignores_the_second_sizing_reference() -> None:
+    b = broker("10000", fee="0", slip="0")
+    b.submit(req("a", Side.BUY, "200"), sizing_price=Dec("100"), sizing_cash=Dec("10000"))
+    assert not b.submit(req("a", Side.BUY, "200"), sizing_price=Dec("1"), sizing_cash=Dec("1000000")).accepted
+    (resize,) = b.advance(make_bar(1, "100", "100")).resizes
+    assert resize.sizing_price == Dec("100") and resize.kind == "anomaly"
+
+
+def test_the_threshold_argument_is_gone() -> None:
+    with pytest.raises(TypeError, match="resize_anomaly_threshold"):
+        SimulatedBroker(  # type: ignore[call-arg]
             filters=lbank_like_filters(),
             fees=FeeSchedule(taker_bps=Dec("35"), maker_bps=Dec("33")),
             slippage=FlatSlippage(Dec("5")),
             base_asset="BTC",
             quote_asset="USDT",
             initial_cash=Dec(10000),
-            resize_anomaly_threshold=value,
+            resize_anomaly_threshold=Dec("0.01"),
         )
 
-    wide = with_threshold(Dec("0.05"))  # the 4.77 % cap of a +5 % gap is now an ordinary price move
-    wide.submit(req("a", Side.BUY, "99.60142"))
-    (resize,) = wide.advance(make_bar(1, "105", "105")).resizes
-    assert resize.kind == "price_move"
-    for bad in (Dec("-0.01"), Dec("1.01"), Dec("NaN"), Dec("Infinity")):
-        with pytest.raises(ValueError, match="resize_anomaly_threshold"):
-            with_threshold(bad)
+
+def test_submit_with_sizing_reference_still_satisfies_the_broker_protocol() -> None:
+    b: Broker = broker()
+    assert b.submit(req("a", Side.BUY, "1")).accepted  # the Protocol-typed call has no sizing arguments
 
 
 class _SizeSlippage:

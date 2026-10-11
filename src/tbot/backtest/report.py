@@ -11,10 +11,11 @@ summarises the same check for a caller, e.g. the CLI, that needs a single boolea
 * any fill-time rejection (``fill_rejections > 0``) -- e.g. below min_notional, or a cash cap that leaves
   nothing tradable;
 * any resize ANOMALY (``resizes_anomaly > 0``): in both fill modes a BUY is capped at fill time to what cash
-  affords at the real price (D-051), and an ordinary price move is counted under ``resizes_price_move``. A
-  cap larger than ``resize_anomaly_threshold`` (default 1 % of the requested quantity; the largest real
-  open-vs-close gap in the data is 0.43 %) means the order was mis-sized and invalidates the run just like
-  a rejection;
+  affords at the real price (D-051). The cap is classified by cause: a request that was affordable at the
+  sizing price (the signal-bar close) and became unaffordable because the price moved is counted under
+  ``resizes_price_move`` and does not invalidate the run, however large the move; a request that was not
+  affordable even at the sizing price (or carried no sizing reference) was mis-sized, is an anomaly and
+  invalidates the run just like a rejection;
 * approved orders that neither filled nor are still pending at the end -- more than half of them vanishing
   this way means the accounting between decisions and fills has come apart, which should never happen by
   construction and is worth a loud flag if it ever does.
@@ -24,7 +25,6 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import asdict
-from decimal import Decimal
 from typing import Any
 
 from tbot.backtest.benchmarks import BenchmarkSet
@@ -54,15 +54,14 @@ def _health_issues(
     rejections: int,
     unfilled: int,
     anomalies: int = 0,
-    threshold: Decimal = Decimal("0.01"),
 ) -> list[str]:
     issues = []
     if rejections > 0:
         issues.append(f"{rejections} order(s) were rejected at fill time -- the result may be cost-biased")
     if anomalies > 0:
         issues.append(
-            f"{anomalies} BUY(s) were capped at fill time by more than {threshold:.2%} of the requested "
-            "quantity (resize anomaly): that is a sizing bug, not price movement"
+            f"{anomalies} BUY(s) were resized at fill time although the request was not affordable at the "
+            "sizing price, or carried no sizing reference (resize anomaly): a sizing bug, not price movement"
         )
     orders = decisions.get(ORDER, 0)
     unresolved = orders - fills - unfilled
@@ -78,14 +77,7 @@ def _result_issues(result: BacktestResult) -> list[str]:
     decisions = Counter(d.outcome for d in result.decisions)
     unfilled = len(result.unfilled_order_ids)
     anomalies = sum(1 for r in result.resizes if r.kind == "anomaly")
-    return _health_issues(
-        decisions,
-        len(result.fills),
-        len(result.rejections),
-        unfilled,
-        anomalies,
-        result.config.resize_anomaly_threshold,
-    )
+    return _health_issues(decisions, len(result.fills), len(result.rejections), unfilled, anomalies)
 
 
 def is_run_invalid(report: dict[str, Any]) -> bool:
@@ -129,13 +121,12 @@ def build_report(result: BacktestResult, benchmarks: BenchmarkSet | None = None)
             "buy_buffer_bps": str(cfg.buy_buffer_bps),
             "drift_tolerance": cfg.drift_tolerance,
         },
-        "resize_anomaly_threshold": str(cfg.resize_anomaly_threshold),
         "health": {
             "decisions": dict(decisions),
             "fill_rejections": n_rejections,
             "unfilled_orders_at_end": n_unfilled,
             "resizes": len(result.resizes),
-            "resizes_price_move": len(result.resizes) - n_anomalies,
+            "resizes_price_move": sum(1 for r in result.resizes if r.kind == "price_move"),
             "resizes_anomaly": n_anomalies,
             "gap_fills": sum(1 for f in result.fills if f.gap_fill),
             "issues": issues,

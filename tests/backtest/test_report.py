@@ -6,6 +6,7 @@ import json
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -15,10 +16,11 @@ from tbot.backtest.config import BacktestConfig
 from tbot.backtest.engine import run_backtest
 from tbot.backtest.feed import BacktestFeed
 from tbot.backtest.report import build_report, is_run_invalid, render_markdown
+from tbot.backtest.result import BacktestResult
 from tbot.core.config import CostConfig
-from tbot.core.types import Bar, Timeframe
-from tests.backtest.helpers import Scripted, make_config
-from tests.backtest.test_engine import five_bars, gap_up_run
+from tbot.core.types import Bar, Strategy, Timeframe
+from tests.backtest.helpers import OversizedRisk, Scripted, make_config
+from tests.backtest.test_engine import five_bars, gap_up_run, oversized_run
 from tests.sim_helpers import (
     SYMBOL,
     T_START,
@@ -199,16 +201,18 @@ def test_report_health_counts_a_resize() -> None:
     report = build_report(res)
     assert report["health"]["resizes"] == 1
     assert "resizes 1" in render_markdown(report)
-    # 0.2 %/h with 1 % slippage is a 1.19 % cap: an anomaly, counted separately from price moves
-    assert report["health"]["resizes_anomaly"] == 1 and report["health"]["resizes_price_move"] == 0
-    assert "(price_move 0, anomaly 1)" in render_markdown(report)
+    # 0.2 %/h with 1 % slippage is a 1.19 % cap: affordable at the sizing close, so a price_move
+    assert report["health"]["resizes_anomaly"] == 0 and report["health"]["resizes_price_move"] == 1
+    assert "(price_move 1, anomaly 0)" in render_markdown(report)
+    assert not is_run_invalid(report)
 
 
 @pytest.mark.parametrize("delay", [timedelta(0), timedelta(hours=6)], ids=["next_open", "delay_6h"])
-def test_resizes_alone_do_not_make_a_run_invalid(delay: timedelta) -> None:
-    """(d) A price_move resize (+0.43 % gap, the largest real open-vs-close gap) is counted but the run is
-    clean: no issue, no INVALID RUN block."""
-    res, _ = gap_up_run("0.43", delay)
+@pytest.mark.parametrize("gap", ["0.43", "3", "5"])
+def test_resizes_alone_do_not_make_a_run_invalid(delay: timedelta, gap: str) -> None:
+    """(d) A price_move resize is counted but the run is clean (no issue, no INVALID RUN block), whatever the
+    size of the move: +0.43 % is the largest real open-vs-close gap, +3 % a large 6 h move, +5 % a stress."""
+    res, _ = gap_up_run(gap, delay)
     assert len(res.resizes) == 1 and res.rejections == ()
     report = build_report(res)
     assert report["health"]["issues"] == [] and not is_run_invalid(report)
@@ -219,9 +223,9 @@ def test_resizes_alone_do_not_make_a_run_invalid(delay: timedelta) -> None:
 
 @pytest.mark.parametrize("delay", [timedelta(0), timedelta(hours=6)], ids=["next_open", "delay_6h"])
 def test_anomaly_resize_marks_the_run_invalid_without_any_rejection(delay: timedelta) -> None:
-    """Item 4: a +5 % gap caps 4.8 % of the order -- an anomaly. The BUY is NOT rejected (no
-    INSUFFICIENT_FUNDS) but the run is INVALID, in the report dict and the markdown block."""
-    res, _ = gap_up_run("5", delay)
+    """A request twice what cash covers at the sizing price is a sizing bug -- an anomaly. The BUY is NOT
+    rejected (no INSUFFICIENT_FUNDS) but the run is INVALID, in the report dict and the markdown block."""
+    res = oversized_run(delay)
     assert res.rejections == () and len(res.fills) == 1
     report = build_report(res)
     assert report["health"]["fill_rejections"] == 0 and report["health"]["resizes_anomaly"] == 1
@@ -241,15 +245,32 @@ def test_genuine_rejection_still_fires_next_to_a_resize() -> None:
     assert any("rejected" in issue for issue in report["health"]["issues"])
 
 
+def test_cli_exits_0_on_a_large_price_move_resize(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """End-to-end: buy & hold through the CLI on a +5 % open gap is a price_move resize: valid, exit 0."""
+    bars = [make_bar(0, "100", "100"), make_bar(1, "105", "105"), make_bar(2, "105", "105")]
+    monkeypatch.setattr(cli, "load_bars", lambda *_a, **_k: bars)
+    assert cli.main(["--strategy", "buy_and_hold"]) == 0
+    out = capsys.readouterr().out
+    assert "INVALID RUN WARNING" not in out and "(price_move 1, anomaly 0)" in out
+
+
 def test_cli_exits_3_on_an_anomaly_resize(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Item 4 end-to-end: buy & hold through the CLI on a +5 % open gap exits 3 with the INVALID RUN block."""
-    bars = [make_bar(0, "100", "100"), make_bar(1, "105", "105"), make_bar(2, "105", "105")]
+    """End-to-end: a sizing bug (a risk manager requesting 2x cash) reached through the CLI exits 3 with the
+    INVALID RUN block, even though the prices do not move and nothing is rejected."""
+    bars = [make_bar(0, "100", "100"), make_bar(1, "100", "100"), make_bar(2, "100", "100")]
     monkeypatch.setattr(cli, "load_bars", lambda *_a, **_k: bars)
+
+    def oversized(feed: BacktestFeed, strat: Strategy, cfg: BacktestConfig, **kw: Any) -> BacktestResult:
+        return run_backtest(feed, strat, cfg, risk=OversizedRisk(cfg), **kw)
+
+    monkeypatch.setattr(cli, "run_backtest", oversized)
     assert cli.main(["--strategy", "buy_and_hold"]) == 3
     out = capsys.readouterr().out
-    assert "INVALID RUN WARNING" in out and "resize anomaly" in out
+    assert "INVALID RUN WARNING" in out and "resize anomaly" in out and "(price_move 0, anomaly 1)" in out
 
 
 def test_report_health_counts_a_gap_fill() -> None:
