@@ -221,6 +221,14 @@ _RECEIVER_RE = (
 # like `"/withdraw"` or `"/api/v1/withdraw"`) -- round 3's reviewer-found false positive
 # `WITHDRAWAL = "withdrawal"` (a ledger-entry-type constant, not a call to anything) has no `/` and
 # so no longer matches.
+# D-075: ccxt order/cancel/edit method names. Snake_case under the module-wide `(?i)`, camelCase in a
+# case-sensitive group so ordinary identifiers that merely start with the same letters
+# (`created_orders`, `canceledOrders`, `edit_distance`) never match.
+_CCXT_ORDER_METHOD = (
+    r"(?:(?:create|edit|cancel)_(?:\w+_)?orders?(?:_\w+)?"
+    r"|(?-i:(?:create|edit|cancel)(?:[A-Z][a-z0-9]*)*Orders?(?:[A-Z][A-Za-z0-9]*)?))"
+)
+
 FORBIDDEN_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "path:/order",
@@ -308,6 +316,42 @@ FORBIDDEN_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         re.compile(
             r"(?i)\.(?:new_order|create_order|cancel_order|cancel_all_orders|cancel_open_orders|"
             r"place_order|new_oco_order|create_\w*_order|withdraw|delete_order|cancel_replace)\s*\("
+        ),
+    ),
+    # D-075: ccxt's order / cancel / edit / margin / transfer surface. ccxt exposes every
+    # method in snake_case AND camelCase (`create_order` == `createOrder`), plus bulk (`create_orders`),
+    # websocket (`create_order_ws`), typed (`create_market_buy_order`, `createLimitSellOrder`) and
+    # bracket (`create_order_with_take_profit_and_stop_loss`) variants that `sdk:order-method-call`
+    # above never matched. Matched on the attribute access alone (no `(` needed) so a bound-method
+    # reference such as `fn = ex.createOrder` is caught too. The camelCase half is case-SENSITIVE
+    # (`(?-i:...)`) so a stats attribute like `stats.createdOrders` or `canceled_orders` stays clean.
+    ("sdk:ccxt-order-method", re.compile(r"(?i)\.\s*" + _CCXT_ORDER_METHOD + r"\b")),
+    # The same names as a quoted literal: `getattr(ex, "createOrder")`, `methods = ["cancel_order"]`.
+    # A read-only capability lookup (`ex.has["createOrder"]`) is deliberately left alone.
+    ("sdk:ccxt-order-method-literal", re.compile(r"(?i)(?<!\bhas\[)([\"'])" + _CCXT_ORDER_METHOD + r"\1")),
+    # Margin, leverage, borrowing, transfers, withdrawals and conversions (snake_case and camelCase).
+    (
+        "sdk:ccxt-funds-method",
+        re.compile(
+            r"(?i)\.\s*(?:set_?leverage|set_?margin(?:_?mode)?|set_?position_?mode|add_?margin|reduce_?margin|"
+            r"borrow(?:_?\w*margin)?|repay(?:_?\w*margin)?|transfer(?:_?(?:in|out))?|withdraw(?:_?ws)?|"
+            r"create_?convert_?trade)\b"
+        ),
+    ),
+    # ccxt's implicit private API: `ex.privatePostOrder(...)`, `ex.private_delete_order(...)`,
+    # `ex.v2PrivatePostTradeOrder(...)`. Case-sensitive tail so `.private_posture` stays clean.
+    (
+        "sdk:ccxt-implicit-private",
+        re.compile(r"\.\s*(?-i:\w*[Pp]rivate_?(?:[Pp]ost|[Pp]ut|[Dd]elete|[Pp]atch)(?![a-z]))"),
+    ),
+    ("sdk:ccxt-fetch2", re.compile(r"(?i)\.\s*fetch2\s*\(")),
+    # `getattr(<exchange-looking object>, <anything>)`: the method name may be built at runtime, which
+    # no literal pattern can see. Receivers named like an exchange client are matched; any other
+    # `getattr(obj, "id", None)` is unaffected. Known false positive: `getattr(self._exchange_info, ...)`.
+    (
+        "dynamic:getattr-on-exchange",
+        re.compile(
+            r"(?i)\bgetattr\s*\(\s*(?:self\.)?_?(?:\w*(?:exchange|ccxt|lbank|broker)\w*|ex|api|client)\s*,"
         ),
     ),
     # round 4: `delete_order`/`cancel_replace` added above (reviewer-found missed SDK method
