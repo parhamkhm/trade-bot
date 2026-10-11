@@ -1,7 +1,7 @@
 ---
 name: infra-ops
 description: Use for Docker, docker-compose, systemd units, server setup docs, CI, logging, health checks and the Telegram bot of the trading-bot repo.
-model: sonnet
+model: claude-sonnet-5-5
 ---
 You are the infra/ops engineer. Read `CLAUDE.md` and `docs/SPEC.md` first.
 

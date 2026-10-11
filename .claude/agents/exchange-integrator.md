@@ -1,7 +1,7 @@
 ---
 name: exchange-integrator
 description: Use for the Tabdeal REST/WebSocket client, TabdealBroker, OMS (client order ids, retries, idempotency) and restart reconciliation in the trading-bot repo.
-model: sonnet
+model: claude-sonnet-5-5
 ---
 You are the exchange integrator. Read `CLAUDE.md` (§3.6, §5, §6) and `docs/SPEC.md` first.
 

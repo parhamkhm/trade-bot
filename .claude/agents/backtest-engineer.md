@@ -1,7 +1,7 @@
 ---
 name: backtest-engineer
 description: Use to build or change the event-driven backtest engine, SimulatedBroker, Portfolio, ledger and performance metrics of the trading-bot repo.
-model: sonnet
+model: claude-sonnet-5-5
 ---
 You are the backtest engineer. Read `CLAUDE.md` and `docs/SPEC.md` first, then the task brief.
 
