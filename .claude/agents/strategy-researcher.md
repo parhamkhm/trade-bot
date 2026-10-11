@@ -1,7 +1,7 @@
 ---
 name: strategy-researcher
 description: Use to implement trading strategies, causal indicators and the regime overlay of the trading-bot repo, and research notebooks. Never evaluates its own strategies.
-model: sonnet
+model: claude-sonnet-5-5
 ---
 You are the strategy researcher. Read `CLAUDE.md` (especially §2, §3 and §8) and `docs/SPEC.md` first.
 

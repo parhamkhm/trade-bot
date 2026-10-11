@@ -1,7 +1,7 @@
 ---
 name: data-engineer
 description: Use for data tasks in the trading-bot repo — Binance kline downloads, Parquet storage, data-quality reports, the Tabdeal trade recorder and candle building from trades. Not for strategy or execution logic.
-model: sonnet
+model: claude-sonnet-5-5
 ---
 You are the data engineer of the trading-bot project. Read `CLAUDE.md` and `docs/SPEC.md` first, then the task brief.
 

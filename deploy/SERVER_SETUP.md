@@ -945,3 +945,272 @@ Before considering the server "done":
       forgetting.
 - [ ] Decided whether CI needs a self-hosted runner or GitHub-hosted is fine for a private
       repo (`docs/SPEC.md` section 9, question 7) — this document does not touch CI.
+
+---
+
+## 18. LBank recorder (pivot step 0)
+
+Raw LBank BTC/USDT spot market data (top-20 order book every 10 s, public trades every 30 s,
+1m/1h/1d klines, BTCUSDT perpetual funding every 60 s), one SQLite file per UTC day. Public
+endpoints only: no API key exists or is read. Order-book history starts **2026-10-10 13:40:00.871 UTC**.
+
+### 18.1 Pinned checkout
+
+The recorder runs from its own checkout, `/opt/tbot/lbank-run`, detached at a fixed commit, not from
+`/opt/tbot/trade-bot`: pulling `main` must never rebuild or restart the raw recorder by accident
+(CLAUDE.md §3.8). Upgrade deliberately, as `tbot`:
+
+```
+cd /opt/tbot/lbank-run && git fetch && git checkout --detach <commit>
+docker compose -f deploy/docker-compose.lbank.yml up -d --build
+```
+
+`docker compose up -d --build` replaces the container, which leaves a recording gap of roughly the
+container restart time (seconds). Note the exact gap from the `depth_snapshots` timestamps when it
+matters.
+
+### 18.2 Install (root, once)
+
+```
+cd /opt/tbot/lbank-run
+install -m 0644 deploy/systemd/tbot-lbank-recorder.service deploy/systemd/tbot-lbank-backup.service \
+    deploy/systemd/tbot-lbank-backup.timer /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now tbot-lbank-recorder.service tbot-lbank-backup.timer
+```
+
+### 18.3 Nightly archive and backup (`deploy/backup_lbank.py`, ~02:40 UTC)
+
+- **Closed days** (ended ≥ 2 h ago, untouched for 2 h): online copy → `integrity_check` → zstd
+  (`lbank-YYYY-MM-DD.sqlite.zst`, read-only, next to the live files) → decompressed again and
+  verified (integrity + identical row counts per table) → copied to `/var/backups/tbot/lbank/`
+  (sha256-checked) → only then is the uncompressed day file removed.
+- **Today's file**: a plain online, integrity-checked copy in `/var/backups/tbot/lbank/`, refreshed
+  nightly, so at most one night of data is ever unbacked.
+- Closed archives never change, so every one is kept (≈ 7–10 MB a day).
+- Check the last run: `journalctl -u tbot-lbank-backup.service -n 5 -o cat` (one JSON line;
+  non-empty `failed` / `corrupt` means look now).
+
+The container healthcheck also turns **unhealthy at ≥ 80 % disk used** (`TBOT_LBANK_DISK_MAX_PCT`).
+It never stops recording.
+
+### 18.4 Weekly copy to Parham's Windows laptop
+
+From PowerShell on the laptop (the root key is already installed there). It copies only the archives
+the laptop does not have yet:
+
+```powershell
+$dst = "C:\trade-bot-backups\lbank"; New-Item -ItemType Directory -Force $dst | Out-Null
+$have = Get-ChildItem $dst -Filter *.zst | ForEach-Object Name
+ssh root@91.228.186.132 "ls -1 /var/backups/tbot/lbank/ | grep -E '^lbank-[0-9-]{10}\.sqlite\.zst$'" |
+  Where-Object { $have -notcontains $_ } |
+  ForEach-Object { scp "root@91.228.186.132:/var/backups/tbot/lbank/$_" "$dst\" }
+```
+
+To read one on the laptop: `zstd -d lbank-2026-10-11.sqlite.zst` (zstd for Windows:
+https://github.com/facebook/zstd/releases), then open the `.sqlite` with any SQLite tool.
+
+### 18.5 Backup status file (`/var/backups/tbot/lbank/status.json`)
+
+Every backup run writes this file atomically **twice**: at the start (`in_progress: true`,
+`ok: false`, `exit_code: null`, so a run that is killed or times out never leaves last night's OK
+behind) and again at the end. A run that finds the lock held writes nothing (the holder owns it).
+
+```json
+{"ts": "2026-10-12T02:40:31+00:00", "ok": true, "in_progress": false,
+ "started_ts": "2026-10-12T02:40:02+00:00", "exit_code": 0, "days_archived": ["2026-10-11"],
+ "days_pending": [], "message": "ok", "integrity_ok": true}
+```
+
+- `in_progress` and `started_ts` are additions (the other keys are unchanged). `ts` is the end of the
+  run (equal to `started_ts` while in progress).
+- `ok` is false and `days_pending` lists the closed days still not archived whenever archiving failed;
+  the source file is then kept and a full verified copy of it sits in the backup directory.
+- Exit codes: 0 ok, 1 failed (read `message`), 2 corrupt / failed integrity check (`integrity_ok` is
+  false: look now), 3 another healthy run holds `.lock` (nothing touched; the unit treats 3 as
+  success), 4 the lock holder has run longer than 1800 s (stuck) or a dead holder's lock could not be
+  replaced (the unit FAILS; `status.json` still shows the holder's `in_progress: true`). The lock file
+  contains `<pid> <start epoch>`; a holder whose pid is dead is taken over automatically.
+- Alert on `ok == false` (tolerate `in_progress: true` for 1800 s after `started_ts`; longer means the
+  run was killed or is stuck), on non-empty `days_pending`, or on a `ts` older than 26 h.
+- Timeout headroom (`TimeoutStartSec=1800`): estimated, not measured (no `zstd` binary on the dev
+  machine). A day file is about 7-10 MB compressed, so roughly 50-100 MB raw; `zstd -19` runs at about
+  3 MB/s per thread, i.e. 20-40 s per day, plus a few sha256 and decompress passes (seconds). Even
+  at 3-5x slowdown from `Nice=19` / idle I/O that is a few minutes per day, so one night plus a backlog
+  of roughly ten closed days fits. After a longer outage the run may time out part-way; it leaves
+  `in_progress: true`, finishes the rest the next night (every step is idempotent), and the alert fires.
+  Time the first real run (`journalctl -u tbot-lbank-backup`, field `seconds`) and adjust.
+- Check it with `cat /var/backups/tbot/lbank/status.json`.
+
+---
+
+## 19. Telegram health-alert monitor (`tbot-health-monitor.service`)
+
+A small separate service on the host (not in any container) that sends you a Telegram message when
+something needs attention. It is **send-only**: it never reads Telegram messages, has no commands
+(no `/halt`), and sends no trade alerts. The recorder containers get no secret and are not changed.
+
+It alerts on four things, with the server's hostname and the UTC time in every message:
+
+1. a recorder stream is stale or erroring (Tabdeal and LBank recorders) -- one alert key
+   `recorder:<name>` per recorder, covering both the container state and the stream/heartbeat state,
+   so the two can never falsely clear each other;
+2. a backup problem: the LBank status file says failed / corrupt / stale (`backup:lbank`), the file
+   exists but cannot be read (`backup:lbank:unreadable`), the file has never appeared within the
+   grace period (`backup:lbank:nostatus`, see below), the trades backup (`backup:trades`) is missing
+   or stale, or a backup's systemd unit is `failed` (`backup:unit:<name>`);
+3. a disk is more than 80 % full (`/`, `/var/lib/docker`, `/var/backups/tbot`);
+4. a recorder container is unhealthy, exited, restarting, missing, or has restarted since the last
+   check (crash loop), or docker itself is down.
+
+A problem is announced once, repeated as a reminder every 6 h while it lasts, and followed by a
+`RESOLVED` message when it clears. One `INFO monitor started` message is sent at every start.
+
+A few things are deliberately **not** instant alerts, to avoid flapping and false "all clear"s:
+
+- a container or disk problem must be seen on `TBOT_MONITOR_CONFIRM_CYCLES` (default 2) consecutive
+  60 s checks before it alerts; a stream or backup failure alerts immediately;
+- a disk alert, once open, only clears `TBOT_MONITOR_DISK_CLEAR_MARGIN` (default 2) points below the
+  limit, not right at it;
+- if a whole check fails (docker is down, `systemctl` is missing, a check crashes), every alert key it
+  owns is frozen: none of them is reported `RESOLVED` just because the monitor could not tell;
+- the LBank backup status file may not exist yet right after this unit (or the backup job) is first
+  installed. The monitor stays quiet for `TBOT_MONITOR_BACKUP_MAX_AGE_HOURS` (default 36 h) counted
+  from the first time it noticed the file missing, then alerts under `backup:lbank:nostatus` -- so a
+  backup that never reports is never silently accepted as fine.
+
+### 19.0 Pinned checkout
+
+Like the LBank recorder (section 18.1), the monitor runs from its own copy, `/opt/tbot/monitor-run`,
+not from `/opt/tbot/trade-bot`: pulling `main` into the main checkout must never change what this
+long-running root process executes without a deliberate update.
+
+**Never `cp -r /opt/tbot/trade-bot`.** The main checkout is where `/opt/tbot/trade-bot/.env` lives
+(section 9); a recursive copy would duplicate that secret file into `/opt/tbot/monitor-run`, outside
+the one place it is supposed to exist. Always get `/opt/tbot/monitor-run` from a fresh `git clone`
+instead -- it only ever contains what git tracks, never `.env` or anything else `.gitignore`d. First
+time only, as `root`:
+
+```
+git clone git@github.com:parhamkhm/trade-bot.git /opt/tbot/monitor-run
+git -C /opt/tbot/monitor-run checkout --detach <commit>
+```
+
+To pick up a later change to the monitor itself, as `root`:
+
+```
+git -C /opt/tbot/monitor-run fetch
+git -C /opt/tbot/monitor-run checkout --detach <commit>
+systemctl restart tbot-health-monitor
+```
+
+Pinning to `<commit>` (same pattern as 18.1) keeps the monitor's version a deliberate, reviewed
+choice, independent of whatever the laptop's own checkout happens to be on.
+
+### 19.1 Create the bot (Parham, on his phone, about 2 minutes)
+
+1. In Telegram open **@BotFather**, send `/newbot`, pick a name and a username ending in `bot`.
+2. BotFather replies with a **token** like `123456789:AAxxxxxxxx...`. Treat it like a password:
+   do not paste it in chat, GitHub, or any file inside the repo.
+3. Open a chat with your new bot (search its username) and press **Start**, then send it any
+   message, e.g. `hi`. Telegram only lets a bot see you after you wrote to it first.
+
+### 19.2 Put the two values on the server (root)
+
+The values live only in a root-only file on the server:
+
+```
+install -m 0600 -o root -g root /opt/tbot/monitor-run/deploy/health_monitor.env.example /opt/tbot/health-monitor.env
+nano /opt/tbot/health-monitor.env
+```
+
+Fill in the token after `TBOT_TELEGRAM_BOT_TOKEN=` (no quotes, no spaces). Leave
+`TBOT_TELEGRAM_CHAT_ID=` empty for now, save and exit (`Ctrl+O`, `Enter`, `Ctrl+X`).
+
+### 19.3 Find your chat id
+
+Run this in a subshell (the parentheses matter: they keep the token from staying exported in your
+login shell once the command finishes):
+
+```
+( set -a; . /opt/tbot/health-monitor.env; python3 /opt/tbot/monitor-run/scripts/telegram_get_chat_id.py )
+```
+
+It prints something like `chat_id=123456789  type=private  name=Parham`, followed by a reminder
+that the bot's username is public: double-check `name=` is really you (or your intended group)
+before copying the id anywhere. The token is read from the environment only and never printed.
+If it says "No chats found", you have not written to the bot yet (step 3 of 19.1): do that and run
+it again. Put the number into the env file:
+
+```
+nano /opt/tbot/health-monitor.env       # TBOT_TELEGRAM_CHAT_ID=123456789
+```
+
+### 19.4 Install and start (root)
+
+```
+install -m 0644 /opt/tbot/monitor-run/deploy/systemd/tbot-health-monitor.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now tbot-health-monitor
+```
+
+The monitor uses only the system `python3` (standard library): no uv, no virtualenv, no extra
+packages. It runs from the pinned `/opt/tbot/monitor-run` (section 19.0), not from
+`/opt/tbot/trade-bot`, so changing the main checkout alone does nothing to it. The service never
+touches the recorder containers, and it does not mount or use the docker socket from inside a
+container -- it is a plain host process that shells out to the host's own `docker` and `systemctl`.
+
+**Before relying on it**, confirm the hardened unit can actually run `docker inspect` on this
+server: `ProtectHome=yes` hides `/home`, `/root` and `/run/user/*` from the service, which is where
+some Docker installations put per-user config or the rootless socket. Standard root-owned
+`/var/run/docker.sock` is unaffected, but if `systemctl status tbot-health-monitor` shows it failing
+to talk to docker, check `docker context show` and `DOCKER_HOST` as root first -- `_CHILD_ENV_ALLOWED`
+in `health_monitor.py` already passes `DOCKER_HOST`, `DOCKER_CONFIG` and `DOCKER_CONTEXT` through if
+they are set on the service's own environment (not from the env file, which carries only Telegram
+secrets and tuning).
+
+### 19.5 Test it
+
+```
+systemctl status tbot-health-monitor --no-pager
+journalctl -u tbot-health-monitor -n 30 --no-pager
+```
+
+You should get an `INFO monitor started` message on Telegram within a few seconds. More tests, again
+in a subshell:
+
+```
+( set -a; . /opt/tbot/health-monitor.env; python3 /opt/tbot/monitor-run/scripts/run_health_monitor.py --send-test )
+( set -a; . /opt/tbot/health-monitor.env; python3 /opt/tbot/monitor-run/scripts/run_health_monitor.py --check )
+```
+
+`--send-test` sends one test message; `--check` runs the checks once, prints any problems, and sends
+nothing.
+
+To see a real alert, stop a recorder briefly (`docker stop tbot-lbank-recorder`). After
+`TBOT_MONITOR_CONFIRM_CYCLES` (default 2) consecutive 60 s checks see it down -- so roughly 2
+minutes -- you get `ALERT recorder:lbank`. Run `docker start tbot-lbank-recorder` and wait for
+`RESOLVED` (after `TBOT_MONITOR_RESOLVE_CYCLES`, default 2, clean checks). The logs are JSON lines
+in the journal (`journalctl -u tbot-health-monitor -f`); the token never appears in them. If
+Telegram is unreachable the monitor logs an error and retries with a growing delay; it does not crash.
+
+### 19.6 Optional: dead-man switch for a dead server
+
+If the **whole server** dies (power, network, provider outage), the monitor dies with it and you
+hear nothing -- that silence is the one failure it cannot report on its own. The monitor supports an
+optional, stdlib-only dead-man ping for this: set `TBOT_DEADMAN_URL` in the env file to a URL from a
+service like [healthchecks.io](https://healthchecks.io) (free tier is enough), and the monitor sends
+one plain `GET` to it after every completed cycle; that service then alerts *you* if the pings stop.
+Ping failures are ignored by the monitor itself and the URL is never logged. This is entirely
+optional -- Parham decides later whether to set it up; the monitor works the same without it.
+
+### 19.7 Limits and what to add later
+
+- The dead-man switch above is the mitigation for the "whole server died" blind spot; without it,
+  that blind spot remains.
+- Alert state (including which alerts are open and docker `RestartCount` per container) is kept in
+  `/var/lib/tbot-health-monitor/state.json`, so a restart does not repeat old alerts or lose the
+  crash-loop count. Optional non-secret tuning variables (including the hysteresis settings and the
+  dead-man URL) are listed, commented out, in the env file.
+- To rotate the token: revoke it in BotFather (`/revoke`), paste the new one into the env file,
+  `systemctl restart tbot-health-monitor`.

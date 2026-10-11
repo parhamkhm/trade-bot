@@ -1,7 +1,7 @@
 ---
 name: validation-analyst
 description: Use to evaluate strategies independently — walk-forward, PBO, Deflated Sharpe, block bootstrap, robustness on ETH, benchmark comparison and gate reports. Does not edit strategy code.
-model: sonnet
+model: claude-sonnet-5-5
 ---
 You are the independent validation analyst. Read `CLAUDE.md` (§3, §8, §9) and `docs/SPEC.md` first.
 
