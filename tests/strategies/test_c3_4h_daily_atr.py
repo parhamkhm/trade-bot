@@ -102,5 +102,92 @@ def test_4h_target_weight_uses_only_the_last_completed_daily_sigma(entry: Phase3
     assert after > 0.0 and after != base
 
 
+def _last_completed_day(bars: list[Bar]) -> range:
+    """Indices of the 6 4h bars of the last completed UTC day (the window ends INCOMPLETE bars into a day)."""
+    end = len(bars) - INCOMPLETE
+    return range(end - BARS_PER_DAY, end)
+
+
+def _non_extreme_mid_bar(bars: list[Bar]) -> int:
+    """A 4h bar of the last completed day that sets neither the day's high, low, open nor close."""
+    day = list(_last_completed_day(bars))
+    hi_i = max(day, key=lambda k: bars[k].high)
+    lo_i = min(day, key=lambda k: bars[k].low)
+    for k in day[1:-1]:
+        if k not in (hi_i, lo_i) and bars[k].high < bars[hi_i].high and bars[k].low > bars[lo_i].low:
+            return k
+    raise AssertionError("synthetic data has no non-extreme mid-day bar")
+
+
+def _daily_hlc(bars: list[Bar]) -> tuple[Decimal, Decimal, Decimal]:
+    day = list(_last_completed_day(bars))
+    return max(bars[k].high for k in day), min(bars[k].low for k in day), bars[day[-1]].close
+
+
+@pytest.mark.parametrize("entry", C3_4H, ids=lambda e: e.key)
+def test_4h_only_change_inside_a_completed_day_leaves_the_stop_unchanged(entry: Phase3Entry) -> None:
+    """A 4h bar of a completed day is changed (high, low AND close) while that day's daily high, low and
+    close stay unchanged: the stop level must not change. Control: raising the bar that sets the day's high
+    changes the daily range, so the stop level must change."""
+    skip_if_not_implemented(entry)
+    strategy = load(entry)
+    bars = _window_mid_day(400)
+    entry_price = bars[-1].close
+    base = strategy.stop_price(BarWindow.of(bars), entry_price)
+    day_high, day_low, day_close = _daily_hlc(bars)
+
+    k = _non_extreme_mid_bar(bars)
+    b = bars[k]
+    new_close = (b.close + day_low) / 2 if b.close > day_low else b.close  # moves the close, stays inside
+    mid = replace(b, close=new_close, high=max(b.open, new_close), low=min(b.open, new_close))
+    changed = [*bars[:k], mid, *bars[k + 1 :]]
+    assert _daily_hlc(changed) == (day_high, day_low, day_close)  # the daily bar is untouched
+    assert changed[k] != bars[k]
+    assert strategy.stop_price(BarWindow.of(changed), entry_price) == base
+
+    hi_i = max(_last_completed_day(bars), key=lambda j: bars[j].high)
+    control = [*bars[:hi_i], _scaled(bars[hi_i], hi=Decimal("1.5")), *bars[hi_i + 1 :]]
+    assert _daily_hlc(control)[0] != day_high
+    assert strategy.stop_price(BarWindow.of(control), entry_price) != base
+
+
+@pytest.mark.parametrize("entry", C3_4H, ids=lambda e: e.key)
+def test_4h_only_intrabar_range_change_leaves_the_target_weight_unchanged(entry: Phase3Entry) -> None:
+    """Only the intrabar high/low of a non-extreme 4h bar of a completed day changes (not its close:
+    4h closes feed the C3 signal by design); the day's daily high, low and close stay unchanged, so the
+    target weight must not change."""
+    skip_if_not_implemented(entry)
+    strategy = load(entry)
+    bars = _uptrend_mid_day(400)
+    base = strategy.on_bar(BarWindow.of(bars)).target_weight
+    assert 0.0 < base < 1.0, f"precondition: long with a vol-targeted weight below 1, got {base}"
+    day = _daily_hlc(bars)
+
+    k = _non_extreme_mid_bar(bars)
+    b = bars[k]
+    widened = replace(b, high=(b.high + day[0]) / 2, low=(b.low + day[1]) / 2)  # wider, still inside the day
+    changed = [*bars[:k], widened, *bars[k + 1 :]]
+    assert _daily_hlc(changed) == day and changed[k] != bars[k]
+    assert strategy.on_bar(BarWindow.of(changed)).target_weight == base
+
+
+@pytest.mark.parametrize("series", ["cyclic", "uptrend"])
+def test_4h_only_edits_leave_the_daily_bar_unchanged_and_the_control_does_not(series: str) -> None:
+    """Strategy-independent check of the edits used above, on both synthetic series: the mid-bar edits change
+    the 4h bar but not the completed day's daily high/low/close; the control changes the daily high."""
+    bars = _window_mid_day(400) if series == "cyclic" else _uptrend_mid_day(400)
+    day = _daily_hlc(bars)
+    k = _non_extreme_mid_bar(bars)
+    b = bars[k]
+    new_close = (b.close + day[1]) / 2
+    shrunk = replace(b, close=new_close, high=max(b.open, new_close), low=min(b.open, new_close))
+    widened = replace(b, high=(b.high + day[0]) / 2, low=(b.low + day[1]) / 2)
+    for edited in (shrunk, widened):
+        assert edited != b
+        assert _daily_hlc([*bars[:k], edited, *bars[k + 1 :]]) == day
+    hi_i = max(_last_completed_day(bars), key=lambda j: bars[j].high)
+    assert _daily_hlc([*bars[:hi_i], _scaled(bars[hi_i], hi=Decimal("1.5")), *bars[hi_i + 1 :]])[0] != day[0]
+
+
 def test_c3_4h_entries_are_registered() -> None:
     assert [e.key for e in C3_4H] == ["C3-4h-(8,16,32)", "C3-4h-(16,32,64)", "C3-4h-(32,64,128)"]
