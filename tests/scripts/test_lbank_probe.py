@@ -71,6 +71,7 @@ def make_sample(
     spread_pct: float = 0.05,
     accuracy_ok: bool = True,
     request_ok: bool = True,
+    fail_status: int = 429,
 ) -> dict[str, Any]:
     return {
         "kind": "sample",
@@ -79,12 +80,13 @@ def make_sample(
         "requests": [
             {
                 "endpoint": "depth",
-                "status": 200 if request_ok else 429,
+                "status": 200 if request_ok else fail_status,
                 "ok": request_ok,
                 "error": None,
                 "payload_error": None,
                 "latency_ms": 10.0,
                 "nbytes": 1,
+                "timeout_s": lp.REQUEST_TIMEOUT_S,
             }
         ],
         "server_time": {"ok": True, "delta_ms": delta_ms, "rtt_ms": 100.0, "half_rtt_ms": 50.0},
@@ -271,6 +273,121 @@ def test_parse_kline_rows_normalises_milliseconds() -> None:
     assert lp.parse_kline_rows(body) == [(1_790_000_000,), (1_790_000_060,)]
 
 
+def test_parse_kline_rows_accepts_dict_shaped_rows() -> None:
+    """item 5: a dict-shaped row (e.g. a mirror or future API version) is parsed via its first
+    recognised timestamp field, not rejected outright."""
+    body = {"data": [{"openTime": 1_790_000_000_000, "open": "1"}, {"t": 1_790_000_060, "open": "1"}]}
+    assert lp.parse_kline_rows(body) == [(1_790_000_000,), (1_790_000_060,)]
+
+
+def test_parse_kline_rows_raises_typed_error_for_unrecognised_shapes() -> None:
+    """item 5: the failure mode is always KlineRowError (a ValueError subclass), never a bare
+    KeyError/IndexError/TypeError that a generic ``except ValueError`` would miss."""
+    with pytest.raises(lp.KlineRowError):
+        lp.parse_kline_rows({"data": [{"unknown_field": 1}]})
+    with pytest.raises(lp.KlineRowError):
+        lp.parse_kline_rows({"data": [[]]})
+    with pytest.raises(lp.KlineRowError):
+        lp.parse_kline_rows({"data": [42]})
+    with pytest.raises(lp.KlineRowError):
+        lp.parse_kline_rows({"data": [{"t": "not-a-number"}]})
+    with pytest.raises(lp.KlineRowError):
+        lp.parse_kline_rows({"data": "not-a-list"})
+
+
+def test_kline_probe_catches_a_bad_row_records_it_and_does_not_raise() -> None:
+    """item 5: ``_kline_probe`` catches ``KlineRowError``, records ``parse_error``, and returns
+    empty rows instead of propagating -- so one malformed page never aborts the whole G0 run."""
+
+    class BadRowFetcher:
+        def get(self, endpoint: str, _spec: lp.EndpointSpec, params: Any = None) -> lp.HttpResult:
+            return lp.HttpResult(
+                endpoint=endpoint,
+                url="https://example.invalid/v2/kline.do",
+                params=dict(params or {}),
+                sent_at=T0,
+                received_at=T0,
+                status=200,
+                latency_ms=1.0,
+                nbytes=1,
+                error=None,
+                body={"result": "true", "error_code": 0, "data": [{"nonsense": 1}]},
+                payload_ok=True,
+                payload_error=None,
+            )
+
+    info, rows = lp._kline_probe(BadRowFetcher(), "1d", "recent", 0)
+    assert rows == []
+    assert "parse_error" in info
+    assert "KlineRowError" in info["parse_error"]
+
+
+def test_probe_kline_history_continues_past_a_bad_timeframe(tmp_path: Path) -> None:
+    """item 5: a malformed kline response for ONE timeframe does not stop the history probe from
+    covering the others."""
+    env = lp.VirtualEnv()
+    seen_params: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        params = dict(request.url.params)
+        seen_params.append(params)
+        if params.get("type") == "day1":
+            return httpx.Response(200, json={"result": "true", "error_code": 0, "data": [{"bad": 1}]})
+        secs = {"hour4": 14_400, "hour1": 3_600, "minute1": 60}[params["type"]]
+        start = int(params["time"])
+        return httpx.Response(
+            200,
+            json={
+                "result": "true",
+                "error_code": 0,
+                "data": [[start + i * secs, "1", "1", "1", "1", "1"] for i in range(3)],
+            },
+        )
+
+    with lp.Fetcher(env, transport=httpx.MockTransport(handler)) as fetcher:
+        history = lp.probe_kline_history(fetcher, env)
+    tfs = history["timeframes"]
+    assert "parse_error" in tfs["1d"]["recent"]
+    assert tfs["1d"]["max_bars_per_request_observed"] == 0
+    # the other three timeframes were not affected by 1d's bad response
+    for tf in ("4h", "1h", "1m"):
+        assert "parse_error" not in tfs[tf]["recent"]
+        assert tfs[tf]["max_bars_per_request_observed"] == 3
+
+
+def test_summarize_latency_counts_timeouts_at_the_timeout_value_and_separately() -> None:
+    """item 4: a timeout's latency is counted AT its configured timeout (not excluded, and not at
+    whatever partial latency_ms happened to be measured), and timeout_count is reported
+    separately from other kinds of failure."""
+    samples = [
+        {
+            "requests": [
+                {"endpoint": "trades", "status": 200, "ok": True, "error": None, "latency_ms": 50.0},
+                {
+                    "endpoint": "trades",
+                    "status": None,
+                    "ok": False,
+                    "error": "timeout",
+                    "latency_ms": 3.0,  # a short partial measurement -- must NOT be used as-is
+                    "timeout_s": 20.0,
+                },
+                {
+                    "endpoint": "trades",
+                    "status": None,
+                    "ok": False,
+                    "error": "ConnectError",  # a non-timeout transport error
+                    "latency_ms": 1.0,
+                },
+            ]
+        }
+    ]
+    out = lp.summarize_latency(samples)
+    assert out["trades"]["timeout_count"] == 1
+    assert out["trades"]["max_ms"] == 20_000.0  # the timeout, in ms, not the 3.0 ms partial read
+    assert out["trades"]["n"] == 3
+    assert out["trades"]["http_not_200"] == 2  # both the timeout and the connect error
+
+
 # ---------------------------------------------------------------------------------
 # accuracy row (D-073 condition 3)
 # ---------------------------------------------------------------------------------
@@ -331,6 +448,40 @@ def test_g0_fails_when_any_request_is_not_200() -> None:
     assert out["checks"]["all_endpoints_200"]["failures"][0]["status"] == 429
 
 
+def test_g0_tolerates_isolated_non_ban_failures_within_95_percent() -> None:
+    """item 3: a single isolated non-ban-type failure (e.g. a 400) out of 32 samples is 31/32 =
+    96.9% success, above the 95% per-endpoint threshold, and there is no ban-type status --
+    so the condition passes."""
+    samples = full_plan()
+    samples[5] = make_sample(5, minutes=60, request_ok=False, fail_status=400)
+    out = lp.evaluate_g0(samples)
+    assert out["checks"]["all_endpoints_200"]["pass"] is True
+    assert out["verdict"] == "PASS"
+
+
+def test_g0_fails_below_95_percent_even_without_any_ban_status() -> None:
+    """item 3: the per-endpoint rate matters on its own too, not only ban-type statuses -- enough
+    isolated 400s to drop under 95% fails even though none of them is a ban-type response."""
+    samples = full_plan()
+    for i in (1, 3, 5, 7):  # 4/32 = 12.5% failing -> 28/32 = 87.5% success, under 95%
+        samples[i] = make_sample(i, minutes=i * 12, request_ok=False, fail_status=400)
+    out = lp.evaluate_g0(samples)
+    assert out["checks"]["all_endpoints_200"]["pass"] is False
+    assert out["checks"]["all_endpoints_200"]["ban_type_response_seen"] is False
+    assert out["verdict"] == "FAIL"
+
+
+def test_g0_fails_on_a_single_ban_status_even_above_95_percent() -> None:
+    """item 3: even one ban-type response (429/403/418) fails the condition outright, regardless
+    of how high the overall per-endpoint success rate still is."""
+    samples = full_plan()
+    samples[5] = make_sample(5, minutes=60, request_ok=False, fail_status=403)
+    out = lp.evaluate_g0(samples)
+    assert out["checks"]["all_endpoints_200"]["pass"] is False
+    assert out["checks"]["all_endpoints_200"]["ban_type_response_seen"] is True
+    assert out["verdict"] == "FAIL"
+
+
 def test_g0_fails_on_clock_skew_but_uses_the_median_not_the_worst_case() -> None:
     assert lp.evaluate_g0(full_plan(delta_ms=1500.0))["failed_checks"] == ["clock_offset"]
     samples = full_plan(delta_ms=200.0)
@@ -338,6 +489,49 @@ def test_g0_fails_on_clock_skew_but_uses_the_median_not_the_worst_case() -> None
     assert lp.evaluate_g0(samples)["verdict"] == "PASS"
     samples = full_plan(delta_ms=-1200.0)  # negative skew counts as well
     assert lp.evaluate_g0(samples)["failed_checks"] == ["clock_offset"]
+
+
+def _clock(med_abs: float, half_rtt: float, delta_at_min_rtt: float) -> dict[str, Any]:
+    return {
+        "median_abs_delta_ms": med_abs,
+        "median_half_rtt_ms": half_rtt,
+        "delta_at_min_rtt_ms": delta_at_min_rtt,
+    }
+
+
+def test_clock_check_passes_when_clearly_under_threshold() -> None:
+    out = lp._clock_check(_clock(200.0, 50.0, 180.0))
+    assert out["pass"] is True
+    assert out["status"] == "pass"
+
+
+def test_clock_check_fails_when_clearly_over_threshold() -> None:
+    out = lp._clock_check(_clock(2000.0, 50.0, 1900.0))
+    assert out["pass"] is False
+    assert out["status"] == "fail"
+
+
+def test_clock_check_fails_when_delta_at_min_rtt_alone_is_over_even_if_median_is_under() -> None:
+    """item 6: BOTH conditions must hold -- a clean median with one bad low-RTT sample still
+    fails (and is not inconclusive, since the uncertainty band here does not straddle 1000)."""
+    out = lp._clock_check(_clock(200.0, 10.0, 1500.0))
+    assert out["pass"] is False
+    assert out["status"] == "fail"
+
+
+def test_clock_check_is_inconclusive_when_uncertainty_band_straddles_threshold() -> None:
+    """item 6: median 900 +/- half-RTT 150 spans [750, 1050], straddling 1000 -- cannot confirm
+    pass or fail, so this is reported as inconclusive (which counts as not-passed)."""
+    out = lp._clock_check(_clock(900.0, 150.0, 900.0))
+    assert out["pass"] is False
+    assert out["status"] == "inconclusive"
+    assert "reason" in out
+
+
+def test_clock_check_no_data() -> None:
+    out = lp._clock_check({"n": 0})
+    assert out["pass"] is False
+    assert out["status"] == "no_data"
 
 
 def test_g0_fails_when_accuracy_is_missing_in_any_sample() -> None:
@@ -360,9 +554,11 @@ def test_g0_is_incomplete_when_the_sampling_plan_is_not_met() -> None:
     assert lp.evaluate_g0(short_span)["verdict"] == "INCOMPLETE"
 
 
-def test_g0_with_no_samples_is_not_a_pass() -> None:
+def test_g0_with_no_samples_is_incomplete_not_fail() -> None:
+    """item 8: zero samples is INCOMPLETE (nothing was measured yet), never FAIL."""
     out = lp.evaluate_g0([])
-    assert out["verdict"] == "FAIL"
+    assert out["verdict"] == "INCOMPLETE"
+    assert out["plan"]["plan_ok"] is False
 
 
 def test_g0_fail_beats_incomplete() -> None:
@@ -457,6 +653,23 @@ def test_request_whitelist_is_get_only_and_public() -> None:
     }
 
 
+def test_per_endpoint_timeouts_match_item_3() -> None:
+    """item 3: 20 s for supplement/trades, 10 s (the default) for every other endpoint."""
+    assert lp.ENDPOINTS["trades"].timeout_s == 20.0
+    for key, spec in lp.ENDPOINTS.items():
+        if key != "trades":
+            assert spec.timeout_s == 10.0, key
+
+
+def test_fetcher_result_carries_the_endpoints_configured_timeout() -> None:
+    env = lp.VirtualEnv()
+    with lp.Fetcher(env, transport=lp.fixture_transport(env)) as fetcher:
+        trades_res = fetcher.get("trades", lp.ENDPOINTS["trades"], {"symbol": "btc_usdt", "size": 10})
+        depth_res = fetcher.get("depth", lp.ENDPOINTS["depth"], {"symbol": "btc_usdt", "size": 10})
+    assert trades_res.timeout_s == 20.0
+    assert depth_res.timeout_s == 10.0
+
+
 # ---------------------------------------------------------------------------------
 # rate-limit stop logic
 # ---------------------------------------------------------------------------------
@@ -501,14 +714,46 @@ def test_stop_tracker_stays_stopped() -> None:
     assert tracker.observe(result(200)) == "HTTP 429"
 
 
+def test_stop_tracker_ban_only_ignores_isolated_non_ban_statuses_and_payload_errors() -> None:
+    """item 1: sampling mode's ban_only tracker does NOT stop on an isolated 4xx or a payload
+    error on HTTP 200 -- those are left to the per-endpoint 95% tolerance (item 3)."""
+    tracker = lp.StopTracker(ban_only=True)
+    assert tracker.observe(result(400)) is None
+    assert tracker.observe(result(404)) is None
+    assert tracker.observe(result(200, payload_ok=False)) is None
+    assert tracker.reason is None
+
+
+@pytest.mark.parametrize("status", [429, 403, 418])
+def test_stop_tracker_ban_only_still_stops_on_ban_statuses(status: int) -> None:
+    assert lp.StopTracker(ban_only=True).observe(result(status)) is not None
+
+
+def test_stop_tracker_ban_only_still_stops_on_5xx_and_transport_error_bursts() -> None:
+    t1 = lp.StopTracker(ban_only=True)
+    assert t1.observe(result(502)) is None
+    assert t1.observe(result(503)) is None
+    assert t1.observe(result(504)) is not None
+
+    t2 = lp.StopTracker(ban_only=True)
+    assert t2.observe(result(None, error="timeout", payload_ok=False)) is None
+    assert t2.observe(result(None, error="timeout", payload_ok=False)) is None
+    assert t2.observe(result(None, error="timeout", payload_ok=False)) is not None
+
+
 def run_fixture_ratelimit(
-    tmp_path: Path, *, throttle_after: int | None, steps: list[float], step_seconds: float = 5.0
+    tmp_path: Path,
+    *,
+    throttle_after: int | None,
+    steps: list[float],
+    step_seconds: float = 5.0,
+    latency_s: float = 0.05,
 ) -> tuple[int, dict[str, Any], list[httpx.Request], lp.OutputPaths]:
     env = lp.VirtualEnv()
     seen: list[httpx.Request] = []
     prov = lp.collect_provenance(env, "ratelimit", ["--test"], data_source="offline_fixture")
     paths = lp.OutputPaths.for_run(tmp_path, "rl", "stamp", summary_suffix=".json")
-    transport = lp.fixture_transport(env, throttle_after=throttle_after, seen=seen, latency_s=0.05)
+    transport = lp.fixture_transport(env, throttle_after=throttle_after, seen=seen, latency_s=latency_s)
     with lp.Fetcher(env, transport=transport, min_gap_s=lp.MIN_REQUEST_GAP_S) as fetcher:
         code, summary = lp.run_ratelimit(
             fetcher,
@@ -527,7 +772,11 @@ def test_ratelimit_run_stops_at_first_429_and_never_retries(tmp_path: Path) -> N
     code, summary, seen, _ = run_fixture_ratelimit(tmp_path, throttle_after=9, steps=[1.0, 2.0, 3.0])
     assert code == 4
     assert summary["stopped_early"] is True
-    assert summary["last_safe_rate_rps"] == 1.0
+    assert summary["stopped_reason"] == "ban"
+    # item 2: last_safe_rate_rps is the measured achieved_rps of step 0 (rate=1.0), not the
+    # nominal 1.0 itself.
+    assert summary["last_safe_rate_rps"] == pytest.approx(summary["steps"][0]["achieved_rps"])
+    assert summary["last_safe_rate_rps"] == pytest.approx(1.0, abs=0.05)
     assert summary["max_rate_tested_rps"] == 2.0  # step 3 never started
     assert len([r for r in seen if r.url.path == "/v2/depth.do"]) == 9  # the 429 was the last request
     failure = summary["failure"]
@@ -541,8 +790,12 @@ def test_ratelimit_run_without_incident_returns_zero_and_never_exceeds_five_rps(
     code, summary, seen, _ = run_fixture_ratelimit(tmp_path, throttle_after=None, steps=[1.0, 5.0])
     assert code == 0
     assert summary["stopped_early"] is False
-    assert summary["last_safe_rate_rps"] == 5.0
+    # item 2: last_safe_rate_rps is the MEASURED achieved_rps of the last clean step, not the
+    # nominal target -- here they coincide to within float/virtual-clock noise.
+    assert summary["last_safe_rate_rps"] == pytest.approx(summary["steps"][-1]["achieved_rps"])
+    assert summary["last_safe_rate_rps"] == pytest.approx(5.0, abs=0.05)
     assert summary["steps"][1]["achieved_rps"] <= 5.0 + 1e-9
+    assert all(s["reached"] for s in summary["steps"])
     assert len(seen) == sum(s["requests_sent"] for s in summary["steps"])
 
 
@@ -551,6 +804,61 @@ def test_ratelimit_outputs_record_failing_response_and_provenance(tmp_path: Path
     md = paths.markdown.read_text(encoding="utf-8")
     assert "Failing response" in md and "retry-after" in md
     assert "measured from" in md
+
+
+def test_ratelimit_stops_climbing_when_latency_prevents_reaching_the_target_rate(
+    tmp_path: Path,
+) -> None:
+    """item 2: with a realistic 1.1 s per-request latency, this strictly serial client cannot
+    exercise any rate above ~1/1.1 ~= 0.91 req/s no matter what is requested -- not because the
+    exchange complained (no response here is ever anything but clean 200), but because there is
+    no concurrency to fall back on. Step 0 (rate=1.0) just barely reaches 90% of target; step 1
+    (rate=2.0) falls far short, so the run reports that honestly and stops instead of continuing
+    to escalate to a rate it structurally cannot test.
+    """
+    code, summary, seen, _ = run_fixture_ratelimit(
+        tmp_path, throttle_after=None, steps=[1.0, 2.0, 5.0], step_seconds=10.0, latency_s=1.1
+    )
+    assert code == 5
+    assert summary["stopped_early"] is True
+    assert summary["stopped_reason"] == "latency"
+    assert summary["failure"] is None  # never a bad response -- purely latency-limited
+    assert len(summary["steps"]) == 2  # step rate=5.0 never started
+    step0, step1 = summary["steps"]
+    assert step0["rate_rps"] == 1.0
+    assert step0["reached"] is True
+    assert step0["achieved_rps"] == pytest.approx(1 / 1.1, abs=0.01)
+    assert step1["rate_rps"] == 2.0
+    assert step1["reached"] is False
+    assert step1["achieved_rps"] == pytest.approx(1 / 1.1, abs=0.01)
+    # last_safe_rate_rps is step 0's measured rate (nothing ever complained up to there), not its
+    # nominal 1.0, and not step 1's shortfall (which was never confirmed as a safe TARGET rate).
+    assert summary["last_safe_rate_rps"] == pytest.approx(step0["achieved_rps"])
+    not_reached = summary["rate_not_reached"]
+    assert not_reached["rate_rps"] == 2.0
+    assert "latency-limited" in not_reached["reason"]
+    assert "concurrency" in not_reached["reason"]
+    assert len(seen) == step0["requests_sent"] + step1["requests_sent"]
+
+
+def test_ratelimit_markdown_shows_rate_not_reached_block(tmp_path: Path) -> None:
+    _, _, _, paths = run_fixture_ratelimit(
+        tmp_path, throttle_after=None, steps=[1.0, 2.0], step_seconds=10.0, latency_s=1.1
+    )
+    md = paths.markdown.read_text(encoding="utf-8")
+    assert "Rate not reached" in md
+    assert "latency-limited" in md
+
+
+def test_ratelimit_caveat_names_the_shared_ip_and_this_process_only_scope(tmp_path: Path) -> None:
+    """item 9: the rate-limit summary must say the ceiling covers this probe process only, and
+    that the LBank recorder shares the IP at roughly RECORDER_SHARED_IP_RPS."""
+    _, summary, _, paths = run_fixture_ratelimit(tmp_path, throttle_after=None, steps=[1.0])
+    assert "THIS PROBE PROCESS only" in summary["caveat"]
+    assert "lbank_recorder" in summary["caveat"]
+    assert f"{lp.RECORDER_SHARED_IP_RPS:g}" in summary["caveat"]
+    md = paths.markdown.read_text(encoding="utf-8")
+    assert "THIS PROBE PROCESS only" in md
 
 
 # ---------------------------------------------------------------------------------
@@ -626,6 +934,12 @@ def test_sampling_run_never_requests_anything_but_whitelisted_gets(tmp_path: Pat
 
 
 def test_sampling_run_when_exchange_unreachable_exits_one(tmp_path: Path) -> None:
+    """A transport-level failure (no HTTP response at all) on every request trips the ban_only
+    StopTracker's 3-consecutive-transport-error burst after the 3rd call of sample 0 (timestamp,
+    accuracy, depth) -- before that sample ever completes. This is reported as "unreachable"
+    (exit 1), distinct from a FAIL via stopped_on_ban, because no HTTP response was ever received
+    at all (see run_sampling's BanDetectedError handler)."""
+
     def handler(_request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("no route")
 
@@ -637,8 +951,73 @@ def test_sampling_run_when_exchange_unreachable_exits_one(tmp_path: Path) -> Non
             fetcher, env, samples=3, interval_s=60.0, paths=paths, provenance=prov
         )
     assert code == 1
-    assert summary["plan"]["completed_samples"] == 1  # stopped after the first, fully failed, sample
+    assert summary["plan"]["completed_samples"] == 0  # sample 0 never completed -- never retried
     assert paths.summary.exists() and paths.markdown.exists()
+
+
+def test_sampling_run_stops_immediately_on_429_and_makes_no_further_requests(tmp_path: Path) -> None:
+    """item 1: a 429 on depth.do must be the LAST request this run ever makes -- no more of the
+    sample it occurred in, no further samples, no depth-size/kline-history discovery. The 429
+    arrives on the 5th depth.do call overall: 3 from discover_depth_size (200/100 rejected, 60
+    accepted), 1 from sample 0's own depth read, then the 5th on sample 1's depth read -- so
+    sample 0 completes in full and sample 1 stops partway through.
+    """
+    code, summary, paths, seen = run_fixture_sampling(
+        tmp_path, samples=10, interval_s=60.0, throttle_after=5, throttle_path="/v2/depth.do"
+    )
+    assert code == 2
+    assert summary["g0"]["verdict"] == "FAIL"
+    assert summary["stopped_on_ban"] is not None
+    assert summary["stopped_on_ban"]["reason"] == "HTTP 429"
+    assert summary["plan"]["completed_samples"] == 1  # only sample 0 finished
+
+    depth_calls = [r for r in seen if r.url.path == "/v2/depth.do"]
+    assert len(depth_calls) == 5
+    # the single most important assertion: nothing was ever requested after the 429
+    assert seen[-1] is depth_calls[-1]
+
+    records = lp.read_jsonl(paths.jsonl)
+    ban_records = [r for r in records if r.get("kind") == "stopped_on_ban"]
+    assert len(ban_records) == 1
+    assert ban_records[0]["reason"] == "HTTP 429"
+    # the run ends right there -- no further "sample" records after the one completed sample
+    sample_records = [r for r in records if r.get("kind") == "sample"]
+    assert len(sample_records) == 1
+
+    md = paths.markdown.read_text(encoding="utf-8")
+    assert "FAIL" in md
+    assert "STOPPED ON BAN" in md
+
+
+def test_sampling_run_stops_on_a_transport_error_burst_mid_run(tmp_path: Path) -> None:
+    """item 1: the ban_only tracker also stops on a burst of 3 consecutive transport errors, not
+    only on an explicit ban-type HTTP status -- and, because at least one sample had already
+    completed cleanly, this is reported as a FAIL via stopped_on_ban, not as "unreachable" (which
+    is reserved for a transport failure before the very first sample ever completes).
+    """
+    env = lp.VirtualEnv()
+    base_transport = lp.fixture_transport(env)
+    calls = {"n": 0}
+
+    def flaky_after_one_sample(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        # depth-size discovery (3) + sample 0 (10) + the one-off kline-history probe (12) = 25
+        # calls complete cleanly first; everything after that fails.
+        if calls["n"] > 25:
+            raise httpx.ConnectError("flaky")
+        return base_transport.handle_request(request)
+
+    prov = lp.collect_provenance(env, "sampling", [], data_source="offline_fixture")
+    paths = lp.OutputPaths.for_run(tmp_path, "flaky", "stamp")
+    with lp.Fetcher(env, transport=httpx.MockTransport(flaky_after_one_sample)) as fetcher:
+        code, summary = lp.run_sampling(
+            fetcher, env, samples=10, interval_s=60.0, paths=paths, provenance=prov
+        )
+    assert code == 2  # FAIL, not 1 ("unreachable") -- sample 0 did complete
+    assert summary["g0"]["verdict"] == "FAIL"
+    assert summary["stopped_on_ban"] is not None
+    assert "transport errors" in summary["stopped_on_ban"]["reason"]
+    assert summary["plan"]["completed_samples"] >= 1
 
 
 class InterruptingEnv(lp.VirtualEnv):
@@ -712,6 +1091,84 @@ def test_git_commit_tolerates_missing_git(monkeypatch: pytest.MonkeyPatch) -> No
 
     monkeypatch.setattr(subprocess, "run", boom)
     assert lp.resolve_git_commit() == "unknown"
+
+
+def test_dirty_check_covers_the_probe_and_its_two_data_dependencies() -> None:
+    """item 7: the dirty check must cover scripts/lbank_probe.py AND the two data-layer modules
+    it imports from -- a change to either can change this probe's measured output just as much as
+    editing the script itself."""
+    assert set(lp.DIRTY_CHECK_PATHS) == {
+        "scripts/lbank_probe.py",
+        "src/tbot/data/depth.py",
+        "src/tbot/data/lbank_recorder.py",
+    }
+
+
+def test_resolve_git_commit_uses_the_full_dirty_check_path_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    """item 7: the actual git status call passed to subprocess.run must include every path in
+    DIRTY_CHECK_PATHS, not just the script itself."""
+    monkeypatch.delenv("TBOT_GIT_COMMIT", raising=False)
+    seen_argvs: list[list[str]] = []
+    real_run = subprocess.run
+
+    def spy(argv: list[str], **kwargs: Any) -> Any:
+        seen_argvs.append(list(argv))
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", spy)
+    lp.resolve_git_commit()
+    status_calls = [a for a in seen_argvs if a[:2] == ["git", "status"]]
+    assert len(status_calls) == 1
+    for path in lp.DIRTY_CHECK_PATHS:
+        assert path in status_calls[0]
+
+
+def test_git_commit_unknown_flag_is_set_when_commit_cannot_be_resolved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TBOT_GIT_COMMIT", raising=False)
+
+    def boom(*_a: Any, **_k: Any) -> Any:
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    env = lp.VirtualEnv()
+    prov = lp.collect_provenance(env, "sampling", [])
+    assert prov["git_commit"] == "unknown"
+    assert prov["git_commit_unknown"] is True
+
+
+def test_unknown_git_commit_is_a_warning_in_notes_and_markdown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """item 7: an unresolved commit must show up as a WARNING in both the summary (notes) and the
+    markdown, not just silently as the string "unknown" buried in the provenance block."""
+    monkeypatch.delenv("TBOT_GIT_COMMIT", raising=False)
+
+    def boom(*_a: Any, **_k: Any) -> Any:
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    _, summary, paths, _ = run_fixture_sampling(tmp_path, samples=2)
+    assert any("WARNING" in n and "unknown" in n for n in summary["notes"])
+    md = paths.markdown.read_text(encoding="utf-8")
+    assert "WARNING" in md
+
+
+def test_host_label_overrides_the_kernel_hostname() -> None:
+    """item 7: --host-label lets the caller (e.g. a Docker entrypoint) report a human-meaningful
+    name instead of the container id that socket.gethostname() would otherwise return."""
+    env = lp.VirtualEnv()
+    prov = lp.collect_provenance(env, "sampling", [], host_label="turkey-vps-1")
+    assert prov["hostname"] == "turkey-vps-1"
+    assert prov["measured_from"].startswith("measured from turkey-vps-1 at ")
+
+
+def test_host_label_defaults_to_kernel_hostname_when_not_given() -> None:
+    env = lp.VirtualEnv()
+    prov = lp.collect_provenance(env, "sampling", [])
+    assert prov["hostname"]  # whatever socket.gethostname() returns -- just confirm it is used
+    assert prov["hostname"] != "turkey-vps-1"
 
 
 def test_every_sampling_output_embeds_provenance(tmp_path: Path) -> None:

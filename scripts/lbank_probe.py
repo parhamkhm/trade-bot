@@ -43,10 +43,36 @@ Honest limits of what this script can know:
 * "Largest fill" is computed from the visible levels only; where the visible book ends inside the
   band the figure is a lower bound and is flagged ``truncated``.
 
+Pre-registered G0 interpretation (fixed before any data is seen; see docs/SPEC.md section 7 / D-073):
+
+* Per-request timeout: 20 s for ``supplement/trades`` (LBank's own notes say it can be the slowest
+  public call), 10 s for every other endpoint. A timeout counts as a non-200 response.
+* "Every endpoint answers 200" passes when EVERY whitelisted endpoint individually sees HTTP 200 with
+  a valid payload on at least 95 % of its sampled requests, AND no ban-type response (429/403/418)
+  ever occurs at any point in the run. The per-endpoint rate alone is not enough -- a single ban-type
+  response fails this condition even if the overall rate would still clear 95 % -- because sampling
+  mode stops the entire run the instant one is seen (see below), so in practice this half of the
+  condition is really "did the run survive to the end without being banned".
+* The clock-offset condition passes when BOTH ``|delta_at_min_rtt_ms| < 1000`` AND
+  ``median |delta| < 1000``. When the RTT-uncertainty band (``median |delta| +/- median half-RTT``)
+  straddles the 1000 ms line, the result is reported as "inconclusive" (counted as not-passed, with
+  that reason) rather than guessed at either way.
+
+Sampling-mode ban handling: every response is routed through one shared :class:`StopTracker`
+(``ban_only=True``: it reacts only to 429/403/418, a burst of 3 consecutive 5xx, or a burst of 3
+consecutive transport errors -- an isolated 4xx or payload error is left to the 95 % per-endpoint
+tolerance above, since stopping the whole run on the very first one of those would make that
+tolerance meaningless). The instant it trips, the triggering response is recorded, NO further
+request of any kind is made (no more of the current sample, no depth-size/kline-history discovery,
+no further samples), and the run finishes with verdict FAIL and the reason.
+
 Exit codes: 0 = G0 PASS (or the rate-limit run completed without incident), 2 = G0 FAIL,
-3 = G0 INCOMPLETE (sampling plan not met, no failed check), 4 = rate-limit run stopped early on a
-throttling/ban-type response, 1 = exchange unreachable, 130 / 143 = interrupted by SIGINT / SIGTERM
-(partial outputs are still written).
+3 = G0 INCOMPLETE (sampling plan not met; this also covers zero samples -- an empty run is
+inconclusive, not a failure), 4 = rate-limit run stopped early on a throttling/ban-type response,
+5 = rate-limit run stopped early because a step's achieved rate fell short of 90 % of the requested
+rate (latency-limited -- the client is strictly serial and never adds concurrency to try to reach
+it), 1 = exchange unreachable, 130 / 143 = interrupted by SIGINT / SIGTERM (partial outputs are
+still written).
 """
 
 from __future__ import annotations
@@ -71,7 +97,7 @@ from decimal import Decimal, InvalidOperation
 from itertools import pairwise
 from pathlib import Path
 from types import FrameType
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 import httpx
 
@@ -87,10 +113,13 @@ from tbot.data.lbank_recorder import PERP_BASE_URL, SPOT_BASE_URL, parse_funding
 
 __all__ = [
     "ENDPOINTS",
+    "BanDetectedError",
+    "CheckedFetcher",
     "Env",
     "Fetcher",
     "FillResult",
     "HttpResult",
+    "KlineRowError",
     "StopTracker",
     "VirtualEnv",
     "analyze_book",
@@ -110,7 +139,8 @@ __all__ = [
 USER_AGENT = "tbot-lbank-g0-probe/1 (public read-only market-data probe; contact: project owner)"
 SYMBOL = "btc_usdt"
 PERP_SYMBOL = "BTCUSDT"
-REQUEST_TIMEOUT_S = 10.0
+REQUEST_TIMEOUT_S = 10.0  # default per-request timeout; supplement/trades overrides to TRADES_TIMEOUT_S
+TRADES_TIMEOUT_S = 20.0  # pre-registered (item 3): supplement/trades is the one endpoint given 20 s
 MAX_RATE_RPS = 5.0  # hard ceiling, never exceeded in any mode
 MIN_REQUEST_GAP_S = 1.0 / MAX_RATE_RPS
 DEFAULT_REQUEST_GAP_S = 0.6  # sampling: ~1.7 req/s at most inside one sample
@@ -120,6 +150,17 @@ KLINE_SAMPLE_BARS = 10
 EARLIEST_PROBE_TS_S = 1_483_228_800  # 2017-01-01 UTC, far before any LBank BTC/USDT history
 TRADES_SIZE = 600
 BODY_SNIPPET_CHARS = 2000
+
+# Pre-registered G0 thresholds (item 3): a per-endpoint success rate below this, or a rate-limit
+# step whose achieved rate falls short of this fraction of its target, changes the verdict.
+ENDPOINT_SUCCESS_MIN_RATE = 0.95
+RATE_ACHIEVED_MIN_FRACTION = 0.9
+
+# docs/SPEC.md D-068: the LBank recorder (src/tbot/data/lbank_recorder.py) runs continuously on the
+# same host/IP as this probe. Its own steady-state request rate, from its default polling schedule
+# (depth every 10 s, trades every 30 s, funding every 60 s, klines every 60/600/3600 s), sums to
+# approximately 0.15 req/s -- traffic this probe's rate-limit ceiling does not include or control.
+RECORDER_SHARED_IP_RPS = 0.15
 
 # timeframe label -> (LBank kline ``type``, bar seconds)
 KLINES: dict[str, tuple[str, int]] = {
@@ -138,10 +179,20 @@ G0_MIN_SPAN_S = 6 * 3600
 G0_MAX_MEDIAN_SKEW_MS = 1000.0
 G0_MAX_MEDIAN_SPREAD_PCT = 0.20
 
-# Throttling / ban-type reactions in rate-limit mode.
+# Throttling / ban-type reactions.
 BAN_STATUSES = (403, 418)
+BAN_LIKE_STATUSES = (429, *BAN_STATUSES)
 MAX_CONSECUTIVE_5XX = 3
 MAX_CONSECUTIVE_TRANSPORT_ERRORS = 3
+
+# item 7: files whose working-tree state marks the reported commit "-dirty". Anything these files
+# read or re-export (tbot.data.depth's Decimal maths, tbot.data.lbank_recorder's parsers/base URLs)
+# can change this script's measured output without scripts/lbank_probe.py itself changing.
+DIRTY_CHECK_PATHS: tuple[str, ...] = (
+    "scripts/lbank_probe.py",
+    "src/tbot/data/depth.py",
+    "src/tbot/data/lbank_recorder.py",
+)
 
 Side = Literal["buy", "sell"]
 
@@ -153,6 +204,7 @@ class EndpointSpec:
     name: str
     base: str
     path: str
+    timeout_s: float = REQUEST_TIMEOUT_S
 
 
 # The complete request whitelist. Nothing else is ever requested by this script.
@@ -160,7 +212,7 @@ ENDPOINTS: dict[str, EndpointSpec] = {
     "timestamp": EndpointSpec("timestamp", SPOT_BASE_URL, "/v2/timestamp.do"),
     "accuracy": EndpointSpec("accuracy", SPOT_BASE_URL, "/v2/accuracy.do"),
     "depth": EndpointSpec("depth", SPOT_BASE_URL, "/v2/depth.do"),
-    "trades": EndpointSpec("trades", SPOT_BASE_URL, "/v2/supplement/trades.do"),
+    "trades": EndpointSpec("trades", SPOT_BASE_URL, "/v2/supplement/trades.do", TRADES_TIMEOUT_S),
     "kline": EndpointSpec("kline", SPOT_BASE_URL, "/v2/kline.do"),
     "ticker24hr": EndpointSpec("ticker24hr", SPOT_BASE_URL, "/v2/ticker/24hr.do"),
     "perp_marketdata": EndpointSpec("perp_marketdata", PERP_BASE_URL, "/cfd/openApi/v1/pub/marketData"),
@@ -271,7 +323,12 @@ def _iso(ts_s: int | float | None) -> str | None:
 
 
 def resolve_git_commit() -> str:
-    """Script git commit: env ``TBOT_GIT_COMMIT``, else ``git rev-parse HEAD``; ``unknown`` if absent."""
+    """Script git commit: env ``TBOT_GIT_COMMIT``, else ``git rev-parse HEAD``; ``unknown`` if absent.
+
+    The dirty check covers :data:`DIRTY_CHECK_PATHS` -- not just this script -- since a change to
+    the parsing/maths helpers it imports from ``tbot.data.depth`` or ``tbot.data.lbank_recorder``
+    can change this probe's measured output just as much as editing the script itself would.
+    """
     from_env = os.environ.get("TBOT_GIT_COMMIT", "").strip()
     if from_env:
         return from_env
@@ -281,7 +338,7 @@ def resolve_git_commit() -> str:
             ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, timeout=5, check=True
         ).stdout.strip()
         dirty = subprocess.run(
-            ["git", "status", "--porcelain", "--", "scripts/lbank_probe.py"],
+            ["git", "status", "--porcelain", "--", *DIRTY_CHECK_PATHS],
             cwd=repo,
             capture_output=True,
             text=True,
@@ -296,10 +353,19 @@ def resolve_git_commit() -> str:
 
 
 def collect_provenance(
-    env: Env, mode: str, argv: Sequence[str], *, data_source: Literal["live", "offline_fixture"] = "live"
+    env: Env,
+    mode: str,
+    argv: Sequence[str],
+    *,
+    data_source: Literal["live", "offline_fixture"] = "live",
+    host_label: str | None = None,
 ) -> dict[str, Any]:
+    """``host_label`` overrides ``socket.gethostname()`` -- item 7: inside a Docker container the
+    kernel hostname is the container id, not anything a human running the probe would recognise;
+    the caller (e.g. the entrypoint script) can pass the real host name instead."""
     started = env.now()
-    host = socket.gethostname()
+    host = host_label if host_label else socket.gethostname()
+    git_commit = resolve_git_commit()
     return {
         "hostname": host,
         "utc_start": started.isoformat(),
@@ -307,7 +373,8 @@ def collect_provenance(
         "python": platform.python_version(),
         "platform": platform.platform(),
         "script": "scripts/lbank_probe.py",
-        "git_commit": resolve_git_commit(),
+        "git_commit": git_commit,
+        "git_commit_unknown": git_commit == "unknown",
         "mode": mode,
         "argv": list(argv),
         "user_agent": USER_AGENT,
@@ -358,6 +425,7 @@ class HttpResult:
     body: Any
     payload_ok: bool
     payload_error: str | None
+    timeout_s: float = REQUEST_TIMEOUT_S
     headers: dict[str, str] = field(default_factory=dict)
     body_snippet: str | None = None
 
@@ -369,11 +437,16 @@ class HttpResult:
     def ok(self) -> bool:
         return self.http_ok and self.payload_ok and self.error is None
 
+    @property
+    def is_timeout(self) -> bool:
+        return self.error == "timeout"
+
     def summary(self) -> dict[str, Any]:
         out: dict[str, Any] = {
             "endpoint": self.endpoint,
             "status": self.status,
             "latency_ms": round(self.latency_ms, 1),
+            "timeout_s": self.timeout_s,
             "nbytes": self.nbytes,
             "ok": self.ok,
             "error": self.error,
@@ -427,7 +500,7 @@ class Fetcher:
         content = b""
         headers: dict[str, str] = {}
         try:
-            response = self._client.get(url, params=dict(params or {}))
+            response = self._client.get(url, params=dict(params or {}), timeout=spec.timeout_s)
             status, content = response.status_code, response.content
             headers = {k: v for k, v in response.headers.items() if k.lower() not in _SENSITIVE_HEADERS}
         except httpx.TimeoutException:
@@ -460,9 +533,53 @@ class Fetcher:
             body=body,
             payload_ok=payload_ok,
             payload_error=payload_error,
+            timeout_s=spec.timeout_s,
             headers=headers,
             body_snippet=snippet,
         )
+
+
+class FetchLike(Protocol):
+    """What :class:`SampleRunner` and the discovery helpers need from a fetcher -- satisfied by
+    both :class:`Fetcher` itself and :class:`CheckedFetcher` (sampling mode's ban-aware wrapper)."""
+
+    def get(
+        self, endpoint: str, spec: EndpointSpec, params: Mapping[str, Any] | None = None
+    ) -> HttpResult: ...
+
+
+class BanDetectedError(Exception):
+    """Raised by :class:`CheckedFetcher`.get() the instant its :class:`StopTracker` trips.
+
+    Carries the triggering :class:`HttpResult` so the caller can record exactly what was seen.
+    """
+
+    def __init__(self, reason: str, result: HttpResult) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.result = result
+
+
+class CheckedFetcher:
+    """Wraps a :class:`Fetcher` so every response passes through one shared :class:`StopTracker`
+    before anything else sees it -- the single choke point item 1 requires. The instant the
+    tracker trips, ``get()`` raises :class:`BanDetectedError` instead of returning, so a caller that
+    does nothing special (``SampleRunner``, ``discover_depth_size``, ``probe_kline_history`` all
+    just call ``fetcher.get(...)`` exactly as they would on a plain :class:`Fetcher`) makes no
+    further request once tripped: the exception unwinds the call stack instead of a result
+    coming back to act on.
+    """
+
+    def __init__(self, fetcher: Fetcher, tracker: StopTracker) -> None:
+        self._fetcher = fetcher
+        self.tracker = tracker
+
+    def get(self, endpoint: str, spec: EndpointSpec, params: Mapping[str, Any] | None = None) -> HttpResult:
+        res = self._fetcher.get(endpoint, spec, params)
+        reason = self.tracker.observe(res)
+        if reason is not None:
+            raise BanDetectedError(reason, res)
+        return res
 
 
 # ---------------------------------------------------------------------------------
@@ -668,14 +785,54 @@ def evaluate_accuracy_row(row: Mapping[str, Any]) -> dict[str, Any]:
     return {"ok": all(f["ok"] for f in fields.values()), "fields": fields, "row_keys": sorted(row)}
 
 
+class KlineRowError(ValueError):
+    """Raised when a kline row's shape is not understood -- neither LBank's documented array
+    (``[open_ts, open, high, low, close, volume]``) nor a dict with a recognised timestamp field.
+
+    A :class:`ValueError` subclass so existing ``except ValueError`` handlers still catch it, but a
+    distinct type so ``_kline_probe`` (item 5) can catch it specifically rather than any stray
+    ``ValueError`` from unrelated code it might one day also call.
+    """
+
+
+# Dict-row timestamp field candidates, in priority order. LBank's documented kline response is
+# array-style; this exists for the (currently hypothetical) case of a dict-shaped row from some
+# mirror or future API version, so that case is handled rather than crashing the whole G0 run.
+_KLINE_TS_DICT_KEYS: tuple[str, ...] = ("openTime", "open_time", "t", "time", "startTime")
+
+
+def _row_open_ts(item: Any) -> int:
+    """Open-time (seconds or ms) from one kline row -- array-style (``item[0]``) or dict-style
+    (first matching key in :data:`_KLINE_TS_DICT_KEYS`). Raises :class:`KlineRowError` for
+    anything else, or if the extracted value is not an integer."""
+    if isinstance(item, Mapping):
+        key = next((k for k in _KLINE_TS_DICT_KEYS if k in item), None)
+        if key is None:
+            raise KlineRowError(f"dict kline row has none of {_KLINE_TS_DICT_KEYS}: keys={sorted(item)}")
+        raw = item[key]
+    elif isinstance(item, (list, tuple)) and item:
+        raw = item[0]
+    else:
+        raise KlineRowError(f"kline row is neither a dict nor a non-empty array: {type(item).__name__}")
+    try:
+        return int(raw)
+    except (TypeError, ValueError) as exc:
+        raise KlineRowError(f"kline row timestamp {raw!r} is not an integer: {exc}") from exc
+
+
 def parse_kline_rows(body: Any) -> list[tuple[int, ...]]:
-    """``(open_ts_s, ...)`` rows; millisecond timestamps are normalised to seconds."""
+    """``(open_ts_s, ...)`` rows; millisecond timestamps are normalised to seconds.
+
+    Raises :class:`KlineRowError` (never a bare ``KeyError``/``IndexError``) if the payload shape
+    or any row's shape is not understood; see ``_kline_probe``, which catches it per timeframe so
+    one odd row never aborts the whole G0 run.
+    """
     data = body.get("data") if isinstance(body, dict) else None
     if not isinstance(data, list):
-        raise ValueError("kline data is not a list")
+        raise KlineRowError("kline data is not a list")
     rows: list[tuple[int, ...]] = []
     for item in data:
-        ts = int(item[0])
+        ts = _row_open_ts(item)
         rows.append((ts // 1000 if ts >= 10**11 else ts,))
     return rows
 
@@ -767,7 +924,7 @@ def _failed(res: HttpResult) -> dict[str, Any]:
 class SampleRunner:
     """Runs one sample: every endpoint once, strictly sequentially."""
 
-    def __init__(self, fetcher: Fetcher, env: Env, *, depth_size: int = DEPTH_SIZE_CANDIDATES[-1]) -> None:
+    def __init__(self, fetcher: FetchLike, env: Env, *, depth_size: int = DEPTH_SIZE_CANDIDATES[-1]) -> None:
         self._fetcher = fetcher
         self._env = env
         self.depth_size = depth_size
@@ -920,7 +1077,7 @@ class SampleRunner:
 
 
 def discover_depth_size(
-    fetcher: Fetcher, candidates: Sequence[int] = DEPTH_SIZE_CANDIDATES
+    fetcher: FetchLike, candidates: Sequence[int] = DEPTH_SIZE_CANDIDATES
 ) -> dict[str, Any]:
     """Find the largest accepted ``size`` for ``depth`` by trying candidates from large to small."""
     attempts: list[dict[str, Any]] = []
@@ -945,7 +1102,7 @@ def discover_depth_size(
 
 
 def _kline_probe(
-    fetcher: Fetcher, tf: str, label: str, start_s: int
+    fetcher: FetchLike, tf: str, label: str, start_s: int
 ) -> tuple[dict[str, Any], list[tuple[int, ...]]]:
     ltype, secs = KLINES[tf]
     params = {"symbol": SYMBOL, "size": KLINE_HISTORY_SIZE, "type": ltype, "time": start_s}
@@ -961,12 +1118,17 @@ def _kline_probe(
         try:
             rows = parse_kline_rows(res.body)
             info.update(kline_extent(rows, secs))
-        except (ValueError, TypeError, IndexError) as exc:
+        except KlineRowError as exc:
+            # item 5: a malformed/unrecognised row shape is recorded and this timeframe's history
+            # probe stops here (whatever rows were parsed before the bad one are discarded, since
+            # kline_extent needs a trustworthy sequence) -- it never aborts the other timeframes or
+            # the surrounding sampling run.
             info["parse_error"] = f"{type(exc).__name__}: {exc}"[:200]
+            rows = []
     return info, rows
 
 
-def probe_kline_history(fetcher: Fetcher, env: Env) -> dict[str, Any]:
+def probe_kline_history(fetcher: FetchLike, env: Env) -> dict[str, Any]:
     """Per timeframe: a recent full-size page, the earliest page, and the page after it.
 
     Answers: how many bars does one request return, how far back does the history go, is the
@@ -1007,17 +1169,30 @@ def _valid(samples: Sequence[Mapping[str, Any]], key: str) -> list[Mapping[str, 
 
 
 def summarize_latency(samples: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Per-endpoint latency stats (item 4). A timeout is counted AT its configured timeout value
+    (not excluded, and not at whatever partial ``latency_ms`` happened to be measured) so p50/p95
+    reflect the true tail risk instead of looking artificially good by dropping the worst cases;
+    ``timeout_count`` reports how many of those there were, separately from other failures.
+    """
     by_ep: dict[str, list[Mapping[str, Any]]] = {}
     for sample in samples:
         for req in sample.get("requests", []):
             by_ep.setdefault(req["endpoint"], []).append(req)
     out: dict[str, Any] = {}
     for name, reqs in sorted(by_ep.items()):
-        lat = [float(r["latency_ms"]) for r in reqs if r.get("status") is not None]
+        lat: list[float] = []
+        timeout_count = 0
+        for r in reqs:
+            if r.get("error") == "timeout":
+                timeout_count += 1
+                lat.append(float(r.get("timeout_s", REQUEST_TIMEOUT_S)) * 1000.0)
+            elif r.get("status") is not None:
+                lat.append(float(r["latency_ms"]))
         out[name] = {
             "n": len(reqs),
             "ok": sum(1 for r in reqs if r.get("ok")),
             "http_not_200": sum(1 for r in reqs if r.get("status") != 200),
+            "timeout_count": timeout_count,
             "p50_ms": percentile(lat, 0.5),
             "p95_ms": percentile(lat, 0.95),
             "max_ms": max(lat) if lat else None,
@@ -1042,6 +1217,44 @@ def summarize_clock(samples: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "min_rtt_ms": float(best["rtt_ms"]),
         "note": "positive = LBank ahead of local; uncertainty about +/- half the round trip; "
         "local clock sync not checked by this script",
+    }
+
+
+def _clock_check(clock: Mapping[str, Any]) -> dict[str, Any]:
+    """Item 6's pre-registered clock-offset interpretation.
+
+    Pass requires BOTH ``|delta_at_min_rtt_ms| < 1000`` and ``median |delta| < 1000``: the first
+    is the single lowest-uncertainty sample (least RTT, so least +/- half-RTT ambiguity); the
+    second guards against that one sample being a fluke. When the RTT-uncertainty band around the
+    median (``median_abs_delta_ms +/- median_half_rtt_ms``) straddles the 1000 ms line, this script
+    cannot tell which side of the threshold the truth is on, so it reports "inconclusive" (counted
+    as not-passed, with that reason) instead of picking a side.
+    """
+    threshold = G0_MAX_MEDIAN_SKEW_MS
+    med_abs = clock.get("median_abs_delta_ms")
+    half_rtt = clock.get("median_half_rtt_ms")
+    delta_min_rtt = clock.get("delta_at_min_rtt_ms")
+    base: dict[str, Any] = {"threshold": f"both < {threshold:.0f} ms", "uncertainty_ms": half_rtt}
+    if med_abs is None or delta_min_rtt is None:
+        return {**base, "pass": False, "status": "no_data", "observed": "no data"}
+    abs_delta_min_rtt = abs(delta_min_rtt)
+    if half_rtt is not None and (med_abs - half_rtt) < threshold < (med_abs + half_rtt):
+        return {
+            **base,
+            "pass": False,
+            "status": "inconclusive",
+            "observed": (
+                f"median abs(delta) = {med_abs:.0f} ms +/- half-RTT {half_rtt:.0f} ms "
+                f"straddles the {threshold:.0f} ms threshold"
+            ),
+            "reason": "RTT-uncertainty band crosses the threshold; cannot confirm pass or fail",
+        }
+    ok = abs_delta_min_rtt < threshold and med_abs < threshold
+    return {
+        **base,
+        "pass": ok,
+        "status": "pass" if ok else "fail",
+        "observed": f"median abs(delta) = {med_abs:.0f} ms; |delta at min-RTT| = {abs_delta_min_rtt:.0f} ms",
     }
 
 
@@ -1105,8 +1318,27 @@ def _span_s(samples: Sequence[Mapping[str, Any]]) -> float:
     return (last - first).total_seconds()
 
 
-def evaluate_g0(samples: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    """Pass/fail of the four D-073 pass conditions plus the sampling-plan check."""
+def _per_endpoint_rates(reqs: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
+    by_ep: dict[str, list[Mapping[str, Any]]] = {}
+    for r in reqs:
+        by_ep.setdefault(r["endpoint"], []).append(r)
+    out: dict[str, dict[str, Any]] = {}
+    for name, rs in sorted(by_ep.items()):
+        ok = sum(1 for r in rs if r.get("ok"))
+        out[name] = {"n": len(rs), "ok": ok, "rate": ok / len(rs) if rs else None}
+    return out
+
+
+def evaluate_g0(
+    samples: Sequence[Mapping[str, Any]], *, stopped_on_ban: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    """Pass/fail of the four pre-registered D-073 conditions plus the sampling-plan check.
+
+    ``stopped_on_ban`` (item 1): when sampling mode's shared :class:`StopTracker` trips, the run
+    is stopped immediately and the verdict is forced to FAIL with that reason -- regardless of what
+    the (necessarily incomplete) checks below would otherwise say, since an aborted run proves
+    nothing about the conditions it never got to finish measuring.
+    """
     reqs = [(s["index"], r) for s in samples for r in s.get("requests", [])]
     failures = [
         {
@@ -1118,27 +1350,31 @@ def evaluate_g0(samples: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         for i, r in reqs
         if not r.get("ok")
     ]
+    rates = _per_endpoint_rates([r for _, r in reqs])
+    worst_rate = min((v["rate"] for v in rates.values() if v["rate"] is not None), default=None)
+    ban_seen = any(r.get("status") in BAN_LIKE_STATUSES for _, r in reqs)
     clock = summarize_clock(samples)
     book = summarize_book(samples)
     acc = [s["accuracy"] for s in samples if isinstance(s.get("accuracy"), dict)]
     acc_bad = [a for a in acc if not a.get("ok")]
-    med_skew = clock.get("median_abs_delta_ms")
     med_spread = book["spread_pct"]["median"]
-    checks = {
+    endpoints_ok = (
+        bool(reqs) and worst_rate is not None and worst_rate >= ENDPOINT_SUCCESS_MIN_RATE and not ban_seen
+    )
+    checks: dict[str, dict[str, Any]] = {
         "all_endpoints_200": {
-            "pass": bool(reqs) and not failures,
-            "observed": f"{len(reqs) - len(failures)}/{len(reqs)} requests were HTTP 200 + success payload",
-            "threshold": "all",
+            "pass": endpoints_ok,
+            "observed": (
+                f"worst per-endpoint success rate = {worst_rate:.1%}; ban-type response seen = {ban_seen}"
+                if worst_rate is not None
+                else "no data"
+            ),
+            "threshold": f">= {ENDPOINT_SUCCESS_MIN_RATE:.0%} success per endpoint, and no 429/403/418 ever",
+            "per_endpoint_rates": rates,
+            "ban_type_response_seen": ban_seen,
             "failures": failures[:50],
         },
-        "clock_offset": {
-            "pass": med_skew is not None and med_skew < G0_MAX_MEDIAN_SKEW_MS,
-            "observed": (
-                f"median abs(server - local) = {med_skew:.0f} ms" if med_skew is not None else "no data"
-            ),
-            "threshold": f"< {G0_MAX_MEDIAN_SKEW_MS:.0f} ms",
-            "uncertainty_ms": clock.get("median_half_rtt_ms"),
-        },
+        "clock_offset": _clock_check(clock),
         "accuracy_btc_usdt": {
             "pass": bool(acc) and not acc_bad,
             "observed": f"{len(acc) - len(acc_bad)}/{len(acc)} samples list {SYMBOL} with readable "
@@ -1153,14 +1389,32 @@ def evaluate_g0(samples: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             "threshold": f"< {G0_MAX_MEDIAN_SPREAD_PCT:.2f} %",
         },
     }
+    if stopped_on_ban is not None:
+        checks["no_ban_response"] = {
+            "pass": False,
+            "observed": f"sampling stopped: {stopped_on_ban.get('reason')}",
+            "threshold": "no 429/403/418, no 5xx burst, no transport-error burst, at any point",
+        }
     span = _span_s(samples)
     plan_ok = len(samples) >= G0_MIN_SAMPLES and span >= G0_MIN_SPAN_S
     failed = [name for name, c in checks.items() if not c["pass"]]
-    verdict = "FAIL" if failed else ("PASS" if plan_ok else "INCOMPLETE")
+    if stopped_on_ban is not None:
+        verdict = "FAIL"
+    elif not samples:
+        # item 8: zero samples means nothing has been measured yet, which is INCOMPLETE (the
+        # sampling plan was not met), never FAIL -- FAIL is reserved for a check that was actually
+        # evaluated and came back bad. Checked BEFORE `failed`, because every check above reports
+        # "not passed" on an empty sample set purely for lack of data, which must not read as FAIL.
+        verdict = "INCOMPLETE"
+    elif failed:
+        verdict = "FAIL"
+    else:
+        verdict = "PASS" if plan_ok else "INCOMPLETE"
     return {
         "verdict": verdict,
         "failed_checks": failed,
         "checks": checks,
+        "stopped_on_ban": dict(stopped_on_ban) if stopped_on_ban else None,
         "plan": {
             "samples": len(samples),
             "min_samples": G0_MIN_SAMPLES,
@@ -1208,17 +1462,19 @@ def build_summary(
     interval_s: float,
     interrupted: bool,
     finished: bool,
+    stopped_on_ban: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "provenance": dict(provenance),
         "mode": "sampling",
         "status": {"finished": finished, "interrupted": interrupted},
+        "stopped_on_ban": dict(stopped_on_ban) if stopped_on_ban else None,
         "plan": {
             "planned_samples": planned_samples,
             "interval_s": interval_s,
             "completed_samples": len(samples),
         },
-        "g0": evaluate_g0(samples),
+        "g0": evaluate_g0(samples, stopped_on_ban=stopped_on_ban),
         "latency": summarize_latency(samples),
         "clock": summarize_clock(samples),
         "book": summarize_book(samples),
@@ -1239,6 +1495,8 @@ def _notes(provenance: Mapping[str, Any]) -> list[str]:
         "Latencies and clock deltas are valid only for the host and time in the provenance block.",
         "The local clock's NTP sync is not checked by the script; the operator must record it separately.",
     ]
+    if provenance.get("git_commit") == "unknown" or provenance.get("git_commit_unknown"):
+        notes.insert(0, 'WARNING: git commit could not be resolved (provenance.git_commit = "unknown").')
     if provenance.get("data_source") == "offline_fixture":
         notes.insert(0, "OFFLINE FIXTURE DATA - these numbers are NOT measurements of LBank.")
     return notes
@@ -1276,6 +1534,8 @@ def _provenance_md(prov: Mapping[str, Any]) -> str:
         f"- argv: `{' '.join(prov['argv'])}`",
         f"- local clock sync: {prov['local_clock_sync']}",
     ]
+    if prov.get("git_commit") == "unknown":
+        lines.append('- **WARNING: git commit could not be resolved (reported as "unknown")**')
     if prov["data_source"] == "offline_fixture":
         lines.insert(1, "> **OFFLINE FIXTURE DATA - NOT A MEASUREMENT OF LBANK.**")
     return "\n".join(lines)
@@ -1290,18 +1550,28 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
         _table(
             ["Condition", "Observed", "Threshold", "Result"],
             [
-                [n, c["observed"], c["threshold"], "PASS" if c["pass"] else "FAIL"]
+                [n, c["observed"], c["threshold"], c.get("status", "pass" if c["pass"] else "fail").upper()]
                 for n, c in g0["checks"].items()
             ],
         ),
         f"\nSampling plan: {g0['plan']['samples']} samples over {g0['plan']['span_hours']} h "
         f"(required: >= {g0['plan']['min_samples']} samples, >= {g0['plan']['min_span_hours']:.0f} h) "
-        f"-> plan_ok = {g0['plan']['plan_ok']}. Interrupted: {summary['status']['interrupted']}.",
+        f"-> plan_ok = {g0['plan']['plan_ok']}. Interrupted: {summary['status']['interrupted']}."
+        + (f" STOPPED ON BAN: {g0['stopped_on_ban']['reason']}." if g0.get("stopped_on_ban") else ""),
         "## Latency per endpoint (ms)",
         _table(
-            ["endpoint", "n", "ok", "not-200", "p50", "p95", "max"],
+            ["endpoint", "n", "ok", "not-200", "timeouts", "p50", "p95", "max"],
             [
-                [k, v["n"], v["ok"], v["http_not_200"], v["p50_ms"], v["p95_ms"], v["max_ms"]]
+                [
+                    k,
+                    v["n"],
+                    v["ok"],
+                    v["http_not_200"],
+                    v["timeout_count"],
+                    v["p50_ms"],
+                    v["p95_ms"],
+                    v["max_ms"],
+                ]
                 for k, v in summary["latency"].items()
             ],
         ),
@@ -1487,14 +1757,26 @@ def run_sampling(
     kline_history: bool = True,
     log: Callable[[str], None] = lambda _m: None,
 ) -> tuple[int, dict[str, Any]]:
-    """Run the whole sampling plan; returns ``(exit_code, summary)``. Always writes all outputs."""
+    """Run the whole sampling plan; returns ``(exit_code, summary)``. Always writes all outputs.
+
+    Item 1: every request -- every ``SampleRunner`` call, ``discover_depth_size``, and
+    ``probe_kline_history`` alike -- goes through one shared, ``ban_only`` :class:`StopTracker` via
+    :class:`CheckedFetcher`, the single choke point. The instant it trips (429/403/418, or a burst
+    of 3 consecutive 5xx or transport errors), :class:`BanDetectedError` unwinds whatever was in
+    progress -- mid-sample, mid-discovery, or between samples -- and NO further request of any
+    kind is made: the triggering response is recorded, and the run finishes with verdict FAIL and
+    the reason.
+    """
     writer = JsonlWriter(paths.jsonl)
     writer.write({"kind": "provenance", **provenance})
-    runner = SampleRunner(fetcher, env)
+    tracker = StopTracker(ban_only=True)
+    checked = CheckedFetcher(fetcher, tracker)
+    runner = SampleRunner(checked, env)
     done: list[dict[str, Any]] = []
     discovery: dict[str, Any] | None = None
     history: dict[str, Any] | None = None
     interrupted = unreachable = False
+    stopped_on_ban: dict[str, Any] | None = None
     start = env.monotonic()
 
     def snapshot(finished: bool) -> dict[str, Any]:
@@ -1507,6 +1789,7 @@ def run_sampling(
             interval_s=interval_s,
             interrupted=interrupted,
             finished=finished,
+            stopped_on_ban=stopped_on_ban,
         )
         _publish(paths, summary, render_markdown(summary))
         return summary
@@ -1517,30 +1800,37 @@ def run_sampling(
             if wait > 0:
                 env.sleep(wait)
             if i == 0:
-                discovery = discover_depth_size(fetcher)
+                discovery = discover_depth_size(checked)
                 writer.write(discovery)
                 runner.depth_size = discovery["chosen_size"] or DEPTH_SIZE_CANDIDATES[-1]
             sample = runner.run(i)
             done.append(sample)
             writer.write(sample)
             log(f"sample {i + 1}/{samples} at {sample['utc_start']}: " + _one_line(sample))
-            if i == 0 and all(r["status"] is None for r in sample["requests"]):
-                unreachable = True
-                break
             if i == 0 and kline_history:
-                history = probe_kline_history(fetcher, env)
+                history = probe_kline_history(checked, env)
                 writer.write(history)
             snapshot(finished=False)
+    except BanDetectedError as ban:
+        stopped_on_ban = {"reason": ban.reason, "response": ban.result.summary()}
+        writer.write({"kind": "stopped_on_ban", **stopped_on_ban})
+        # "Unreachable" (exit 1) is reserved for the stricter case of a transport-level failure
+        # (no HTTP response at all) before even the first sample ever completed -- a real,
+        # bad-but-meaningful HTTP response (429/403/418/5xx) means the exchange IS reachable, so
+        # that stays a FAIL via stopped_on_ban, not "unreachable".
+        if not done and ban.result.status is None:
+            unreachable = True
     except KeyboardInterrupt:
         interrupted = True
     provenance["utc_end"] = env.now().isoformat()
-    summary = snapshot(finished=not interrupted and not unreachable)
+    summary = snapshot(finished=not interrupted and not unreachable and stopped_on_ban is None)
     writer.write(
         {
             "kind": "end",
             "utc_end": provenance["utc_end"],
             "interrupted": interrupted,
             "unreachable": unreachable,
+            "stopped_on_ban": stopped_on_ban is not None,
         }
     )
     writer.close()
@@ -1591,8 +1881,22 @@ def _install_sigterm_handler() -> Callable[[], None]:
 
 @dataclass
 class StopTracker:
-    """Decides, response by response, whether the rate-limit run must stop immediately."""
+    """Decides, response by response, whether a run must stop immediately.
 
+    ``ban_only=False`` (rate-limit mode, the original behaviour): stops on a ban-type status
+    (429/403/418), a burst of :data:`MAX_CONSECUTIVE_5XX` 5xx responses, a burst of
+    :data:`MAX_CONSECUTIVE_TRANSPORT_ERRORS` transport errors, ANY other non-200 status, or a
+    payload-level error on an HTTP 200 -- appropriate for a mode whose whole purpose is to probe
+    for the first sign of trouble at ever-increasing request rates.
+
+    ``ban_only=True`` (sampling mode, item 1): stops ONLY on a ban-type status or one of the two
+    bursts above. An isolated 4xx or a single payload-level error does NOT stop a 6-hour sampling
+    run on its own -- that is exactly what G0's per-endpoint 95 % success-rate tolerance (item 3)
+    is meant to absorb; stopping the whole run on the very first one of those would make that
+    tolerance meaningless.
+    """
+
+    ban_only: bool = False
     consecutive_5xx: int = 0
     consecutive_errors: int = 0
     reason: str | None = None
@@ -1617,7 +1921,9 @@ class StopTracker:
                 self.reason = f"{self.consecutive_5xx} consecutive HTTP 5xx (last {status})"
         else:
             self.consecutive_5xx = 0
-            if status != 200:
+            if self.ban_only:
+                pass  # an isolated 4xx or payload error is left to the 95% success-rate check
+            elif status != 200:
                 self.reason = f"unexpected HTTP {status}"
             elif not res.payload_ok:
                 self.reason = f"payload-level error on HTTP 200: {res.payload_error}"
@@ -1655,7 +1961,10 @@ def _run_rate_step(
     tracker: StopTracker,
     writer: JsonlWriter,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    """One fixed-rate step. Serial; a slow response delays the schedule, it never causes a burst."""
+    """One fixed-rate step. Strictly serial -- one request in flight, never concurrent, no matter
+    how far behind ``rate`` a slow response puts the schedule; a slow response delays the next
+    request, it never causes a burst or spins up a second one to catch up (item 2).
+    """
     period = 1.0 / rate
     t0 = env.monotonic()
     statuses: Counter[str] = Counter()
@@ -1689,11 +1998,17 @@ def _run_rate_step(
         if wait > 0:
             env.sleep(wait)
     elapsed = max(env.monotonic() - t0, 1e-9)
+    achieved_rps = sent / elapsed
     step = {
         "rate_rps": rate,
         "step_seconds": step_seconds,
         "requests_sent": sent,
-        "achieved_rps": sent / elapsed,
+        "achieved_rps": achieved_rps,
+        # item 2: a step only counts as having actually tested its target rate if the client could
+        # keep up with it; falling short here means the client itself (its own per-request
+        # latency, never concurrency -- this client never adds any) was the bottleneck, not
+        # anything the exchange said.
+        "reached": achieved_rps >= RATE_ACHIEVED_MIN_FRACTION * rate,
         "statuses": dict(statuses),
         "latency_p50_ms": percentile(latencies, 0.5),
         "latency_p95_ms": percentile(latencies, 0.95),
@@ -1715,13 +2030,23 @@ def run_ratelimit(
     provenance: dict[str, Any],
     log: Callable[[str], None] = lambda _m: None,
 ) -> tuple[int, dict[str, Any]]:
-    """Stepped, stop-at-first-throttle rate discovery. No retry is ever made after a stop."""
+    """Stepped, stop-at-first-throttle rate discovery. No retry is ever made after a stop.
+
+    Item 2: ``last_safe_rate_rps`` is always the MEASURED ``achieved_rps`` of the last clean step,
+    never the nominal target -- the two can differ once client-side latency, not the exchange,
+    becomes the limiting factor. When a step's achieved rate falls short of
+    :data:`RATE_ACHIEVED_MIN_FRACTION` of its target despite no bad response, that step's own
+    achieved rate still counts as safe (nothing complained), but stepping to a higher nominal rate
+    is pointless -- latency, not the exchange, is already the bottleneck -- so the run stops there
+    instead of continuing to escalate.
+    """
     spec_key, params = RATELIMIT_ENDPOINTS[endpoint]
     writer = JsonlWriter(paths.jsonl)
     writer.write({"kind": "provenance", **provenance})
     tracker = StopTracker()
     results: list[dict[str, Any]] = []
     failure: dict[str, Any] | None = None
+    rate_not_reached: dict[str, Any] | None = None
     last_safe: float | None = None
     interrupted = False
     try:
@@ -1732,10 +2057,28 @@ def run_ratelimit(
                 fetcher, env, spec_key, params, rate, step_seconds, tracker, writer
             )
             results.append(step)
-            log(f"step {rate} rps: {step['requests_sent']} requests, statuses {step['statuses']}")
+            log(
+                f"step {rate} rps: {step['requests_sent']} requests, achieved "
+                f"{step['achieved_rps']:.3f} rps, reached={step['reached']}, statuses {step['statuses']}"
+            )
             if failure is not None:
                 break
-            last_safe = rate
+            last_safe = step["achieved_rps"]
+            if not step["reached"]:
+                rate_not_reached = {
+                    "rate_rps": rate,
+                    "achieved_rps": step["achieved_rps"],
+                    "reason": (
+                        "latency-limited: achieved rate fell short of "
+                        f"{RATE_ACHIEVED_MIN_FRACTION:.0%} of the requested rate. The client is "
+                        "strictly serial by design and never adds concurrency to try to reach it, "
+                        "so this says nothing about what the exchange itself would tolerate -- "
+                        "only that THIS client, at THIS measured per-request latency, could not "
+                        "exercise that rate to test it."
+                    ),
+                }
+                log(f"step {rate} rps not reached ({rate_not_reached['reason']}); stopping")
+                break
     except KeyboardInterrupt:
         interrupted = True
     provenance["utc_end"] = env.now().isoformat()
@@ -1746,21 +2089,35 @@ def run_ratelimit(
         "request": {"url": ENDPOINTS[spec_key].base + ENDPOINTS[spec_key].path, "params": dict(params)},
         "plan": {"steps_rps": list(steps), "step_seconds": step_seconds, "pause_seconds": pause_seconds},
         "steps": results,
-        "stopped_early": failure is not None,
+        "stopped_early": failure is not None or rate_not_reached is not None,
+        "stopped_reason": "ban" if failure is not None else ("latency" if rate_not_reached else None),
         "interrupted": interrupted,
         "last_safe_rate_rps": last_safe,
         "max_rate_tested_rps": max((s["rate_rps"] for s in results), default=None),
         "failure": failure,
-        "caveat": "A run that completes proves only that these rates were tolerated for the step length; it "
-        "does not prove there is no limit. Limits may be per endpoint or per window.",
+        "rate_not_reached": rate_not_reached,
+        "caveat": (
+            "A run that completes proves only that these rates were tolerated for the step "
+            "length; it does not prove there is no limit. Limits may be per endpoint or per "
+            "window. This ceiling covers requests made by THIS PROBE PROCESS only: the LBank "
+            "recorder (src/tbot/data/lbank_recorder.py) runs continuously on the same host/IP and "
+            f"adds its own steady-state traffic (approximately {RECORDER_SHARED_IP_RPS:g} req/s "
+            "from its own polling schedule) on top of whatever this probe measures, which this "
+            "probe neither controls nor accounts for -- the exchange sees a higher combined rate "
+            "from this IP than the figures above show in isolation."
+        ),
     }
     _write_atomic(paths.summary, _dumps(summary, indent=2) + "\n")
     _write_atomic(paths.markdown, render_ratelimit_markdown(summary))
-    writer.write({"kind": "end", "utc_end": provenance["utc_end"], "stopped_early": failure is not None})
+    writer.write({"kind": "end", "utc_end": provenance["utc_end"], "stopped_early": summary["stopped_early"]})
     writer.close()
     if interrupted:
         return (143 if _SIGTERM_RECEIVED else 130), summary
-    return (4 if failure is not None else 0), summary
+    if failure is not None:
+        return 4, summary
+    if rate_not_reached is not None:
+        return 5, summary
+    return 0, summary
 
 
 def render_ratelimit_markdown(summary: Mapping[str, Any]) -> str:
@@ -1771,12 +2128,13 @@ def render_ratelimit_markdown(summary: Mapping[str, Any]) -> str:
         f"## Result: last safe rate = {summary['last_safe_rate_rps']} req/s; "
         f"stopped early = {summary['stopped_early']}; interrupted = {summary['interrupted']}",
         _table(
-            ["rate rps", "sent", "achieved rps", "statuses", "p50 ms", "p95 ms", "clean"],
+            ["rate rps", "sent", "achieved rps", "reached", "statuses", "p50 ms", "p95 ms", "clean"],
             [
                 [
                     s["rate_rps"],
                     s["requests_sent"],
                     s["achieved_rps"],
+                    s["reached"],
                     s["statuses"],
                     s["latency_p50_ms"],
                     s["latency_p95_ms"],
@@ -1795,6 +2153,13 @@ def render_ratelimit_markdown(summary: Mapping[str, Any]) -> str:
             f"- status: {fail['status']}, error: {fail['error']}, retry-after: {fail['retry_after']}",
             f"- headers: `{fail['headers']}`",
             f"- body: `{fail['body']}`",
+        ]
+    not_reached = summary.get("rate_not_reached")
+    if not_reached:
+        parts += [
+            "## Rate not reached (latency-limited, not a ban)",
+            f"- target {not_reached['rate_rps']} rps, achieved {not_reached['achieved_rps']:.3f} rps",
+            f"- {not_reached['reason']}",
         ]
     parts.append(f"## Caveat\n\n{summary['caveat']}")
     return "\n\n".join(parts) + "\n"
@@ -1975,6 +2340,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--step-seconds", type=float, default=30.0)
     p.add_argument("--pause-seconds", type=float, default=30.0)
+    p.add_argument(
+        "--host-label",
+        type=str,
+        default=None,
+        help=(
+            "override the reported hostname (item 7) -- e.g. inside Docker the kernel hostname "
+            "is the container id, not anything a human running the probe would recognise"
+        ),
+    )
     return p
 
 
@@ -2006,6 +2380,7 @@ def summarize_file(path: Path, out_dir: Path) -> int:
     prov = {k: v for k, v in prov.items() if k != "kind"}
     prov["utc_end"] = end.get("utc_end", prov.get("utc_end"))
     prov["summarized_from"] = str(path)
+    ban_record = next((r for r in records if r.get("kind") == "stopped_on_ban"), None)
     summary = build_summary(
         prov,
         samples,
@@ -2015,6 +2390,7 @@ def summarize_file(path: Path, out_dir: Path) -> int:
         interval_s=0.0,
         interrupted=bool(end.get("interrupted")),
         finished=bool(end),
+        stopped_on_ban={k: v for k, v in ban_record.items() if k != "kind"} if ban_record else None,
     )
     paths = OutputPaths.for_run(out_dir, "lbank_probe_resummary", _stamp(datetime.now(UTC)))
     _publish(paths, summary, render_markdown(summary))
@@ -2059,7 +2435,8 @@ def run_selftest(out_dir: Path | None) -> int:
                 provenance=prov2,
                 log=_stderr,
             )
-        ok = ok and code2 == 4 and summary2["last_safe_rate_rps"] == 2.0
+        last_safe2 = summary2["last_safe_rate_rps"]
+        ok = ok and code2 == 4 and last_safe2 is not None and abs(last_safe2 - 2.0) < 0.2
         print(f"selftest {'OK' if ok else 'FAILED'} (fixture data, not a measurement); outputs in {target}")
         return 0 if ok else 1
 
@@ -2077,7 +2454,9 @@ def main(
         return summarize_file(args.summarize, args.out_dir)
     env = env or Env()
     ratelimit = bool(args.ratelimit)
-    prov = collect_provenance(env, "ratelimit" if ratelimit else "sampling", raw_argv)
+    prov = collect_provenance(
+        env, "ratelimit" if ratelimit else "sampling", raw_argv, host_label=args.host_label
+    )
     prefix = "lbank_ratelimit" if ratelimit else "lbank_probe"
     paths = OutputPaths.for_run(
         args.out_dir, prefix, _stamp(env.now()), summary_suffix=".json" if ratelimit else ".summary.json"
