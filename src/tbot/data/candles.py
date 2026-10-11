@@ -36,6 +36,7 @@ import pyarrow.parquet as pq  # type: ignore[import-untyped]
 
 from tbot.core.types import Timeframe
 from tbot.data import store as store_mod
+from tbot.data.live_compare import refuse_live_compare_path
 
 __all__ = [
     "HOUR_MS",
@@ -292,6 +293,7 @@ def _read_candles(parquet_root: Path, symbol: str) -> pa.Table:
     tables: list[pa.Table] = []
     for year_dir in sorted(p for p in ds_dir.iterdir() if p.is_dir() and p.name.startswith("year=")):
         for part_file in sorted(year_dir.glob("part-*.parquet")):
+            refuse_live_compare_path(part_file, what="part file")  # D-039: a symlinked part file
             tables.append(pq.read_table(part_file, schema=TABDEAL_KLINE_SCHEMA))
     if not tables:
         return TABDEAL_KLINE_SCHEMA.empty_table()

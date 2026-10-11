@@ -34,6 +34,7 @@ import pyarrow.compute as pc  # type: ignore[import-untyped]
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
 
 from tbot.core.types import Timeframe, ensure_utc
+from tbot.data.live_compare import refuse_live_compare_path
 
 __all__ = [
     "KLINE_SCHEMA",
@@ -305,7 +306,7 @@ class DatasetSidecar:
 def partition_dir(
     parquet_root: Path, *, source: str, symbol: str, timeframe: Timeframe, year: int
 ) -> Path:
-    return (
+    path = (
         parquet_root
         / "klines"
         / f"source={source}"
@@ -313,10 +314,14 @@ def partition_dir(
         / f"timeframe={timeframe.value}"
         / f"year={year:04d}"
     )
+    refuse_live_compare_path(path, what="research store path")  # D-039
+    return path
 
 
 def dataset_dir(parquet_root: Path, *, source: str, symbol: str, timeframe: Timeframe) -> Path:
-    return parquet_root / "klines" / f"source={source}" / f"symbol={symbol}" / f"timeframe={timeframe.value}"
+    path = parquet_root / "klines" / f"source={source}" / f"symbol={symbol}" / f"timeframe={timeframe.value}"
+    refuse_live_compare_path(path, what="research store path")  # D-039
+    return path
 
 
 def month_part_path(
@@ -339,6 +344,7 @@ def sidecar_path(parquet_root: Path, *, source: str, symbol: str, timeframe: Tim
 def load_sidecar(
     path: Path, *, source: str, symbol: str, timeframe: Timeframe
 ) -> DatasetSidecar:
+    refuse_live_compare_path(path, what="sidecar path")  # D-039
     if not path.is_file():
         return DatasetSidecar(source=source, symbol=symbol, timeframe=timeframe)
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -346,6 +352,7 @@ def load_sidecar(
 
 
 def save_sidecar(path: Path, sidecar: DatasetSidecar) -> None:
+    refuse_live_compare_path(path, what="sidecar path")  # D-039
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(".json.tmp")
     tmp_path.write_text(json.dumps(sidecar.to_dict(), indent=2, sort_keys=False) + "\n", encoding="utf-8")
@@ -377,6 +384,7 @@ def write_month_part(path: Path, records: list[KlineRecord]) -> int:
 
     Returns the number of rows written.
     """
+    refuse_live_compare_path(path, what="part file path")  # D-039
     table = _records_to_table(records)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(".parquet.tmp")
@@ -416,6 +424,7 @@ def _read_symbol_timeframe(
         if end is not None and year > end.year:
             continue
         for part_file in sorted(year_dir.glob("part-*.parquet")):
+            refuse_live_compare_path(part_file, what="part file")  # D-039: a symlinked part file
             tables.append(pq.read_table(part_file, schema=KLINE_SCHEMA))
 
     if not tables:
