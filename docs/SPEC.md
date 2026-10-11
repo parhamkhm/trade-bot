@@ -549,6 +549,125 @@ that opened it (under S1 the netted position is treated as one position opened b
 takes over. The new choice is kept at least 3 months, and every switch needs Parham's written approval in
 `docs/reports/`.
 
+### 7.2 Phase 3 pre-registration — DRAFT (not final; no Phase 3 run before Parham approves this section)
+
+Status: **DRAFT, 2026-10-11.** Text marked **[RECORDED]** is copied from decisions already in this document.
+Text marked **[PROPOSAL — needs Parham]** fills a gap that no recorded decision covers; it is not in force
+until Parham approves it. Items marked **[OPEN QUESTION]** conflict with or depend on something unresolved.
+Nothing below may change after any Phase 3 result is seen. Engine commits must be at or after `8d99335`; the
+sealed holdout (from `holdout_start` = 2025-10-01) stays sealed.
+
+**A. Data availability (per strategy)** — research data on hand (laptop store, checked 2026-10-11): Binance
+BTCUSDT and ETHUSDT klines at 1h, 4h and 1d from the bar opening 2018-01-01 to the bar closing 2025-10-01 00:00
+UTC (all before the holdout). Not on hand: Binance funding history, Binance aggTrades, Stooq indices.
+
+| # | Strategy | Inputs | History before 2025-10-01 | Testable for G3 now? |
+|---|---|---|---|---|
+| S0 | `sma100_1d` [RECORDED §7.1] | BTCUSDT 1d OHLC (+ 1h for the 6 h delay fills and stops) | 2018-01-01 → 2025-09-30 (first tradable close 2018-06-01) | **Yes** |
+| C1 | Donchian ensemble | 1d OHLC (+1h for fills) | same | **Yes** |
+| C2 | Time-series momentum | 1d close (+1h) | same | **Yes** |
+| C3 | EWMAC (1d and 4h) | 1d / 4h close (+1h) | same | **Yes** |
+| C4 | Volatility-compression breakout | 1d OHLC (+1h) | same | **Yes** |
+| C5 | Pullback mean-reversion (weak evidence) | 1d close (+1h) | same | **Yes** |
+| C6 | Order-book imbalance (hourly) | LBank order-book snapshots | **none before the holdout** — LBank book history starts 2026-10-10 13:40 UTC | **No.** D-069 already makes it paper/shadow only, evaluated first as an execution filter |
+| — | Funding risk-off overlay (phase 4, G4) | Binance BTCUSDT perpetual funding | from the perpetual's launch (≈ 2019-09; *to verify on download*) | Not a G3 item (G4) |
+| ETH | Robustness [RECORDED G3] | ETHUSDT 1d/4h/1h | 2018-01-01 → 2025-09-30 | **Yes** (Sharpe > 0, same rules) |
+| Idx | S&P 500 / Nasdaq-100 [RECORDED D-071] | Stooq daily price index | *to verify on download* | Informational only, never a gate; 252-day annualisation, price index |
+
+*MinTRL* [RECORDED G3]: reported for every candidate on its pooled OOS manual-delay series (95 %, vs Sharpe 0
+and vs buy-and-hold); it is a reported number, not a pass/fail criterion of G3. The 365-day minimum belongs to S2
+(post-lock paper/live days, phase 7b), not to G3. Under the walk-forward below, the pooled OOS series covers
+2020-01-01 → 2025-09-30 (≈ 2,100 days).
+
+*C6 options (decide nothing now):*
+- (i) **PROXY variant** — an order-flow signal from Binance spot aggTrades (signed taker volume imbalance per
+  hour), pre-registered as a separate, clearly labelled *PROXY* strategy. It measures trade flow, not resting-book
+  imbalance, so it is a different signal; its grid would be fixed before download, and every point is a trial.
+  Data availability on data.binance.vision is *to verify*.
+- (ii) **Forward collection** — keep recording LBank books (already running). Earliest evaluation: the S2
+  minimum of 365 days after its lock, i.e. **no earlier than 2027-10-10** for a paper-only result, and only as an
+  execution filter or shadow strategy per D-069.
+
+**B. Walk-forward scheme** — [PROPOSAL — needs Parham] (CLAUDE.md §8 says "anchored/expanding train windows,
+out-of-sample test windows"; no window lengths are recorded anywhere).
+- Anchored, expanding training window starting at the first tradable close **2018-06-01**.
+- Out-of-sample test windows of **6 calendar months**, stepping 6 months: 2020-01-01–2020-06-30, …,
+  2025-01-01–2025-06-30 (11 folds), plus a final **short fold 2025-07-01–2025-09-30** (12 folds in total).
+- Every fold replays each strategy from the anchor 2018-01-01 [RECORDED §7.1]; a fold-boundary parameter change
+  is charged as a trade [RECORDED §7.1].
+- Per-fold parameter choice [PROPOSAL]: the grid point with the highest annualised Sharpe (365, after all costs,
+  **manual-delay fills**) on that fold's training window; ties go to the grid's base point.
+- Pooled OOS series = all test windows concatenated [RECORDED §7.1 go-live rule].
+
+**C. Parameter grids** — [PROPOSAL — needs Parham] (D-069 says "small pre-fixed parameter grids" but none is
+recorded; the pivot plan names one configuration each, used here as the base point). Common to C1–C5
+[PROPOSAL]: long-only; sizing `w = min(1, 0.30/σ̂)` with S0's σ̂ (D-056); S0's rebalance band; protective stop
+`P_ref − 3 × ATR20` fixed for the position (as S0, D-050); after a stop-out, re-entry only on the strategy's own
+next fresh entry signal. Each grid has a base point and its ±1-step neighbours, so the G3 neighbour test exists.
+
+| # | Base configuration (pivot plan) | Grid (each point = one trial) | Trials |
+|---|---|---|---|
+| C1 | Donchian ensemble 20/55/100: long while the majority of the three channels' breakouts are long; exit at the channel midpoint | lookback scale {0.5, **1**, 2} × (20, 55, 100) | 3 |
+| C2 | TSMOM: mean of sign(30-, 90-, 180-day returns) > 0 ⇒ long | horizon scale {0.5, **1**, 2} × (30, 90, 180) | 3 |
+| C3 | EWMAC (Carver): forecasts (16,64), (32,128), (64,256), vol-normalised, capped ±20, averaged; long when > 0 | timeframe {**1d**, 4h} × speed scale {0.5, **1**, 2} (spans in bars) | 6 |
+| C4 | Vol-compression breakout: 20-day realised vol in the bottom p-th percentile of its trailing 365 days **and** close > 20-day high ⇒ long; exit close < 20-day midpoint | p ∈ {10, **20**, 30} | 3 |
+| C5 | Pullback MR: close > SMA200 and RSI(2) < x ⇒ long; exit RSI(2) > 70 | x ∈ {5, **10**, 15} | 3 |
+
+Total non-S0 trials if every point is run: **18**. S0 = 1 trial (N = 1) [RECORDED §7.1]; S1 has no parameters.
+
+**D. Trial count** — [RECORDED D-059, Parham's wording]: every configuration ever run counts toward the DSR trial
+count, **including failed and abandoned ones**; for every non-S0 contender (each candidate and S1) N = all non-S0
+trials logged in `research/EXPERIMENTS.md` up to the date X is chosen, across all strategy types; S0 uses N = 1.
+A configuration counts once it has produced any backtest number, even if the run is later discarded.
+
+**E. Thresholds** — [RECORDED G3 / §7.1, unchanged]: maxDD ≤ 0.60 × maxDD(B&H); Sharpe ≥ 0.80 × Sharpe(B&H);
+PBO < 0.30; DSR ≥ 0.95 (§7.1 definition); neighbours (±1 grid step) keep ≥ 70 % of the Sharpe; ETH/USDT Sharpe > 0
+with the same rules; for S0 the six §7.1 robustness variants each keep ≥ 70 %. Operational details [PROPOSAL]:
+- PBO by CSCV (Bailey et al.) per candidate family over its grid, on the daily manual-delay return matrix of the
+  grid points over 2018-06-01 → 2025-09-30, with **S = 16** equal blocks and Sharpe as the performance measure.
+- All gating numbers use the pooled OOS manual-delay series; next-open numbers are reported alongside.
+
+**F. Costs** — [RECORDED D-060 / G3]: LBank spot VIP 0 taker 10 bps per side (maker 10 bps; taker assumed);
+slippage = the G3 depth-at-size model; ×2 stress (20 bps fee per side plus twice the slippage model) for S0 and S1,
+and reported for every candidate. **[OPEN QUESTION]** G3 says the slippage curve is frozen from recorder snapshots
+"from the G1b start to the day phase 3 starts"; G1b can start no earlier than 2026-10-17, and D-067 allows only a
+*temporary* G0-based curve until then. Either Phase 3 waits for a frozen recorder window, or it runs with the
+temporary curve labelled *temporary* and all gating numbers are recomputed once the frozen curve exists. Parham
+decides; nothing is assumed here.
+
+**G. Fill modes** — [RECORDED D-051, D-081]: every number twice — next open, and the 6 h manual delay on Binance
+1h execution bars (first 1h bar opening at or after signal close + 6 h); **the gate must pass on the manual-delay
+version**.
+
+**H. T6 selection procedure** — [RECORDED §7.1], step by step:
+1. Run S0 (no search) and every grid point of C1–C5 through the walk-forward (B), both fill modes; log every run.
+2. For each candidate, apply the walk-forward gates: G3 (E) plus the non-holdout part of G4 (regime-overlay
+   keep/drop, phase 4).
+3. Build S1 = equal-weight blend of every strategy that passed G3 (S0 included if it passed), with S0's band;
+   leave-one-out when compared with a candidate C.
+4. C qualifies only if: C passes the walk-forward gates; C's pooled OOS manual-delay Sharpe > S0's and > S1's
+   (S1 without C); C beats S0 in at least half of the folds; DSR(C) ≥ 0.95 with every variant counted.
+5. X = the qualifying C with the highest pooled OOS Sharpe; if none, the better of S0/S1 among those passing the
+   walk-forward gates; if neither passes, X = none and nothing goes live.
+6. Fix X's parameters on the final training window ending at `holdout_start`; compute and log the holdout band
+   (stationary bootstrap, block 20 days, 10,000 resamples, seed 20261008) **before** unsealing.
+7. Unseal the holdout once, for X only (G4). Pass ⇒ X runs; fail ⇒ nothing goes live, no fallback.
+- S2 applies only from phase 7b on paper/live days after lock (z-test, D-064); S3 is ablation only, never deployed.
+
+**I. Robustness** — [RECORDED G3, D-071]: ETH/USDT with the same rules and parameters (gating: Sharpe > 0);
+S&P 500 and Nasdaq-100 (Stooq, daily, 252-day annualisation, price index) with the same daily rules, reported
+for context only, never a gate.
+
+**J. Open questions for Parham before this becomes final**
+1. G1a is still open (D-040: volume-only reconciliation mismatch on three dates in Binance's own files). May
+   Phase 3 run while D-040 is open? No proposed strategy uses volume.
+2. Slippage model window (F).
+3. Approve or change the walk-forward scheme (B), the per-fold selection rule (B) and the PBO block count (E).
+4. Approve or change the grids and the common sizing/stop/re-entry rules (C).
+5. C6: option (i), (ii), or neither (A).
+6. `docs/reports/pivot-lbank-plan.md` exists only on the local branch `plan/lbank-pivot` (never merged). Should it
+   be merged so the references resolve?
+
 ---
 
 ## 8. Decisions log
