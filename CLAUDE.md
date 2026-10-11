@@ -293,6 +293,9 @@ green** — every step (secrets check, ruff, mypy, order-code audit, pytest) ran
 Local checks on the Windows laptop do not count. Every "ready to merge" message to Parham states the CI status
 and run link per PR. Platform-specific code or tests are guarded with `sys.platform` (which mypy narrows) plus
 `pytest.mark.skipif`, and the protection they test must also be exercised on Linux (Parham, 2026-10-11).
+**A PR that changes SPEC pre-registration, gate criteria or any money path is merged only after Parham's explicit
+written approval of that exact head commit** (Parham, 2026-10-12; PR #18 was merged without it — no harm, because
+its text was marked as not in force).
 
 **Rules**
 1. One task → one agent. Independent tasks run in parallel; dependent tasks run in sequence.

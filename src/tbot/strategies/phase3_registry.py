@@ -1,4 +1,4 @@
-"""Registry of the Phase 3 strategies pre-registered in docs/SPEC.md §7.2 C (S0 + the 18 grid points).
+"""Registry of the Phase 3 strategies pre-registered in docs/SPEC.md §7.2 C (S0 + the 17 grid points).
 
 The single source the Phase 3 tests and the walk-forward harness iterate over. Each entry names the module
 and factory the strategy-researcher implements; until a module exists, ``load`` raises
@@ -43,7 +43,6 @@ PHASE3_ENTRIES: tuple[Phase3Entry, ...] = (
     _entry("C2-(60,180,360)", "tbot.strategies.tsmom", _D1, horizons=(60, 180, 360)),
     _entry("C3-1d-(8,16,32)", "tbot.strategies.ewmac", _D1, fast_spans=(8, 16, 32)),
     _entry("C3-1d-(16,32,64)", "tbot.strategies.ewmac", _D1, fast_spans=(16, 32, 64)),
-    _entry("C3-1d-(32,64,128)", "tbot.strategies.ewmac", _D1, fast_spans=(32, 64, 128)),
     _entry("C3-4h-(8,16,32)", "tbot.strategies.ewmac", _H4, fast_spans=(8, 16, 32)),
     _entry("C3-4h-(16,32,64)", "tbot.strategies.ewmac", _H4, fast_spans=(16, 32, 64)),
     _entry("C3-4h-(32,64,128)", "tbot.strategies.ewmac", _H4, fast_spans=(32, 64, 128)),

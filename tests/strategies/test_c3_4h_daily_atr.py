@@ -1,49 +1,105 @@
-"""SPEC §7.2 C: the 4h C3 points use S0's daily ATR20 of the last COMPLETED daily bar for their stop.
+"""SPEC §7.2 C: the 4h C3 points use S0's daily ATR20 and sigma-hat of the last COMPLETED daily close only.
 
-At a 4h decision inside a UTC day, the current day is not complete. Changing the 4h bars of that incomplete
-day must not change the stop level; changing a bar of the last completed day (its high/low, hence its true
-range) must change it. Skips while the C3 module is not implemented; no strategy PR may merge while it skips.
+At a 4h decision inside a UTC day, the current day is not complete. For both the stop level (ATR20) and the
+target weight (sigma-hat sizing), changing the 4h bars of that incomplete day must leave the value
+unchanged, and changing the last completed day must change it. Skips only while the C3 module does not
+exist; no strategy PR may merge while it skips.
 """
 
 from __future__ import annotations
 
+import random
 from dataclasses import replace
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
 
 from tbot.core.types import Bar, BarWindow, Timeframe
 from tbot.strategies.phase3_registry import PHASE3_ENTRIES, Phase3Entry, load
-from tests.strategies.test_volume_invariance import _ohlc
+from tests.strategies.test_volume_invariance import _ohlc, skip_if_not_implemented
 
 C3_4H = [e for e in PHASE3_ENTRIES if e.key.startswith("C3-4h")]
 BARS_PER_DAY = 6
+INCOMPLETE = 3  # the window ends 3 bars (12 h) into an incomplete UTC day
+START = datetime(2018, 1, 1, tzinfo=UTC)
 
 
 def _window_mid_day(n_days: int) -> list[Bar]:
-    bars = _ohlc(Timeframe.H4, n_days * BARS_PER_DAY + 3)  # ends 3 bars (12 h) into an incomplete day
-    return bars
+    return _ohlc(Timeframe.H4, n_days * BARS_PER_DAY + INCOMPLETE)
+
+
+def _uptrend_mid_day(n_days: int, seed: int = 7) -> list[Bar]:
+    """A steady uptrend (every EWMAC speed long at the end) with moderate vol: vol-target weight < 1."""
+    rng = random.Random(seed)
+    out: list[Bar] = []
+    price = 10_000.0
+    for i in range(n_days * BARS_PER_DAY + INCOMPLETE):
+        o = price
+        c = o * (1 + rng.gauss(0.0015, 0.01))
+        out.append(
+            Bar(
+                symbol="BTCUSDT",
+                timeframe=Timeframe.H4,
+                ts=START + (i + 1) * Timeframe.H4.delta,
+                open=Decimal(f"{o:.2f}"),
+                high=Decimal(f"{max(o, c) * 1.002:.2f}"),
+                low=Decimal(f"{min(o, c) * 0.998:.2f}"),
+                close=Decimal(f"{c:.2f}"),
+                volume=Decimal(10),
+            )
+        )
+        price = c
+    return out
+
+
+def _scaled(
+    bar: Bar, *, close: Decimal | None = None, hi: Decimal = Decimal(1), lo: Decimal = Decimal(1)
+) -> Bar:
+    new_close = bar.close if close is None else close
+    return replace(
+        bar,
+        close=new_close,
+        high=max(bar.high * hi, new_close, bar.open),
+        low=min(bar.low * lo, new_close, bar.open),
+    )
 
 
 @pytest.mark.parametrize("entry", C3_4H, ids=lambda e: e.key)
 def test_4h_stop_uses_only_the_last_completed_daily_atr(entry: Phase3Entry) -> None:
-    try:
-        strategy = load(entry)
-    except ModuleNotFoundError:
-        pytest.skip(f"{entry.key}: not implemented yet ({entry.module}); blocks any strategy PR")
+    skip_if_not_implemented(entry)
+    strategy = load(entry)
     bars = _window_mid_day(400)
     entry_price = bars[-1].close
     base = strategy.stop_price(BarWindow.of(bars), entry_price)
 
-    # 1) the incomplete day's 4h bars (last 3) change -> the stop level must not change
-    incomplete = [replace(b, high=b.high * Decimal("1.2"), low=b.low * Decimal("0.8")) for b in bars[-3:]]
-    assert strategy.stop_price(BarWindow.of(bars[:-3] + incomplete), entry_price) == base
+    # 1) the incomplete day's 4h bars change -> the stop level must not change
+    incomplete = [_scaled(b, hi=Decimal("1.2"), lo=Decimal("0.8")) for b in bars[-INCOMPLETE:]]
+    assert strategy.stop_price(BarWindow.of(bars[:-INCOMPLETE] + incomplete), entry_price) == base
 
     # 2) a 4h bar of the last COMPLETED day widens that day's range -> the stop level must change
-    i = len(bars) - 3 - 1  # last 4h bar of the last completed day
-    widened = replace(bars[i], high=bars[i].high * Decimal("1.5"))
-    changed = [*bars[:i], widened, *bars[i + 1 :]]
+    i = len(bars) - INCOMPLETE - 1  # last 4h bar of the last completed day
+    changed = [*bars[:i], _scaled(bars[i], hi=Decimal("1.5")), *bars[i + 1 :]]
     assert strategy.stop_price(BarWindow.of(changed), entry_price) != base
+
+
+@pytest.mark.parametrize("entry", C3_4H, ids=lambda e: e.key)
+def test_4h_target_weight_uses_only_the_last_completed_daily_sigma(entry: Phase3Entry) -> None:
+    skip_if_not_implemented(entry)
+    strategy = load(entry)
+    bars = _uptrend_mid_day(400)
+    base = strategy.on_bar(BarWindow.of(bars)).target_weight
+    assert 0.0 < base < 1.0, f"precondition: long with a vol-targeted weight below 1, got {base}"
+
+    # 1) the incomplete day's closes move by 1 % (the trend stays up) -> the target weight must not change
+    incomplete = [_scaled(b, close=b.close * Decimal("1.01")) for b in bars[-INCOMPLETE:]]
+    assert strategy.on_bar(BarWindow.of(bars[:-INCOMPLETE] + incomplete)).target_weight == base
+
+    # 2) the last COMPLETED daily close moves by 3 % -> sigma-hat, and so the target weight, must change
+    i = len(bars) - INCOMPLETE - 1  # last 4h bar of the last completed day = that day's close
+    changed = [*bars[:i], _scaled(bars[i], close=bars[i].close * Decimal("1.03")), *bars[i + 1 :]]
+    after = strategy.on_bar(BarWindow.of(changed)).target_weight
+    assert after > 0.0 and after != base
 
 
 def test_c3_4h_entries_are_registered() -> None:
