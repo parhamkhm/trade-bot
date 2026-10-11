@@ -824,6 +824,7 @@ only, never a gate.
 | D-083 | **G0 clock item: scope — post-hoc scoping clarification, written after the 2026-10-11 clock verdict (Parham, 2026-10-11).** G0 stays recorded as FAIL on the clock item (rule of commit 6dd5b07) and PASS on every other item; the criterion itself is unchanged. The clock item gates **signed (private) requests only**: it is a blocker for the first phase that sends any signed request (the postponed private G0 read, before phase 7a, and phase 5b), and it does **not** gate phases 1–4, which send no signed request. Before the first signed request the functional signed-request test (§10.3, once approved) must also pass | the clock item exists because LBank validates the timestamp of signed requests; phases 1–4 only read public endpoints and Binance files, so a clock offset cannot affect them; written after the verdict and labelled as such so it is not mistaken for a pre-registered rule |
 | D-084 | **Design constraint: network round trip Turkey server ↔ LBank public API ≈ 1.1–1.3 s** (min 1090 ms, median ≈ 1300 ms, p95 ≈ 2.8 s, max 6.8 s; 120 `timestamp.do` calls, 2026-10-11 16:17–17:17 UTC, `research/reports/g0_lbank_clock_20261011/`). **No strategy may depend on execution or reaction faster than a few seconds**; every latency assumption in a backtest or live component must be at least this slow | measured from the only server we have; a strategy that needs sub-second reaction would be untestable and unexecutable from here |
 | D-085 | **Slippage calibration window — amendment, decided 2026-10-11 before any Phase 3 result (Parham).** The G3 depth-at-size curve is the median over recorder snapshots from the **G1b start to the day G1b passes** (then frozen and logged), replacing "to the day phase 3 starts". §7 G3 and §7.2 F state the same single rule. Phase 3 runs first with the D-067 provisional curve, labelled PROVISIONAL; the G3 verdict comes only from one complete rerun with the frozen curve (§7.2 F) | phase 3 starts before the LBank book history is long enough: G1b can start no earlier than 2026-10-17, so a window ending when phase 3 starts would be empty or too short |
+| D-086 | **Venue decision by the owner (Parham, 2026-10-11): the venue remains LBank spot.** LBank's User Service Agreement (§10.2 item 4, quoted verbatim, page date 2026-07-22) restricts residents of listed countries; eligibility under these terms is the owner's responsibility, and the owner accepts the risk of account restriction or frozen funds. Phase 7a risk controls (risk-engineer scope): a hard capital cap set by Parham before 7a, the exchange balance kept to what the strategy needs with the excess withdrawn on a fixed schedule, and a Telegram alert on any account-restriction or KYC-related API error. No workaround of any exchange restriction is designed or documented | the owner's decision; the controls limit the loss if the account is restricted, consistent with D-065 (only capital Parham can afford to lose) |
 
 ---
 
@@ -864,8 +865,8 @@ key exists), with the evidence recorded in `docs/vendor/` and the date here. Pha
 
 ### 10.2 Phase 7a blockers (planning only, no code)
 
-4. **Exchange account eligibility — clause verified 2026-10-11; the account holder's country of residence is to
-   be confirmed by Parham. Until then: UNVERIFIED, and live trading on LBank is BLOCKED.** LBank's own *LBank User
+4. **Exchange account eligibility — clause verified 2026-10-11; owner decision recorded below (D-086).** LBank's
+   own *LBank User
    Service Agreement* (https://www.lbank.com/support/articles/21436496711705, page date **2026-07-22**, read
    2026-10-11) says in its Important Notice: "This Platform does not accept registration or investment from
    individuals in the following countries or regions: Afghanistan, Antigua and Barbuda, Azerbaijan, Bangladesh,
@@ -874,10 +875,16 @@ key exists), with the evidence recorded in `docs/vendor/` and the date here. Pha
    Mainland China, Mali, Mauritania, North Korea, Somalia, South Sudan, Sudan and Darfur, Syria, United States,
    Uruguay, Yemen, and Canada." Its Special Disclaimer repeats it: "LBank has determined not to provide
    services to clients from the following countries or regions: [...] Iran [...]". A secondary source
-   (cryptowinrate, updated 2026-09-30) also lists Iran. **If the account holder's country of residence is on
-   this list, live trading on LBank is blocked and the exchange choice returns to Parham for a decision before
-   phase 7a.** D-065 (venue risks accepted) does not override the exchange's own eligibility terms. This project
-   neither proposes nor supports any way of circumventing exchange restrictions.
+   (cryptowinrate, updated 2026-09-30) also lists Iran.
+   - **Owner decision 2026-10-11: venue remains LBank. LBank's User Service Agreement (quoted above) restricts
+     residents of listed countries. Eligibility under these terms is the owner's responsibility, and the owner
+     accepts the risk of account restriction or frozen funds.** This replaces the earlier "exchange choice
+     returns to Parham" outcome; the quoted clause stays unchanged.
+   - *Risk controls, enforced in phase 7a (risk-engineer scope; no code now):* (a) a **hard capital cap** on the
+     exchange, set by Parham before 7a; (b) the exchange balance is kept to what the strategy needs, and the
+     excess is withdrawn on a fixed schedule; (c) a **Telegram alert** if the API returns any account-restriction
+     or KYC-related error.
+   - No workaround of any exchange restriction is designed or documented by this project.
 5. **Server location rule — UNVERIFIED for each location against the exchange's terms.** Every exchange-facing
    service (recorder, signal/paper service, any signed client) runs from a location permitted by the exchange's
    terms. Any server move requires re-running the G0 network checks (latency and the clock measurement) from the
