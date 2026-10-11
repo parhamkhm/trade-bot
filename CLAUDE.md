@@ -283,6 +283,11 @@ REPORT BACK: files changed, test results, open questions, risks found
 
 **Definition of Done:** `uv run pytest` green · `uv run ruff check .` clean · `uv run mypy` clean on strict
 packages · new code has tests · no secrets · `docs/SPEC.md` decision log updated if behaviour changed.
+**A PR is "ready to merge" only when its GitHub Actions CI run on the PR's current head commit is fully
+green** — every step (secrets check, ruff, mypy, order-code audit, pytest) ran and passed on the Linux runner.
+Local checks on the Windows laptop do not count. Every "ready to merge" message to Parham states the CI status
+and run link per PR. Platform-specific code or tests are guarded with `sys.platform` (which mypy narrows) plus
+`pytest.mark.skipif`, and the protection they test must also be exercised on Linux (Parham, 2026-10-11).
 
 **Rules**
 1. One task → one agent. Independent tasks run in parallel; dependent tasks run in sequence.
