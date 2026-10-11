@@ -26,7 +26,11 @@ ACCEPTANCE:
   - S0 reproduces every §7.1 rule with hand-computed unit cases (FLAT→LONG, LONG→STOPPED incl. the entry bar,
     STOPPED→FLAT on the stop-out bar's close, re-entry only after a close ≤ SMA100, stop floor 0.01, the
     25 % band, transitions always traded);
-  - each candidate's grid is a frozen tuple in code equal to SPEC §7.2 C; a test asserts it;
+  - each candidate's grid is a frozen tuple in code equal to SPEC §7.2 C; every entry of
+    src/tbot/strategies/phase3_registry.py loads (module + `make(timeframe=..., **params)` factory);
+  - tests/strategies/test_volume_invariance.py and tests/strategies/test_c3_4h_daily_atr.py run with ZERO
+    skips (every registered strategy volume-invariant through the real engine path; the 4h C3 points use only
+    the daily ATR20 of the last completed daily bar); the static volume test stays green;
   - uv run pytest, ruff, mypy, mypy --platform linux green.
 OUT OF SCOPE: any walk-forward, metric, PBO/DSR, report or comparison between strategies; any change to the
               engine, broker, SPEC or core/types.py; touching data on/after 2025-10-01; logging trials (no results
@@ -51,9 +55,14 @@ CONTRACTS USED: engine/broker/strategy APIs as merged — do not modify.
 ACCEPTANCE:
   - BEFORE the first run: every grid point to be run is listed in research/EXPERIMENTS.md with its parameters;
     every run that produces any number is logged (failed or abandoned included); N for DSR follows D-059;
-  - walk-forward: 12 folds exactly as §7.2 B, anchored replay from 2018-01-01, per-fold choice by training
-    Sharpe (manual-delay, after costs), pooled OOS series = folds concatenated; a test proves no OOS bar is used
-    in any training choice (truncation-style test on the harness);
+  - walk-forward: 12 periods exactly as §7.2 B, anchored replay from 2018-01-01, per-period choice by training
+    Sharpe (manual-delay, after costs) over the eligible points' COMMON tradable days, eligibility exactly as the
+    §7.2 B table, pooled OOS series = periods concatenated; a test proves no OOS bar is used in any training
+    choice (truncation-style test on the harness);
+  - neighbour test, buy-and-hold benchmark and ETH/Stooq robustness exactly as §7.2 E and I (BTC's per-period
+    choices reused unchanged, no re-selection);
+  - every Phase 3 number labelled PROVISIONAL (D-067 curve); the G3 verdict comes only from ONE complete rerun
+    of the whole procedure with the frozen curve (D-085), including per-period selection;
   - metrics: Sharpe (365), maxDD, PBO (CSCV, S = 16), DSR (§7.1 definition), MinTRL (95 %, vs 0 and vs B&H),
     turnover and annual cost drag; both fill modes; ×2 cost stress;
   - the slippage model used is exactly the one Parham chose in §7.2 F, labelled as such in every table;
