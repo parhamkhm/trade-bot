@@ -1,0 +1,74 @@
+{
+  "provenance": {
+    "hostname": "srv6950132412 (docker, image tbot-lbank-recorder @ 8a7d528)",
+    "utc_start": "2026-10-11T10:45:39.117650+00:00",
+    "utc_end": "2026-10-11T10:46:10.106722+00:00",
+    "python": "3.12.15",
+    "platform": "Linux-7.0.0-14-generic-x86_64-with-glibc2.36",
+    "script": "scripts/lbank_probe.py",
+    "git_commit": "8a7d528ec3d8dbb5bebb5a2ea8ba02f7adb761d8",
+    "git_commit_unknown": false,
+    "mode": "ratelimit",
+    "argv": [
+      "--ratelimit",
+      "--out-dir",
+      "/out",
+      "--host-label",
+      "srv6950132412 (docker, image tbot-lbank-recorder @ 8a7d528)"
+    ],
+    "user_agent": "tbot-lbank-g0-probe/1 (public read-only market-data probe; contact: project owner)",
+    "data_source": "live",
+    "measured_from": "measured from srv6950132412 (docker, image tbot-lbank-recorder @ 8a7d528) at 2026-10-11T10:45:39.117650+00:00",
+    "local_clock_sync": "NOT checked by this script - the operator records chrony/timedatectl status separately"
+  },
+  "mode": "ratelimit",
+  "endpoint": "depth",
+  "request": {
+    "url": "https://api.lbkex.com/v2/depth.do",
+    "params": {
+      "symbol": "btc_usdt",
+      "size": 20
+    }
+  },
+  "plan": {
+    "steps_rps": [
+      1.0,
+      2.0,
+      3.0,
+      5.0
+    ],
+    "step_seconds": 30.0,
+    "pause_seconds": 30.0
+  },
+  "steps": [
+    {
+      "rate_rps": 1.0,
+      "step_seconds": 30.0,
+      "requests_sent": 27,
+      "achieved_rps": 0.891820596061584,
+      "reached": false,
+      "statuses": {
+        "200": 27
+      },
+      "latency_p50_ms": 289.74063228815794,
+      "latency_p95_ms": 1751.0407515801485,
+      "rate_limit_headers_seen": {
+        "x-lbank-ratelimit-limit": "200",
+        "x-lbank-ratelimit-time": "10s"
+      },
+      "completed_without_incident": true
+    }
+  ],
+  "stopped_early": true,
+  "stopped_reason": "latency",
+  "interrupted": false,
+  "last_safe_rate_rps": 0.891820596061584,
+  "max_rate_tested_rps": 1.0,
+  "failure": null,
+  "rate_not_reached": {
+    "rate_rps": 1.0,
+    "achieved_rps": 0.891820596061584,
+    "reason": "latency-limited: achieved rate fell short of 90% of the requested rate. The client is strictly serial by design and never adds concurrency to try to reach it, so this says nothing about what the exchange itself would tolerate -- only that THIS client, at THIS measured per-request latency, could not exercise that rate to test it."
+  },
+  "caveat": "A run that completes proves only that these rates were tolerated for the step length; it does not prove there is no limit. Limits may be per endpoint or per window. This ceiling covers requests made by THIS PROBE PROCESS only: the LBank recorder (src/tbot/data/lbank_recorder.py) runs continuously on the same host/IP and adds its own steady-state traffic (approximately 0.15 req/s from its own polling schedule) on top of whatever this probe measures, which this probe neither controls nor accounts for -- the exchange sees a higher combined rate from this IP than the figures above show in isolation."
+}
