@@ -3,6 +3,7 @@
 .env.*
 !.env.example
 deploy/recorder.env
+deploy/health_monitor.env
 
 # Data (never committed). Anchored to the repo root so src/tbot/data and tests/data stay tracked.
 /data/
