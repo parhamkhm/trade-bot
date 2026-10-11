@@ -1,0 +1,149 @@
+{
+  "script": "scripts/lbank_clock_test.py",
+  "registered_run": true,
+  "registration_note": null,
+  "verdict": "FAIL",
+  "verdict_reason": "|offset| + min_rtt/2 = 929.899 ms >= 500 ms",
+  "rule": "|offset| + min_rtt/2 < 500 ms",
+  "provenance": {
+    "hostname": "srv6950132412 (docker, image tbot-lbank-recorder @ 8a7d528, scripts from main @ 3129b14)",
+    "utc_start": "2026-10-11T16:17:45.020058+00:00",
+    "utc_end": "2026-10-11T17:17:17.902606+00:00",
+    "python": "3.12.15",
+    "platform": "Linux-7.0.0-14-generic-x86_64-with-glibc2.36",
+    "script": "scripts/lbank_clock_test.py",
+    "git_commit": "3129b145f24725043c2e93c3beb2d42cb864d97c",
+    "git_commit_unknown": false,
+    "mode": "clock-retest",
+    "argv": [
+      "--calls",
+      "120",
+      "--spacing",
+      "30",
+      "--out-dir",
+      "/out",
+      "--host-label",
+      "srv6950132412 (docker, image tbot-lbank-recorder @ 8a7d528, scripts from main @ 3129b14)"
+    ],
+    "user_agent": "tbot-lbank-g0-clock-test/1 (public read-only timestamp.do re-test; contact: project owner)",
+    "data_source": "live",
+    "measured_from": "measured from srv6950132412 (docker, image tbot-lbank-recorder @ 8a7d528, scripts from main @ 3129b14) at 2026-10-11T16:17:45.020058+00:00",
+    "local_clock_sync": "Host clock NTP/NTS sync is NOT checked by this script (it cannot be from inside a container); the operator records `chronyc tracking` / `timedatectl` on the host next to this run.",
+    "registered_run": true
+  },
+  "plan": {
+    "calls": 120,
+    "spacing_s": 30.0,
+    "timeout_s": 10.0,
+    "fastest_n": 12,
+    "min_valid_calls": 108,
+    "threshold_ms": 500.0
+  },
+  "counts": {
+    "attempted": 120,
+    "valid": 120,
+    "not_valid": 0,
+    "skipped_missed_slots": 0,
+    "skipped_slot_indexes": [],
+    "http_status": {
+      "200": 120
+    },
+    "invalid_reasons": {}
+  },
+  "stopped_on_ban": null,
+  "interrupted": false,
+  "estimate": {
+    "offset_ms": 384.91130325,
+    "min_rtt_ms": 1089.975931,
+    "half_min_rtt_ms": 544.9879655,
+    "bound_ms": 929.8992687499999,
+    "offset_minus_half_min_rtt_ms": -160.07666224999997,
+    "offset_plus_half_min_rtt_ms": 929.8992687499999,
+    "margin_to_threshold_ms": -429.8992687499999,
+    "criterion_met": false,
+    "fastest_calls": [
+      {
+        "index": 84,
+        "rtt_ms": 1089.975931,
+        "offset_ms": 376.8353085
+      },
+      {
+        "index": 95,
+        "rtt_ms": 1096.615236,
+        "offset_ms": 378.521901
+      },
+      {
+        "index": 76,
+        "rtt_ms": 1101.47727,
+        "offset_ms": 378.992716
+      },
+      {
+        "index": 114,
+        "rtt_ms": 1102.312688,
+        "offset_ms": 379.591214
+      },
+      {
+        "index": 17,
+        "rtt_ms": 1105.309445,
+        "offset_ms": 372.9475935
+      },
+      {
+        "index": 44,
+        "rtt_ms": 1118.94709,
+        "offset_ms": 382.748109
+      },
+      {
+        "index": 69,
+        "rtt_ms": 1125.465039,
+        "offset_ms": 389.0496025
+      },
+      {
+        "index": 80,
+        "rtt_ms": 1129.674687,
+        "offset_ms": 387.9932935
+      },
+      {
+        "index": 68,
+        "rtt_ms": 1130.517122,
+        "offset_ms": 393.4173
+      },
+      {
+        "index": 33,
+        "rtt_ms": 1131.095315,
+        "offset_ms": 391.3079705
+      },
+      {
+        "index": 115,
+        "rtt_ms": 1131.605323,
+        "offset_ms": 387.0744975
+      },
+      {
+        "index": 37,
+        "rtt_ms": 1132.138462,
+        "offset_ms": 387.754572
+      }
+    ]
+  },
+  "latency_ms": {
+    "wall_rtt": {
+      "min": 1089.975931,
+      "p50": 1304.238574,
+      "p95": 2563.1194330999992,
+      "max": 6807.307336
+    },
+    "monotonic_rtt": {
+      "min": 1090.1147788390517,
+      "p50": 1304.4633311219513,
+      "p95": 2563.233764097094,
+      "max": 6807.420926168561
+    },
+    "max_abs_wall_minus_monotonic": 0.3731474794792575
+  },
+  "offset_all_valid_ms": {
+    "min": -2448.867029,
+    "p50": 402.35225349999996,
+    "p95": 583.74504595,
+    "max": 3018.109605
+  },
+  "host_clock_sync": "Host clock NTP/NTS sync is NOT checked by this script (it cannot be from inside a container); the operator records `chronyc tracking` / `timedatectl` on the host next to this run."
+}
