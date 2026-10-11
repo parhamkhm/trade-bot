@@ -268,8 +268,13 @@ These refine `CLAUDE.md` §9 into measurable checks. They may be tightened, neve
 spread across ≥ 6 h. Every number carries where and when it was measured.
 - *Pass conditions:*
   - every spot v2 endpoint (`timestamp`, `accuracy`, `depth`, `supplement/trades`, `kline`, `ticker/24hr`) and
-    the perpetual `marketData` answer 200;
-  - median |LBank server time − local NTP clock| < 1 s;
+    the perpetual `marketData` answer 200. *Interpretation, fixed 2026-10-11 before any G0 data:* each endpoint
+    returns HTTP 200 with a valid payload in **≥ 95 %** of its sampled requests (a timeout or transport error
+    counts as a failure; timeout 20 s for `supplement/trades`, 10 s for the rest), and **no** 429/403/418 occurs
+    at all. A ban-type response stops the run at once (no further requests) and G0 fails;
+  - median |LBank server time − local NTP clock| < 1 s, and the offset measured at the minimum round trip
+    is also < 1 s. When the median ± the median half round trip straddles 1 s, the result is *inconclusive*
+    and counts as not passed;
   - `accuracy` lists `btc_usdt` with readable price/quantity precision, minimum quantity and minimum order value;
   - median best bid/ask spread < 0.20 %.
 - *Reported, not gating:*
