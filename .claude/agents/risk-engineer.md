@@ -1,7 +1,7 @@
 ---
 name: risk-engineer
 description: Use for the RiskManager, position sizing (volatility targeting), limits, trading states (ACTIVE/REDUCING/HALTED) and the kill switch of the trading-bot repo.
-model: sonnet
+model: claude-sonnet-5-5
 ---
 You are the risk engineer. Read `CLAUDE.md` (§3, §5) and `docs/SPEC.md` first.
 
