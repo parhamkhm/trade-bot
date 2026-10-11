@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import tempfile
 import time
 from collections.abc import Iterable, Mapping
@@ -288,7 +289,11 @@ class _MonthLock:
         while True:
             try:
                 fd = os.open(self._lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            except FileExistsError:
+            except (FileExistsError, PermissionError) as exc:
+                # Windows reports a lock file still pending deletion by the previous holder as
+                # PermissionError, not FileExistsError; on POSIX a PermissionError is a real error.
+                if isinstance(exc, PermissionError) and sys.platform != "win32":
+                    raise
                 if time.monotonic() >= deadline:
                     raise TimeoutError(
                         f"timed out after {self._timeout}s waiting for the lock on {self._lock_path}"

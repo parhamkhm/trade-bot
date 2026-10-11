@@ -23,7 +23,9 @@ import dataclasses
 import inspect
 import os
 import re
+import sys
 import tempfile
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -489,22 +491,38 @@ def _plant_research_format_file(live_root: Path) -> Path:
     return part
 
 
-def _link_dir(link: Path, target: Path) -> None:
-    """Directory symlink; on Windows without symlink privilege fall back to a junction; else skip."""
+_ON_WINDOWS = sys.platform == "win32"
+
+
+def _symlink_dir(link: Path, target: Path) -> None:
+    """Directory symlink. Must work on the Linux CI runner; Windows without the privilege skips."""
     try:
         link.symlink_to(target, target_is_directory=True)
-        return
     except (OSError, NotImplementedError):
-        pass
-    if os.name == "nt":  # junctions need no privilege; created via the stdlib's own helper (cmd mangles "=")
-        try:
-            import _winapi
+        if _ON_WINDOWS:
+            pytest.skip("Windows without symlink privilege; the junction case covers this platform")
+        raise
 
-            _winapi.CreateJunction(str(target), str(link))
-            return
-        except (ImportError, OSError):
-            pass
-    pytest.skip("platform cannot create directory symlinks or junctions here")
+
+def _junction_dir(link: Path, target: Path) -> None:
+    """NTFS junction (needs no privilege). Windows only; the parametrisation skips it elsewhere."""
+    if sys.platform == "win32":
+        import _winapi
+
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        pytest.skip("junctions exist only on Windows")
+
+
+LinkMaker = Callable[[Path, Path], None]
+LINK_KINDS = [
+    pytest.param(_symlink_dir, id="symlink"),
+    pytest.param(
+        _junction_dir,
+        id="junction",
+        marks=pytest.mark.skipif(not _ON_WINDOWS, reason="junctions exist only on Windows"),
+    ),
+]
 
 
 def _load(parquet_root: Path) -> list[object]:
@@ -564,21 +582,23 @@ def test_loader_refuses_subdirectory_of_live_compare(planted: Path) -> None:
         _load(planted / "klines")
 
 
-def test_loader_refuses_symlink_or_junction_to_live_compare(planted: Path) -> None:
+@pytest.mark.parametrize("make_link", LINK_KINDS)
+def test_loader_refuses_symlink_or_junction_to_live_compare(planted: Path, make_link: LinkMaker) -> None:
     link = planted.parent / "totally_innocent_parquet"
-    _link_dir(link, planted)
+    make_link(link, planted)
     assert (link / "klines").is_dir()  # the link really does reach the data
     with pytest.raises(lc.LiveCompareAccessError):
         _load(link)
 
 
-def test_loader_refuses_link_nested_below_the_root(planted: Path) -> None:
+@pytest.mark.parametrize("make_link", LINK_KINDS)
+def test_loader_refuses_link_nested_below_the_root(planted: Path, make_link: LinkMaker) -> None:
     root = planted.parent / "parquet"
     tf_dir = Path("klines") / "source=binance" / "symbol=BTCUSDT" / "timeframe=1d"
     (root / tf_dir).mkdir(parents=True)
     # Only the year directory is a link: the dataset directory itself looks innocent, so this
     # exercises the per-part-file check rather than the directory check.
-    _link_dir(root / tf_dir / "year=2024", planted / tf_dir / "year=2024")
+    make_link(root / tf_dir / "year=2024", planted / tf_dir / "year=2024")
     with pytest.raises(lc.LiveCompareAccessError):
         _load(root)
 
@@ -612,7 +632,8 @@ def _plant_candle_research_file(live_root: Path) -> Path:
     return part
 
 
-def test_read_candles_refuses_a_junction_at_the_year_level(tmp_path: Path) -> None:
+@pytest.mark.parametrize("make_link", LINK_KINDS)
+def test_read_candles_refuses_a_link_at_the_year_level(tmp_path: Path, make_link: LinkMaker) -> None:
     """Review MAJOR-5: a dedicated test that reaches ``candles._read_candles`` directly through a
     link at the ``year=`` level (mirroring ``test_loader_refuses_link_nested_below_the_root`` for
     the Binance kline reader), so that removing the per-part-file guard added to
@@ -623,7 +644,7 @@ def test_read_candles_refuses_a_junction_at_the_year_level(tmp_path: Path) -> No
     root = tmp_path / "data" / "parquet"
     tf_dir = Path("klines") / "source=tabdeal" / "symbol=BTCUSDT" / "timeframe=1h"
     (root / tf_dir).mkdir(parents=True)
-    _link_dir(root / tf_dir / "year=2024", live_root / tf_dir / "year=2024")
+    make_link(root / tf_dir / "year=2024", live_root / tf_dir / "year=2024")
     with pytest.raises(lc.LiveCompareAccessError):
         candles_mod._read_candles(root, "BTCUSDT")
 
@@ -652,7 +673,9 @@ def test_loader_refuses_symlinked_part_file(planted: Path) -> None:
     try:
         decoy.symlink_to(secret)
     except (OSError, NotImplementedError):
-        pytest.skip("platform cannot create file symlinks here")
+        if not _ON_WINDOWS:
+            raise
+        pytest.skip("Windows without symlink privilege cannot create file symlinks")
     with pytest.raises(lc.LiveCompareAccessError):
         _load(root)
 
