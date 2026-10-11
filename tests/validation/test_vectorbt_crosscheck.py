@@ -353,8 +353,8 @@ OLD_ENGINE_REJECTION_DAYS = {
 def test_zero_buffer_on_real_data_has_no_fill_rejections_and_caps_instead(name: str) -> None:
     """Buffer 0, next-open: 0 fill rejections on real data, including every day the old engine rejected.
 
-    Not asserted on purpose: the number of "anomaly" resizes on real data (the anomaly rule is Parham's open
-    decision); only the invariant (no rejection) and the existence of ordinary ``price_move`` caps are.
+    Not asserted on purpose: the number of "anomaly" resizes on real data (g2_numbers reports 0; SPEC D-082);
+    only the invariant (no rejection) and the existence of ordinary ``price_move`` caps are.
     """
     bars = _bars("real")
     res = run(_strategy(name), bars, make_cfg(buffer_bps=Decimal(0)))

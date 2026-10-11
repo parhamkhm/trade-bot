@@ -142,7 +142,7 @@ def test_gap_up_buy_is_capped_at_fill_time_not_rejected() -> None:
     * BUY price at open(1) = ceil(100.5 * 1.0005, tick) = 100.56. At that price the requested order costs
       99.85017 * 100.56 * 1.001 = 10050.97 > 10000 cash, which the old engine rejected (INSUFFICIENT_FUNDS).
     * Cap: floor(10000 / (100.56 * 1.001), step) = floor(10000 / 100.66056) = 99.34377 (-0.5072 % of the
-      request, below the 1 % anomaly threshold: kind "price_move"). Notional 9990.0095112, fee
+      request; affordable at the sizing close, so kind "price_move", SPEC D-082). Notional 9990.0095112, fee
       9.9900095112, cash left 0.0004792888.
     """
     bars = five_bars()
