@@ -399,13 +399,20 @@ def _disk_usage(path: Path) -> DiskUsage | None:
 class Memory:
     """What checks may remember between cycles. The ``Monitor`` loads and persists the dicts.
 
-    * ``restart_counts``: last seen docker ``RestartCount`` per container (crash-loop detection),
+    * ``restart_counts``: last *communicated* docker ``RestartCount`` per container (crash-loop
+      detection). This only advances once the Monitor has actually sent a message mentioning it
+      (``Monitor._commit_restart_count``) -- never merely because a cycle observed it -- so a
+      Telegram back-off or the per-cycle message cap cannot silently swallow a restart tick.
+    * ``pending_restart_counts``: the RestartCount observed THIS cycle, not yet committed into
+      ``restart_counts``. Purely a hand-off from the check function to the ``Monitor``; it is
+      recomputed from live docker data every cycle and is never persisted across a restart.
     * ``anchors``: ISO timestamps of reference points (e.g. when the backup status file was last seen),
     * ``open_keys``: keys with an open alert right now (set by the ``Monitor`` before every cycle; the
       disk check uses it to apply the clear margin).
     """
 
     restart_counts: dict[str, int] = field(default_factory=dict)
+    pending_restart_counts: dict[str, int] = field(default_factory=dict)
     anchors: dict[str, str] = field(default_factory=dict)
     open_keys: set[str] = field(default_factory=set)
 
@@ -599,15 +606,24 @@ def _parse_inspect(stdout: str) -> tuple[object, int | None]:
 
 
 def _restart_note(target: Target, count: int | None, probes: Probes) -> str:
-    """Crash-loop signal: the container's RestartCount went up since the last cycle."""
+    """Crash-loop signal: the container's RestartCount went up since the last cycle.
+
+    The comparison baseline (``restart_counts``) only advances once the resulting note is actually
+    sent (``Monitor._commit_restart_count``) -- not merely because this check observed it -- so a
+    Telegram back-off or the 8-messages-per-cycle cap cannot silently consume a restart tick. Until
+    committed, the delta keeps being reported, cumulatively, cycle after cycle.
+    """
     if count is None:
         return ""
-    counts = probes.memory.restart_counts
-    previous = counts.get(target.container)
-    counts[target.container] = count
-    if previous is None or count <= previous:
+    memory = probes.memory
+    baseline = memory.restart_counts.get(target.container)
+    if baseline is None:
+        memory.restart_counts[target.container] = count  # bootstrap: nothing to compare yet, no note
         return ""
-    return f"{target.container} restarted {count - previous} time(s) since the last check (total {count})"
+    memory.pending_restart_counts[target.container] = count
+    if count <= baseline:
+        return ""
+    return f"{target.container} restarted {count - baseline} time(s) since the last check (total {count})"
 
 
 def _inspect_target(target: Target, settings: Settings, probes: Probes) -> list[Problem]:
@@ -679,7 +695,13 @@ def evaluate_lbank_status(
         started = parse_iso(data.get("started_ts")) or ts
         running_h = (now - started).total_seconds() / 3600.0
         if running_h <= IN_PROGRESS_GRACE_HOURS:
-            return []  # a normal run under way; not stuck yet
+            # A normal run under way: not stuck yet. This must NOT be [] -- the writer's very first
+            # write of a run sets in_progress=true/ok=false over whatever last night's status said,
+            # so if last night's run had genuinely failed (an open "backup:lbank" alert), returning
+            # no problems at all would read as "cleared" and RESOLVE it before the new run even
+            # finishes. Freeze the key instead: neither resolved nor re-alerted until the run ends.
+            summary = f"LBank backup run in progress (started {running_h * 60:.0f} min ago)"
+            return [Problem(key, summary, freeze=(key,), silent=True)]
         summary = (
             f"LBank backup has been 'in_progress' for {running_h:.1f} h"
             f" (limit {IN_PROGRESS_GRACE_HOURS:g} h): the run was killed or is stuck"
@@ -753,14 +775,30 @@ def check_trades_backup(settings: Settings, probes: Probes) -> list[Problem]:
     return []
 
 
+_UNIT_CLEAR_STATES = frozenset(
+    {"active", "inactive", "activating", "deactivating", "reloading", "maintenance"}
+)
+
+
 def check_units(settings: Settings, probes: Probes) -> list[Problem]:  # noqa: ARG001
-    """Class 2: a backup systemd unit in the ``failed`` state."""
+    """Class 2: a backup systemd unit in the ``failed`` state.
+
+    ``systemctl is-failed`` is trusted only when it answers with one of the known, documented unit
+    states (``_UNIT_CLEAR_STATES``, or ``failed`` itself). Anything else -- non-zero exit with empty
+    stdout, "Failed to connect to bus" (dbus unreachable), or any other unexpected text -- is
+    inconclusive, not evidence the unit is healthy: it freezes that one unit's own key instead of
+    being silently read as "not failed".
+    """
     problems: list[Problem] = []
     try:
         for unit in BACKUP_UNITS:
-            res = probes.run(["systemctl", "is-failed", unit])
-            if res.stdout.strip() == "failed":
-                problems.append(Problem(f"backup:unit:{unit}", f"systemd unit {unit} is failed"))
+            key = f"backup:unit:{unit}"
+            state = probes.run(["systemctl", "is-failed", unit]).stdout.strip()
+            if state == "failed":
+                problems.append(Problem(key, f"systemd unit {unit} is failed"))
+            elif state not in _UNIT_CLEAR_STATES:
+                summary = f"systemctl is-failed {unit}: unexpected output {short(state, 80)!r}"
+                problems.append(Problem(key, summary, freeze=(key,), silent=True))
     except ToolError as exc:
         return [Problem("tool:systemctl", f"systemctl unavailable: {exc.reason}", freeze=("backup:unit:",))]
     return problems
@@ -1082,6 +1120,19 @@ class Monitor:
         else:
             tracked[event.key].last_sent_ts = now.isoformat()
 
+    def _commit_restart_count(self, key: str) -> None:
+        """Once a recorder's message has actually been sent, the restart-count note in it has been
+        delivered: advance the comparison baseline so the same tick is not reported again. Until
+        this runs, ``_restart_note`` keeps comparing against the OLD baseline (see its docstring)."""
+        if not key.startswith(_RECORDER_PREFIX):
+            return
+        for target in self._s.targets:
+            if recorder_key(target) == key:
+                pending = self._memory.pending_restart_counts.pop(target.container, None)
+                if pending is not None:
+                    self._memory.restart_counts[target.container] = pending
+                return
+
     def _message(self, event: Event, now: datetime) -> str:
         if event.kind == "resolved":
             item = self._state.tracked.get(event.key)
@@ -1100,6 +1151,7 @@ class Monitor:
             if not self._try_send(self._message(event, now), now):
                 break
             self._apply(event, now)
+            self._commit_restart_count(event.key)
             sent.append(event)
         self._state.anchors = dict(self._memory.anchors)
         self._state.restart_counts = dict(self._memory.restart_counts)

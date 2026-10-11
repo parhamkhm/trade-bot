@@ -159,7 +159,10 @@ def test_contract_real_in_progress_write_within_the_grace_period_is_quiet(tmp_pa
     )
     settings = make_settings(tmp_path, lbank_status_file=dest / "status.json")
     found = hm.check_lbank_backup(settings, fixed_probes(now + timedelta(minutes=10), dest))
-    assert found == []
+    assert len(found) == 1
+    assert found[0].key == "backup:lbank"
+    assert found[0].silent is True  # never a visible alert while the run is still young
+    assert found[0].freeze == ("backup:lbank",)  # but also never read as "cleared"
 
 
 # ---------------------------------------------------------------------------------------------

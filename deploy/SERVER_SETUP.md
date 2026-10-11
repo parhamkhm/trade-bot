@@ -1083,22 +1083,29 @@ A few things are deliberately **not** instant alerts, to avoid flapping and fals
 
 Like the LBank recorder (section 18.1), the monitor runs from its own copy, `/opt/tbot/monitor-run`,
 not from `/opt/tbot/trade-bot`: pulling `main` into the main checkout must never change what this
-long-running root process executes without a deliberate update. First time only:
+long-running root process executes without a deliberate update.
+
+**Never `cp -r /opt/tbot/trade-bot`.** The main checkout is where `/opt/tbot/trade-bot/.env` lives
+(section 9); a recursive copy would duplicate that secret file into `/opt/tbot/monitor-run`, outside
+the one place it is supposed to exist. Always get `/opt/tbot/monitor-run` from a fresh `git clone`
+instead -- it only ever contains what git tracks, never `.env` or anything else `.gitignore`d. First
+time only, as `root`:
 
 ```
-cp -r /opt/tbot/trade-bot /opt/tbot/monitor-run
+git clone git@github.com:parhamkhm/trade-bot.git /opt/tbot/monitor-run
+git -C /opt/tbot/monitor-run checkout --detach <commit>
 ```
 
 To pick up a later change to the monitor itself, as `root`:
 
 ```
-rm -rf /opt/tbot/monitor-run
-cp -r /opt/tbot/trade-bot /opt/tbot/monitor-run
+git -C /opt/tbot/monitor-run fetch
+git -C /opt/tbot/monitor-run checkout --detach <commit>
 systemctl restart tbot-health-monitor
 ```
 
-(Or pin to a fixed commit the same way as 18.1 -- `git checkout --detach <commit>` inside
-`/opt/tbot/monitor-run` -- if you want the monitor's version independent of the laptop's checkout.)
+Pinning to `<commit>` (same pattern as 18.1) keeps the monitor's version a deliberate, reviewed
+choice, independent of whatever the laptop's own checkout happens to be on.
 
 ### 19.1 Create the bot (Parham, on his phone, about 2 minutes)
 

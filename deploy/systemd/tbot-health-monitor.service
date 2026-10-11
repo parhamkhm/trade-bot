@@ -10,7 +10,10 @@
 # change what this unit runs underneath it without a deliberate, reviewed update step.
 #
 # Install (root):
-#   cp -r /opt/tbot/trade-bot /opt/tbot/monitor-run   # first time only; see SERVER_SETUP.md 19.0
+#   git clone <repo> /opt/tbot/monitor-run   # first time only; see SERVER_SETUP.md 19.0.
+#   git -C /opt/tbot/monitor-run checkout --detach <commit>
+#   # Never `cp -r /opt/tbot/trade-bot`: that checkout holds .env (section 9) and a recursive copy
+#   # would duplicate it here.
 #   install -m 0644 /opt/tbot/monitor-run/deploy/systemd/tbot-health-monitor.service /etc/systemd/system/
 #   install -m 0600 -o root -g root /opt/tbot/monitor-run/deploy/health_monitor.env.example \
 #       /opt/tbot/health-monitor.env   # then edit

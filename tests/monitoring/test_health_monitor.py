@@ -14,6 +14,7 @@ import traceback
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -516,9 +517,14 @@ def test_lbank_integrity_null_is_not_an_alert(host: Host, settings: Settings) ->
     assert lbank(host, settings) == []
 
 
-def test_lbank_in_progress_within_the_grace_period_is_quiet(host: Host, settings: Settings) -> None:
+def test_lbank_in_progress_within_the_grace_period_is_a_silent_frozen_problem_not_nothing(
+    host: Host, settings: Settings
+) -> None:
     """The writer sets in_progress=true, ok=false, exit_code=null at the START of every run (so a
-    killed run never leaves last night's OK behind); a normal run must not alert while it works."""
+    killed run never leaves last night's OK behind); a normal run must not ALERT while it works.
+    But this must come back as a silent, frozen Problem -- not an empty list -- so that a Monitor
+    does not read "no problems" as "the previous open alert cleared" (see the Monitor-level test
+    below, test_lbank_in_progress_freezes_an_open_alert_instead_of_resolving_it)."""
     host.lbank_status(
         in_progress=True,
         ok=False,
@@ -527,7 +533,34 @@ def test_lbank_in_progress_within_the_grace_period_is_quiet(host: Host, settings
         ts=iso(NOW - timedelta(minutes=5)),
         started_ts=iso(NOW - timedelta(minutes=5)),
     )
-    assert lbank(host, settings) == []
+    found = lbank(host, settings)
+    assert len(found) == 1
+    assert found[0].key == "backup:lbank"
+    assert found[0].silent is True
+    assert found[0].freeze == ("backup:lbank",)
+    assert hm.collect(settings, host.probes()).problems == {}  # never surfaces as a visible problem
+
+
+def test_lbank_in_progress_freezes_an_open_alert_instead_of_resolving_it(
+    host: Host, tmp_path: Path, clock: Clock
+) -> None:
+    """Monitor-level: an open backup:lbank alert must not be RESOLVED just because a new run started
+    (in_progress=true is written over whatever last night's status said, per deploy/backup_lbank.py).
+    Without the freeze, resolve_cycles=2 clean-looking cycles below would wrongly send RESOLVED."""
+    settings = make_settings(tmp_path)
+    host.lbank_status(ok=False, exit_code=1, message="disk full")
+    monitor = make_monitor(settings, host, Outbox())
+    assert [e.kind for e in monitor.run_cycle()] == ["alert"]  # backup:lbank is open
+
+    clock.advance(hours=23)
+    started_ts = iso(clock())
+    host.lbank_status(
+        in_progress=True, ok=False, exit_code=None, integrity_ok=None, ts=started_ts, started_ts=started_ts
+    )
+    clock.advance(minutes=1)
+    assert monitor.run_cycle() == []  # cycle 1 "clean-looking": must not count towards resolving
+    clock.advance(minutes=1)
+    assert monitor.run_cycle() == []  # cycle 2: still must not resolve (would have, unfrozen)
 
 
 def test_lbank_in_progress_past_one_hour_alerts_as_stuck(host: Host, settings: Settings) -> None:
@@ -672,6 +705,108 @@ def test_failed_backup_units_alert(host: Host, settings: Settings) -> None:
 
 def test_inactive_units_do_not_alert(host: Host, settings: Settings) -> None:
     assert hm.check_units(settings, host.probes()) == []
+
+
+@pytest.mark.parametrize(
+    "state", ["active", "inactive", "activating", "deactivating", "reloading", "maintenance"]
+)
+def test_every_documented_clear_state_does_not_alert(host: Host, settings: Settings, state: str) -> None:
+    def clear_run(_args: Sequence[str], _s: str = state) -> CmdResult:
+        return CmdResult(1, f"{_s}\n", "")
+
+    probes = replace(host.probes(), run=clear_run)
+    assert hm.check_units(settings, probes) == []
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    ["", "unknown", "Failed to connect to bus: No such file or directory", "\n", "garbage output"],
+)
+def test_ambiguous_systemctl_output_is_a_silent_frozen_problem_not_clear(
+    host: Host, settings: Settings, stdout: str
+) -> None:
+    """Review MAJOR: check_units may treat a unit as clear only when the output is one of the known
+    states. Anything else (empty stdout, "unknown", a bus-connection failure, garbage) must freeze
+    that one unit's key rather than being silently read as "not failed"."""
+    base_run = host.run
+
+    def ambiguous_run(args: Sequence[str], _o: str = stdout) -> CmdResult:
+        return CmdResult(1, _o, "") if args[0] == "systemctl" else base_run(args)
+
+    probes = replace(host.probes(), run=ambiguous_run)
+    found = hm.check_units(settings, probes)
+    assert len(found) == len(hm.BACKUP_UNITS)
+    for problem, unit in zip(found, hm.BACKUP_UNITS, strict=True):
+        assert problem.key == f"backup:unit:{unit}"
+        assert problem.silent is True
+        assert problem.freeze == (problem.key,)
+    assert hm.collect(settings, probes).problems == {}  # never surfaces as a visible problem
+
+
+def test_systemctl_ambiguous_output_freezes_that_units_alert_until_resolved(
+    host: Host, tmp_path: Path, clock: Clock
+) -> None:
+    """Monitor-level: an open unit alert must stay open -- neither RESOLVED nor repeated -- for as
+    long as systemctl answers ambiguously, then resolve normally once it is confirmed healthy again.
+    Removing the freeze=(key,) added to check_units's ambiguous-output branch makes this fail."""
+    settings = make_settings(tmp_path)
+    host.failed_units = {"tbot-trades-backup.service"}
+    base_run = host.run
+    ambiguous = {"on": False}
+
+    def flaky_run(args: Sequence[str]) -> CmdResult:
+        if ambiguous["on"] and tuple(args) == ("systemctl", "is-failed", "tbot-trades-backup.service"):
+            return CmdResult(3, "", "Failed to connect to bus: No such file or directory")
+        return base_run(args)
+
+    probes = replace(host.probes(), run=flaky_run)
+    out = Outbox()
+    monitor = Monitor(settings, probes, out, StateStore(settings.state_dir / "state.json"))
+    assert [e.kind for e in monitor.run_cycle()] == ["alert"]  # the unit is genuinely failed
+
+    host.failed_units = set()  # the unit actually recovered...
+    ambiguous["on"] = True  # ...but systemctl itself answers ambiguously right now
+    clock.advance(hours=1)
+    assert monitor.run_cycle() == []  # neither RESOLVED nor a reminder: inconclusive, not healthy
+    clock.advance(minutes=1)
+    assert monitor.run_cycle() == []
+
+    ambiguous["on"] = False
+    clock.advance(minutes=1)
+    assert monitor.run_cycle() == []  # resolve_cycles=2: first genuinely clean cycle
+    clock.advance(minutes=1)
+    assert [(e.kind, e.key) for e in monitor.run_cycle()] == [
+        ("resolved", "backup:unit:tbot-trades-backup.service")
+    ]
+
+
+def test_disks_check_crashing_freezes_open_disk_alerts_instead_of_resolving_them(
+    host: Host, tmp_path: Path, clock: Clock
+) -> None:
+    """Monitor-level: if the named 'disks' check itself crashes, its open alerts must stay open --
+    the monitor cannot tell whether the underlying disk problem cleared. Removing "disks": ("disk:",)
+    from CHECK_KEY_PREFIXES (or the freeze handling in collect()) makes this fail."""
+    settings = make_settings(tmp_path, confirm_cycles=1)
+    host.disks[BACKUP_DIR] = DiskUsage(95 * GIB, 5 * GIB, 2)
+    monitor = make_monitor(settings, host, Outbox())
+    assert [e.kind for e in monitor.run_cycle()] == ["alert"]  # disk:<BACKUP_DIR> is open
+
+    class BoomDisk:
+        def __call__(self, _path: Path) -> DiskUsage | None:
+            raise RuntimeError("disk probe exploded")
+
+    monitor._probes = replace(monitor._probes, disk=BoomDisk())
+    for _ in range(3):  # however long the check keeps crashing, the open alert is never resolved
+        clock.advance(hours=1)
+        events = monitor.run_cycle()
+        assert "disk:" + str(BACKUP_DIR) not in {e.key for e in events if e.kind == "resolved"}
+
+    monitor._probes = replace(monitor._probes, disk=host.disk)
+    host.disks[BACKUP_DIR] = DiskUsage(10 * GIB, 90 * GIB, 2)  # genuinely healthy again
+    clock.advance(minutes=1)
+    assert monitor.run_cycle() == []  # resolve_cycles=2: first clean cycle
+    clock.advance(minutes=1)
+    assert ("resolved", "disk:" + str(BACKUP_DIR)) in [(e.kind, e.key) for e in monitor.run_cycle()]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -937,6 +1072,59 @@ def test_at_most_eight_messages_per_cycle(host: Host, tmp_path: Path, clock: Clo
     assert len(monitor.run_cycle()) == 4
     assert monitor.run_cycle() == []
     assert len(out.sent) == 12
+
+
+def test_restart_note_survives_a_telegram_backoff_until_actually_sent(
+    host: Host, tmp_path: Path, clock: Clock
+) -> None:
+    """The note must not be "consumed" just because a cycle observed the new RestartCount: it has
+    to survive until a message mentioning it is actually delivered (review MINOR, restart-note
+    pending-until-sent)."""
+    settings = make_settings(tmp_path)
+    host.restarts["tbot-lbank-recorder"] = 1
+    make_monitor(settings, host, Outbox()).run_cycle()  # bootstrap: baseline=1, no note possible yet
+
+    out = Outbox()
+    out.fail = TelegramError("timeout")
+    store = StateStore(settings.state_dir / "state.json")
+    monitor = Monitor(settings, host.probes(), out, store)
+    host.restarts["tbot-lbank-recorder"] = 2
+    clock.advance(minutes=1)
+    assert monitor.run_cycle() == []  # alert attempted, send failed: nothing committed
+
+    out.fail = None
+    clock.advance(seconds=70)  # past the back-off window
+    host.restarts["tbot-lbank-recorder"] = 3  # a second restart while the first note was still pending
+    events = monitor.run_cycle()
+    assert [(e.kind, e.key) for e in events] == [("alert", "recorder:lbank")]
+    assert "restarted 2 time(s)" in out.sent[-1]  # cumulative: 1 -> 3, the first tick was not lost
+    assert "total 3" in out.sent[-1]
+
+
+def test_restart_note_survives_the_per_cycle_message_cap(host: Host, tmp_path: Path, clock: Clock) -> None:
+    settings = make_settings(tmp_path, confirm_cycles=1)
+    host.restarts["tbot-lbank-recorder"] = 1
+    make_monitor(settings, host, Outbox()).run_cycle()  # bootstrap: baseline=1, no note, no other alerts
+
+    paths = tuple(Path(f"/mnt/d{i}") for i in range(8))
+    for i, path in enumerate(paths):
+        host.disks[path] = DiskUsage(99 * GIB, 1 * GIB, 100 + i)
+    settings2 = make_settings(tmp_path, disk_paths=paths, confirm_cycles=1)  # same state_dir: continuity
+
+    host.restarts["tbot-lbank-recorder"] = 2
+    out = Outbox()
+    monitor = Monitor(settings2, host.probes(), out, StateStore(settings2.state_dir / "state.json"))
+    clock.advance(minutes=1)
+    first = monitor.run_cycle()
+    assert len(first) == 8  # the 8 disk alerts fill the cap; recorder:lbank's alert is dropped
+    assert "recorder:lbank" not in {e.key for e in first}
+
+    host.restarts["tbot-lbank-recorder"] = 3  # a second restart while the first note was still pending
+    clock.advance(minutes=1)
+    second = monitor.run_cycle()
+    assert [(e.kind, e.key) for e in second] == [("alert", "recorder:lbank")]
+    assert "restarted 2 time(s)" in out.sent[-1]  # cumulative: 1 -> 3, the capped tick was not lost
+    assert "total 3" in out.sent[-1]
 
 
 # ---------------------------------------------------------------------------------------------
