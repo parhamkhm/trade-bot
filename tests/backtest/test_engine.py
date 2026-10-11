@@ -331,6 +331,71 @@ def test_delay_model_fills_at_first_hourly_open_six_hours_after_the_signal_close
     assert res.equity[1].quantity == Dec("40.32258")
 
 
+def test_delay_fill_lands_on_the_next_available_bar_when_the_deadline_bars_are_missing() -> None:
+    """GAP case of Parham's review item (a): the 1h bars opening at created_ts + 6 h and + 7 h are missing, so
+    the order fills on the FIRST bar with open_ts >= created_ts + 6 h, which is created_ts + 8 h: not later
+    (not at the next signal bar) and not earlier. The fill is flagged gap_fill and the report counts it."""
+    days, hours = delay_setup()
+    created = T_START + timedelta(days=1)  # close of the first signal bar, when the order is created
+    missing = (created + timedelta(hours=6), created + timedelta(hours=7))
+    gapped = [b for b in hours if b.open_ts not in missing]
+    assert len(gapped) == len(hours) - 2
+    cfg = make_config(fill_delay=timedelta(hours=6), exec_timeframe=Timeframe.H1)
+    res = run_backtest(BacktestFeed(days), Scripted([0.5, 0.5]), cfg, exec_feed=BacktestFeed(gapped))
+    (rec,) = res.fills
+    assert rec.fill.ts == created + timedelta(hours=8)
+    assert rec.gap_fill is True
+    assert rec.reference_price == Dec("132")  # open of the 08:00 hourly bar (opens are 124 + hour index)
+    assert rec.fill.price == Dec("133.32")  # adverse +1 %
+    assert rec.fill.quantity == Dec("40.32258")  # still sized at the signal close (124)
+    assert res.rejections == ()
+    # the only order left open is the rebalance created at the LAST close; the gapped order itself is done
+    assert rec.fill.client_order_id == "bt-000001" and res.unfilled_order_ids == ("bt-000002",)
+    assert res.equity[0].quantity == 0 and res.equity[1].quantity == Dec("40.32258")
+    report = build_report(res)
+    assert report["health"]["gap_fills"] == 1
+    assert not is_run_invalid(report)
+    # the contiguous run on the same data is NOT a gap fill (the counter is not always 1)
+    clean = run_backtest(BacktestFeed(days), Scripted([0.5, 0.5]), cfg, exec_feed=BacktestFeed(hours))
+    assert build_report(clean)["health"]["gap_fills"] == 0
+
+
+def test_delay_order_stays_pending_when_no_exec_bar_exists_before_the_next_signal_bar() -> None:
+    """Even more extreme gap: not one 1h bar at or after created_ts + 6 h exists before the next signal bar.
+    The order must stay pending (no fill at the wrong time, nothing crashes), and the pending-order rule
+    keeps the next signal from stacking a second order."""
+    days, hours = delay_setup()
+    created = T_START + timedelta(days=1)
+    before_deadline = [b for b in hours if b.open_ts < created + timedelta(hours=6)]
+    assert any(b.open_ts >= created for b in before_deadline)  # day 1's first six hours exist, then nothing
+    cfg = make_config(fill_delay=timedelta(hours=6), exec_timeframe=Timeframe.H1)
+    res = run_backtest(BacktestFeed(days), Scripted([0.5, 0.9]), cfg, exec_feed=BacktestFeed(before_deadline))
+    assert res.fills == () and res.rejections == ()
+    assert [d.outcome for d in res.decisions] == ["ORDER", "SKIPPED_PENDING_ORDER"]
+    assert len(res.unfilled_order_ids) == 1
+    assert res.equity[-1].quantity == 0
+    assert build_report(res)["health"]["gap_fills"] == 0
+
+
+def test_delay_pending_order_fills_on_the_first_bar_after_a_whole_missing_day_of_exec_data() -> None:
+    """Three signal days; day 1 has no 1h data at all, day 2 has all of it. The order created at the close of
+    day 0 stays pending through the day-1 signal (SKIPPED_PENDING_ORDER) and fills at the FIRST bar that
+    exists, the 00:00 bar of day 2 (a gap fill), before the day-2 decision is taken."""
+    d0, d1, d2 = make_bar(0, "100", "124"), make_bar(1, "124", "150"), make_bar(2, "150", "150")
+    hours = hour_bars_for_day(d2, [str(150 + h) for h in range(24)])  # opens at d1.ts + h
+    assert hours[0].open_ts == d1.ts
+    cfg = make_config(fill_delay=timedelta(hours=6), exec_timeframe=Timeframe.H1)
+    res = run_backtest(
+        BacktestFeed([d0, d1, d2]), Scripted([0.5, 0.5, 0.5]), cfg, exec_feed=BacktestFeed(hours)
+    )
+    (rec,) = res.fills
+    assert rec.fill.ts == d1.ts  # created_ts + 24 h, the first existing bar at or after created_ts + 6 h
+    assert rec.gap_fill is True and rec.reference_price == Dec("150")
+    assert res.decisions[1].outcome == "SKIPPED_PENDING_ORDER"
+    assert res.equity[1].quantity == 0 and res.equity[2].quantity == rec.fill.quantity
+    assert build_report(res)["health"]["gap_fills"] == 1
+
+
 def test_delay_mode_buy_resizes_and_fills_in_a_rising_market() -> None:
     """BLOCKER from the Phase 2a review: the stub sizes the quantity at close(t); if the price keeps
     rising during the 6h manual delay, the fill-time price is higher than what was sized for. The OLD
