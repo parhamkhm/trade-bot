@@ -5,12 +5,15 @@ from __future__ import annotations
 from collections.abc import Iterator
 from datetime import timedelta
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
+from tbot.backtest.benchmarks import run_benchmarks
 from tbot.backtest.config import BacktestConfig
 from tbot.backtest.engine import EngineError, _fast_window, run_backtest
 from tbot.backtest.feed import BacktestFeed, FeedError
+from tbot.backtest.report import build_report, is_run_invalid
 from tbot.backtest.result import BacktestResult
 from tbot.core.types import Bar, BarWindow, RegimeState, Side, TargetIntent, Timeframe
 from tbot.data.binance_loader import CANONICAL_HOLDOUT_START, HoldoutLockError
@@ -344,6 +347,22 @@ def test_delay_mode_buy_resizes_and_fills_in_a_rising_market() -> None:
     assert res.equity[1].quantity == Dec("97.34150") and res.equity[1].quantity > 0
 
 
+def test_next_open_mode_keeps_the_exchange_like_rejection_in_a_rising_market() -> None:
+    """Counterpart of the delay-mode resize test (coordinator decision): with fill_delay == 0 the BUY is NOT
+    resized. The same kind of price move (the next open gaps above what the order was sized for) leaves the
+    order rejected whole with INSUFFICIENT_FUNDS, counted in ``rejections``, with no ResizeRecord, and the
+    report flags the run as invalid."""
+    day0 = make_bar(0, "100", "100")
+    day1 = make_bar(0, "105", "105", start=day0.ts)  # gaps +5 %, far above the 1.5 % cost buffer
+    cfg = make_config(fee="50", slip="100", buffer="0")
+    res = run_backtest(BacktestFeed([day0, day1]), Scripted([1.0, 1.0]), cfg)
+    assert res.fills == () and res.resizes == ()
+    (rej,) = res.rejections
+    assert "INSUFFICIENT_FUNDS" in rej.reason
+    assert res.equity[1].quantity == 0
+    assert is_run_invalid(build_report(res))
+
+
 def test_delay_requires_exec_feed_and_finer_timeframe() -> None:
     days, _ = delay_setup()
     with pytest.raises(ValueError, match="exec_timeframe"):
@@ -436,3 +455,42 @@ def test_engine_level_holdout_guard_catches_a_custom_feed_that_skips_its_own_che
         run_backtest(_RawFeed(sealed), Scripted([0.0]), make_config(), allow_holdout=True)  # one lock
     monkeypatch.setenv("TBOT_UNSEAL_HOLDOUT", "G4")
     assert run_backtest(_RawFeed(sealed), Scripted([0.0]), make_config(), allow_holdout=True).n_bars == 1
+
+
+def _unseal_rows(log: Path) -> list[str]:
+    return [line for line in log.read_text(encoding="utf-8").splitlines() if "unsealed" in line]
+
+
+def _sealed_bars() -> list[Bar]:
+    # every bar closes inside the holdout (the first closes exactly at the boundary)
+    return bars_from_closes([100, 101, 103, 102], start=CANONICAL_HOLDOUT_START - timedelta(days=1))
+
+
+def test_unsealing_is_logged_once_per_run_not_once_per_bar(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("TBOT_UNSEAL_HOLDOUT", "G4")
+    bars = _sealed_bars()
+    res = run_backtest(_RawFeed(bars), Scripted([0.5]), make_config(), allow_holdout=True)
+    assert res.n_bars == 4
+    assert len(_unseal_rows(tmp_path / "HOLDOUT_LOG.md")) == 1  # 4 sealed bars, 1 log row
+
+
+def test_benchmarks_take_allow_holdout_so_a_g4_run_unseals_exactly_once_per_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """MAJOR (re-review): run_benchmarks re-runs the engine twice on the same feed; without
+    ``allow_holdout`` it raised HoldoutLockError right after the strategy run had unsealed, forcing a
+    second unsealing. With both locks set it must run, logging one unsealing per engine run."""
+    feed, cfg, strat = _RawFeed(_sealed_bars()), make_config(), Scripted([0.5])
+    monkeypatch.setenv("TBOT_UNSEAL_HOLDOUT", "G4")
+    res = run_backtest(feed, strat, cfg, allow_holdout=True)
+    with pytest.raises(HoldoutLockError):  # the first lock is missing for the benchmarks
+        run_benchmarks(feed, strat, cfg, res)
+    bench = run_benchmarks(feed, strat, cfg, res, allow_holdout=True)
+    assert bench.buy_and_hold.n_bars == 4 and bench.vol_matched.n_bars == 4
+    # strategy + B&H + vol-matched = three engine runs; the refused attempt is logged as a refusal
+    assert len(_unseal_rows(tmp_path / "HOLDOUT_LOG.md")) == 3
+    monkeypatch.delenv("TBOT_UNSEAL_HOLDOUT")  # the env lock alone must not be enough either
+    with pytest.raises(HoldoutLockError):
+        run_benchmarks(feed, strat, cfg, res, allow_holdout=True)

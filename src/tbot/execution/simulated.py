@@ -14,14 +14,17 @@ is handed each execution bar as it becomes available:
 * Quantity must already be a multiple of the step size, at least ``min_qty`` and at most ``max_qty``
   (checked at submit); the fill-time notional must reach ``min_notional``. Violations are rejected,
   never silently rounded -- exactly what the live exchange will do with the same ``SymbolFilters``.
-* **A BUY is resized, never rejected outright, when the price has moved against it since it was sized**
-  (manual-delay fills, D-051: the risk manager sizes at ``close(t)``, but the fill price is read minutes
-  or hours later). At fill time the quantity is capped at
+* **Manual-delay mode only (``fill_delay > 0``, D-051): a BUY is resized, not rejected outright, when the
+  price has moved against it since it was sized** (the risk manager sizes at ``close(t)``, but the fill
+  price is read minutes or hours later). At fill time the quantity is capped at
   ``floor_to_step(cash / (fill_price * (1 + taker_fee_rate)))`` -- the most the current cash can still
   afford at the actual fill price, mirroring what a manual trader does when placing the order. Every
   resize is reported as an explicit :class:`ResizeRecord` (requested vs. filled quantity, reason), never
-  silently. A SELL is never capped this way: it is rejected whole if the position does not cover it,
-  exactly as before -- a long-only book has no symmetric "resize down" for an exit.
+  silently, and is queryable per order via :meth:`SimulatedBroker.resize_of`.
+* In next-open mode (``fill_delay == 0``) there is NO resize: an automated market order that the exchange
+  cannot cover is rejected (``INSUFFICIENT_FUNDS``), counted as a fill rejection and flagged by the
+  report's INVALID RUN rule. A SELL is never capped in either mode: it is rejected whole if the position
+  does not cover it -- a long-only book has no symmetric "resize down" for an exit.
 * LIMIT orders are rejected: SPEC defines no limit-fill semantics yet (needs a maker/queue model).
 
 Fees and slippage come from ``FeeSchedule`` / ``SlippageModel`` objects built from configuration.
@@ -195,6 +198,7 @@ class _Order:
     filled_qty: Decimal = _ZERO
     avg_price: Decimal | None = None
     last_ts: datetime | None = None
+    resize: ResizeRecord | None = None
 
 
 class SimulatedBroker:
@@ -260,6 +264,14 @@ class SimulatedBroker:
         self._pending.remove(client_order_id)
 
     def get_order(self, client_order_id: str) -> OrderStatus:
+        """Current status of an order.
+
+        ``quantity`` is always the REQUESTED quantity. A BUY that was resized at fill time (manual-delay
+        mode only, see the module docstring) is reported as ``FILLED`` with ``filled_quantity < quantity``
+        (``remaining`` is then the resized-away amount, NOT working on the book; nothing is left pending).
+        ``OrderStatus`` has no resized flag (``core/types.py`` is frozen for this agent), so use
+        :meth:`resize_of` / :meth:`was_resized` to tell a resized fill from any other state.
+        """
         order = self._get(client_order_id)
         req = order.req
         return OrderStatus(
@@ -274,6 +286,13 @@ class SimulatedBroker:
             exchange_order_id=order.exchange_order_id,
             avg_fill_price=order.avg_price,
         )
+
+    def resize_of(self, client_order_id: str) -> ResizeRecord | None:
+        """The fill-time resize applied to this order (requested vs. filled quantity), if any."""
+        return self._get(client_order_id).resize
+
+    def was_resized(self, client_order_id: str) -> bool:
+        return self.resize_of(client_order_id) is not None
 
     def open_orders(self, symbol: str) -> list[OrderStatus]:
         return [self.get_order(cid) for cid in self._pending if self._orders[cid].req.symbol == symbol]
@@ -352,9 +371,10 @@ class SimulatedBroker:
 
     def _resolve_buy_quantity(self, req: OrderRequest, price: Decimal) -> tuple[Decimal, str | None]:
         """Cap a BUY's quantity to what current cash affords at the actual fill price (module docstring).
-        SELLs are never touched here. Returns ``(quantity, resize_reason)``; ``resize_reason`` is ``None``
-        when the full requested quantity is still affordable."""
-        if req.side is not Side.BUY:
+        Only in manual-delay mode (``fill_delay > 0``); in next-open mode and for SELLs the requested
+        quantity is returned untouched. Returns ``(quantity, resize_reason)``; ``resize_reason`` is
+        ``None`` when the full requested quantity is used."""
+        if req.side is not Side.BUY or self._delay <= timedelta(0):
             return req.quantity, None
         unit_cost = price * (1 + self._fees.taker_bps / _BPS)
         if unit_cost <= 0:
@@ -375,6 +395,7 @@ class SimulatedBroker:
             if quantity != req.quantity
             else None
         )
+        order.resize = resize
         notional = price * quantity
         fee = self._fees.fee(notional)
         reason = self._fill_problem(req, quantity, price, notional, fee)

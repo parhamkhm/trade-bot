@@ -91,21 +91,33 @@ def effective_warmup_bars(strategy: Strategy, regime: RegimeModel | None) -> int
     return max(strategy.warmup_bars, regime.warmup_bars if regime is not None else 1)
 
 
-def _check_not_sealed(bar: Bar, *, allow_holdout: bool, caller: str) -> None:
-    if not is_holdout_sealed(bar.ts):
-        return
-    env_matches = os.environ.get(HOLDOUT_UNSEAL_ENV) == HOLDOUT_UNSEAL_VALUE
-    unsealed = allow_holdout and env_matches
-    outcome = "unsealed" if unsealed else "refused: locks mismatched or absent"
-    # best-effort: an installed package with no repo root above it has nowhere to log
-    with contextlib.suppress(RuntimeError):
-        log_holdout_event(caller=caller, reason="backtest engine bar guard", outcome=outcome)
-    if not unsealed:
-        raise HoldoutLockError(
-            f"a bar closing at {bar.ts.isoformat()} falls in the sealed holdout; this engine-level "
-            "guard catches it even from a custom DataFeed that does not enforce the seal itself "
-            "(SPEC section 5.2, both locks required)"
-        )
+class _SealGuard:
+    """Engine-level holdout guard, one instance per run. A refusal raises and is logged; an unsealing is
+    logged ONCE per run (the first sealed bar), not once per bar, so ``research/HOLDOUT_LOG.md`` records
+    one entry per unsealed run."""
+
+    def __init__(self, *, allow_holdout: bool) -> None:
+        self._allow = allow_holdout
+        self._unseal_logged = False
+
+    def check(self, bar: Bar, *, caller: str) -> None:
+        if not is_holdout_sealed(bar.ts):
+            return
+        env_matches = os.environ.get(HOLDOUT_UNSEAL_ENV) == HOLDOUT_UNSEAL_VALUE
+        unsealed = self._allow and env_matches
+        if unsealed and self._unseal_logged:
+            return
+        outcome = "unsealed" if unsealed else "refused: locks mismatched or absent"
+        # best-effort: an installed package with no repo root above it has nowhere to log
+        with contextlib.suppress(RuntimeError):
+            log_holdout_event(caller=caller, reason="backtest engine bar guard", outcome=outcome)
+        if not unsealed:
+            raise HoldoutLockError(
+                f"a bar closing at {bar.ts.isoformat()} falls in the sealed holdout; this engine-level "
+                "guard catches it even from a custom DataFeed that does not enforce the seal itself "
+                "(SPEC section 5.2, both locks required)"
+            )
+        self._unseal_logged = True
 
 
 class _Peekable:
@@ -274,6 +286,7 @@ def run_backtest(
         if exec_feed is not None and config.exec_timeframe is not None
         else None
     )
+    guard = _SealGuard(allow_holdout=allow_holdout)
     previous: Bar | None = None
     for bar in feed.bars(config.symbol, config.timeframe):
         if bar.symbol != config.symbol or bar.timeframe != config.timeframe:
@@ -283,9 +296,9 @@ def run_backtest(
         if previous is not None and bar.ts <= previous.ts:
             raise EngineError(f"feed went backwards: {bar.ts} after {previous.ts}")
         previous = bar
-        _check_not_sealed(bar, allow_holdout=allow_holdout, caller="run_backtest:signal_feed")
+        guard.check(bar, caller="run_backtest:signal_feed")
         for exec_bar in cursor.pop_until(bar.ts) if cursor is not None else (bar,):
-            _check_not_sealed(exec_bar, allow_holdout=allow_holdout, caller="run_backtest:exec_feed")
+            guard.check(exec_bar, caller="run_backtest:exec_feed")
             run.execute(exec_bar)
         run.history.append(bar)
         run.mark(bar)

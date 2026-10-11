@@ -54,11 +54,24 @@ def run_benchmarks(
     *,
     regime: RegimeModel | None = None,
     exec_feed: DataFeed | None = None,
+    allow_holdout: bool = False,
 ) -> BenchmarkSet:
     """``regime`` is used only to compute the shared warm-up (see the module docstring); the regime
-    overlay itself is never applied to the benchmarks -- buy-and-hold stays an unscaled baseline."""
+    overlay itself is never applied to the benchmarks -- buy-and-hold stays an unscaled baseline.
+
+    ``allow_holdout`` is the first holdout lock and is passed on to BOTH benchmark runs, so a G4 run that
+    unsealed the holdout for the strategy does not die with ``HoldoutLockError`` in the benchmarks (which
+    would force a second unsealing). The feeds given here must already be unsealed by the caller."""
     warmup = effective_warmup_bars(strategy, regime)
-    bh = run_backtest(feed, BuyAndHold(warmup_bars=warmup), config, exec_feed=exec_feed)
+    bh = run_backtest(
+        feed, BuyAndHold(warmup_bars=warmup), config, exec_feed=exec_feed, allow_holdout=allow_holdout
+    )
     weight, capped = vol_match_weight(compute_metrics(strategy_result).vol, compute_metrics(bh).vol)
-    vm = run_backtest(feed, BuyAndHold(weight=weight, warmup_bars=warmup), config, exec_feed=exec_feed)
+    vm = run_backtest(
+        feed,
+        BuyAndHold(weight=weight, warmup_bars=warmup),
+        config,
+        exec_feed=exec_feed,
+        allow_holdout=allow_holdout,
+    )
     return BenchmarkSet(bh, vm, weight, capped)

@@ -8,7 +8,7 @@ from decimal import Decimal as Dec
 import pytest
 
 from tbot.core.config import CostConfig
-from tbot.core.types import Broker, OrderRequest, OrderState, OrderType, Side, Timeframe
+from tbot.core.types import Bar, Broker, OrderRequest, OrderState, OrderType, Side, Timeframe
 from tbot.execution.simulated import (
     BrokerError,
     FeeSchedule,
@@ -153,48 +153,107 @@ def test_min_notional_checked_at_fill() -> None:
     assert b.balances()["USDT"] == Dec("10000")
 
 
-def test_buy_is_resized_down_rather_than_rejected_when_cash_falls_short() -> None:
-    """A BUY whose requested quantity cash no longer covers at fill time is CAPPED, not rejected (the
-    delay-mode BLOCKER fix): a manual trader sizes when placing the order, so the broker mirrors that
-    at fill time instead of refusing the whole order over a price move. SELLs get no such treatment."""
-    b = broker("100")
+SIX_HOURS = timedelta(hours=6)
+CREATED = T_START + timedelta(days=1)  # close of daily bar 0, the created_ts used by ``req(..., 0)``
+
+
+def exec_bar(hours_after_created: int, open_: str) -> Bar:
+    """1h execution bar whose OPEN is ``hours_after_created`` after ``CREATED``."""
+    return make_bar(
+        0, open_, open_, tf=Timeframe.H1, start=CREATED + timedelta(hours=hours_after_created)
+    )
+
+
+def test_delay_mode_buy_is_resized_down_rather_than_rejected_when_cash_falls_short() -> None:
+    """Manual-delay mode: a BUY whose requested quantity cash no longer covers at fill time is CAPPED, not
+    rejected (the delay-mode BLOCKER fix): a manual trader sizes when placing the order, so the broker
+    mirrors that at fill time instead of refusing the whole order over a price move. SELLs get no such
+    treatment."""
+    b = broker("100", delay=SIX_HOURS)
     b.submit(req("big", Side.BUY, "10"))
     b.submit(req("short", Side.SELL, "1"))
-    rep = b.advance(make_bar(1, "100", "100"))
+    rep = b.advance(exec_bar(6, "100"))
     (rec,) = rep.fills
-    # price 100.05 (5 bps slip), unit cost 100.05 * 1.0035 = 100.400175, cash 100 -> floor to step
+    # price 100.05 (5 bps slip), unit cost 100.05 * 1.0035 = 100.400175, cash 100 -> floor to step 0.00001
     assert rec.fill.client_order_id == "big" and rec.fill.quantity == Dec("0.99601")
     assert rec.fill.price == Dec("100.05")
+    # hand-computed: notional 0.99601 * 100.05 = 99.6508005; fee = 35 bps of that
+    assert rec.fill.fee == Dec("99.6508005") * Dec("35") / Dec(10000) == Dec("0.34877780175")
+    assert rec.fill.fee_asset == "USDT"
+    # cash left = 100 - 99.6508005 - 0.34877780175: the resize left less than one step's cost behind
+    assert b.balances() == {"USDT": Dec("0.00042169825"), "BTC": Dec("0.99601")}
     (resize,) = rep.resizes
     assert resize.client_order_id == "big"
     assert resize.requested_quantity == Dec("10") and resize.filled_quantity == Dec("0.99601")
     assert "moved" in resize.reason
     assert [r.client_order_id for r in rep.rejections] == ["short"]  # SELL still rejected whole
     assert "INSUFFICIENT_FUNDS" in rep.rejections[0].reason
-    assert b.balances()["BTC"] == Dec("0.99601")
 
 
-def test_buy_resized_to_zero_or_below_min_qty_is_still_rejected() -> None:
+def test_resized_order_status_is_filled_with_requested_quantity_and_is_queryable() -> None:
+    """get_order reports a resized BUY as FILLED with filled_quantity < quantity; ``OrderStatus`` has no
+    flag for it (core/types.py is frozen), so ``resize_of``/``was_resized`` expose the resize."""
+    b = broker("100", delay=SIX_HOURS)
+    b.submit(req("big", Side.BUY, "10"))
+    assert not b.was_resized("big") and b.resize_of("big") is None  # not yet filled
+    b.advance(exec_bar(6, "100"))
+    st = b.get_order("big")
+    assert st.state is OrderState.FILLED
+    assert st.quantity == Dec("10") and st.filled_quantity == Dec("0.99601")
+    assert st.remaining == Dec("9.00399")  # resized away, not working
+    assert b.open_orders(SYMBOL) == []
+    assert b.was_resized("big")
+    record = b.resize_of("big")
+    assert record is not None and record.requested_quantity == Dec("10")
+    assert record.filled_quantity == Dec("0.99601")
+    with pytest.raises(UnknownOrderError):
+        b.was_resized("nope")
+
+
+def test_unresized_order_is_not_reported_as_resized() -> None:
+    b = broker(delay=SIX_HOURS)
+    b.submit(req("ok", Side.BUY, "1"))
+    b.advance(exec_bar(6, "100"))
+    assert b.get_order("ok").filled_quantity == Dec("1") and not b.was_resized("ok")
+
+
+def test_next_open_mode_does_not_resize_and_rejects_with_insufficient_funds() -> None:
+    """fill_delay == 0 (automated next-open fills): the exchange-like rejection is kept. The order is
+    rejected whole (INSUFFICIENT_FUNDS), nothing is booked, and there is no ResizeRecord -- the engine's
+    INVALID RUN rule then flags the run."""
+    b = broker("100")  # no delay
+    b.submit(req("big", Side.BUY, "10"))
+    rep = b.advance(make_bar(1, "100", "100"))
+    assert rep.fills == () and rep.resizes == ()
+    (rej,) = rep.rejections
+    assert rej.client_order_id == "big" and "INSUFFICIENT_FUNDS" in rej.reason
+    assert b.get_order("big").state is OrderState.REJECTED and not b.was_resized("big")
+    assert b.balances() == {"USDT": Dec("100"), "BTC": Dec("0")}
+
+
+def test_delay_mode_buy_resized_to_zero_is_still_rejected() -> None:
     """The resize can land below a tradable size; that must reject (never fill a dust order), but the
     ``ResizeRecord`` is still emitted so the report shows *why* (price moved), not just a bare refusal."""
-    b = broker("0.000001", fee="0", slip="0")  # below one step at price 1: floors to zero
+    b = broker("0.000001", fee="0", slip="0", delay=SIX_HOURS)  # below one step at price 1: floors to zero
     b.submit(req("dust", Side.BUY, "1"))
-    rep = b.advance(make_bar(1, "1", "1"))
+    rep = b.advance(exec_bar(6, "1"))
     assert rep.fills == ()
     (resize,) = rep.resizes
     assert resize.filled_quantity == Dec("0")
     assert "ZERO_QUANTITY" in rep.rejections[0].reason
+    assert b.was_resized("dust") and b.get_order("dust").state is OrderState.REJECTED
 
 
 def test_buy_resize_does_not_trigger_when_cash_was_sized_correctly() -> None:
-    """Sanity check for the next-open fill model: when cash was sized correctly at close(t) (the
-    stub risk manager's job), the fill-time cap must never trigger, so ordinary runs are unaffected --
-    the same setup as the hand-computed 5-bar example's first fill (fee 50 bps, slippage 100 bps)."""
-    b = broker(fee="50", slip="100")
-    b.submit(req("a", Side.BUY, "50"))
-    rep = b.advance(make_bar(1, "100", "100"))
-    assert rep.resizes == ()
-    assert rep.fills[0].fill.quantity == Dec("50") and rep.fills[0].fill.price == Dec("101.00")
+    """Sanity check: when cash was sized correctly at close(t) (the stub risk manager's job), the fill-time
+    cap must never trigger, in either mode -- the same setup as the hand-computed 5-bar example's first
+    fill (fee 50 bps, slippage 100 bps)."""
+    for delay, bar in ((timedelta(0), make_bar(1, "100", "100")), (SIX_HOURS, exec_bar(6, "100"))):
+        b = broker(fee="50", slip="100", delay=delay)
+        b.submit(req("a", Side.BUY, "50"))
+        rep = b.advance(bar)
+        assert rep.resizes == ()
+        assert rep.fills[0].fill.quantity == Dec("50") and rep.fills[0].fill.price == Dec("101.00")
 
 
 def test_gap_fill_is_flagged_when_the_fill_lands_after_the_expected_delay() -> None:

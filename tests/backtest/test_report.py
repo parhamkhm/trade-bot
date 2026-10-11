@@ -138,6 +138,25 @@ def test_clean_run_has_no_issues_and_is_not_flagged_invalid() -> None:
     assert "INVALID RUN WARNING" not in render_markdown(report)
 
 
+def test_benchmark_health_issues_make_the_run_invalid_even_if_the_strategy_is_clean() -> None:
+    """MINOR (re-review): the strategy never trades (clean), but buy & hold's BUY is rejected at fill time
+    (next-open mode, +5 % gap, no resize). A comparison against a benchmark that silently never entered is
+    meaningless, so the benchmark's issue must reach ``health.issues`` / ``is_run_invalid`` / the markdown."""
+    bars = [make_bar(0, "100", "100"), make_bar(1, "105", "105"), make_bar(2, "106", "107")]
+    cfg = make_config(fee="50", slip="100", buffer="0")
+    feed, strat = BacktestFeed(bars), Scripted([0.0])
+    res = run_backtest(feed, strat, cfg)
+    assert res.rejections == ()
+    assert not is_run_invalid(build_report(res))  # strategy alone: clean
+    bench = run_benchmarks(feed, strat, cfg, res)
+    assert bench.buy_and_hold.rejections != ()
+    report = build_report(res, bench)
+    assert is_run_invalid(report)
+    assert any(i.startswith("buy & hold:") and "rejected" in i for i in report["health"]["issues"])
+    assert not any(i.startswith("vol-matched") for i in report["health"]["issues"])  # weight 0: no orders
+    assert "INVALID RUN WARNING" in render_markdown(report)
+
+
 def test_cli_exits_non_zero_on_an_invalid_run(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

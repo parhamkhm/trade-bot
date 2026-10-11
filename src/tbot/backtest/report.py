@@ -57,6 +57,12 @@ def _health_issues(decisions: Counter[str], fills: int, rejections: int, unfille
     return issues
 
 
+def _result_issues(result: BacktestResult) -> list[str]:
+    decisions = Counter(d.outcome for d in result.decisions)
+    unfilled = len(result.unfilled_order_ids)
+    return _health_issues(decisions, len(result.fills), len(result.rejections), unfilled)
+
+
 def is_run_invalid(report: dict[str, Any]) -> bool:
     """True when the run has at least one issue serious enough that a report reader (or the CLI's exit
     code) should not treat the numbers as a clean result. See the module docstring."""
@@ -68,8 +74,9 @@ def build_report(result: BacktestResult, benchmarks: BenchmarkSet | None = None)
     first, last = result.equity[0].ts, result.equity[-1].ts
     costs = cfg.costs
     decisions = Counter(d.outcome for d in result.decisions)
-    n_fills, n_rejections = len(result.fills), len(result.rejections)
+    n_rejections = len(result.rejections)
     n_unfilled = len(result.unfilled_order_ids)
+    issues = _result_issues(result)
     caveats = list(CAVEATS)
     if costs.slippage_provisional:
         caveats.insert(0, _PROVISIONAL_SLIPPAGE_CAVEAT)
@@ -102,12 +109,17 @@ def build_report(result: BacktestResult, benchmarks: BenchmarkSet | None = None)
             "unfilled_orders_at_end": n_unfilled,
             "resizes": len(result.resizes),
             "gap_fills": sum(1 for f in result.fills if f.gap_fill),
-            "issues": _health_issues(decisions, n_fills, n_rejections, n_unfilled),
+            "issues": issues,
         },
         "metrics": {"strategy": _metrics_dict(compute_metrics(result))},
         "caveats": caveats,
     }
     if benchmarks is not None:
+        # a benchmark that silently failed to trade makes every comparison against it meaningless, so its
+        # health issues are folded into the same list that drives the INVALID RUN block and the CLI exit code
+        named = (("buy & hold", benchmarks.buy_and_hold), ("vol-matched B&H", benchmarks.vol_matched))
+        for label, bench in named:
+            issues.extend(f"{label}: {issue}" for issue in _result_issues(bench))
         report["metrics"]["buy_and_hold"] = _metrics_dict(compute_metrics(benchmarks.buy_and_hold))
         report["metrics"]["vol_matched_buy_and_hold"] = _metrics_dict(compute_metrics(benchmarks.vol_matched))
         report["vol_match"] = {"weight": benchmarks.vol_match_weight, "capped_at_1": benchmarks.capped}

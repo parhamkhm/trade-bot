@@ -1113,7 +1113,8 @@ def load_frame(
     )
     df = table.to_pandas()
     if not unsealed and not df.empty:
-        df = df.loc[df["ts"] < CANONICAL_HOLDOUT_START].reset_index(drop=True)
+        sealed = df["ts"].map(is_holdout_sealed).astype(bool)  # the one shared predicate
+        df = df.loc[~sealed].reset_index(drop=True)
     if as_float:
         for column in ("open", "high", "low", "close", "volume", "quote_volume"):
             df[column] = df[column].astype(float)
