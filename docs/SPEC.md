@@ -284,7 +284,11 @@ spread across ≥ 6 h. Every number carries where and when it was measured.
     |offset| + min_rtt / 2 < 500 ms.** Any non-200 or ban-type response is recorded; a 429/403/418 stops the
     run and it counts as failed; fewer than 108 valid calls (90 %) also counts as failed. **Pass ⇒ the G0
     clock item passes and G0 (public part) passes; fail ⇒ G0 stays failed.** The threshold is stricter than
-    the 1 s above because the method removes most of the latency uncertainty; it must not be relaxed;
+    the 1 s above because the method removes most of the latency uncertainty; it must not be relaxed.
+    *Operational meaning, fixed before the run (2026-10-11):* a valid call is HTTP 200 with a success payload
+    and a millisecond server time; `min_rtt` and the fastest 10 % (`ceil(calls/10)` = 12) are taken over valid
+    calls only, ties by call index (both choices can only make passing harder); a slot missed by more than
+    min(5 s, spacing/2) is skipped, never made up, and counts as not valid;
   - `accuracy` lists `btc_usdt` with readable price/quantity precision, minimum quantity and minimum order value;
   - median best bid/ask spread < 0.20 %.
 - *Reported, not gating:*
