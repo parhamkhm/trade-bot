@@ -235,6 +235,24 @@ def test_anomaly_resize_marks_the_run_invalid_without_any_rejection(delay: timed
     assert "INVALID RUN WARNING" in markdown and "(price_move 0, anomaly 1)" in markdown
 
 
+@pytest.mark.parametrize("delay", [timedelta(0), timedelta(hours=6)], ids=["next_open", "delay_6h"])
+def test_uncapped_anomaly_is_not_counted_as_a_resize_but_invalidates_the_run(delay: timedelta) -> None:
+    """An oversized request whose price then falls fills in full: no cap, so ``resizes`` stays 0, but the
+    D-082 anomaly record is counted under ``resizes_anomaly`` and the run is INVALID."""
+    res = oversized_run(delay, factor="1.02", fill_open="95")
+    assert res.rejections == () and len(res.fills) == 1
+    (rec,) = res.resizes
+    assert rec.kind == "anomaly" and rec.capped_quantity == rec.requested_quantity and rec.filled
+    report = build_report(res)
+    health = report["health"]
+    assert health["resizes"] == 0
+    assert health["resizes_anomaly"] == 1 and health["resizes_price_move"] == 0
+    assert is_run_invalid(report)
+    markdown = render_markdown(report)
+    assert "resizes 0 [actual caps]" in markdown and "(price_move 0, anomaly 1)" in markdown
+    assert "INVALID RUN WARNING" in markdown
+
+
 def test_genuine_rejection_still_fires_next_to_a_resize() -> None:
     """(d) A genuine fill-time rejection keeps the INVALID RUN rule, whatever the resize counts say."""
     bars = [make_bar(0, "1000", "1000"), make_bar(1, "0.0001", "0.0001")]

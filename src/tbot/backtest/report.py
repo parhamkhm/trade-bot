@@ -125,7 +125,8 @@ def build_report(result: BacktestResult, benchmarks: BenchmarkSet | None = None)
             "decisions": dict(decisions),
             "fill_rejections": n_rejections,
             "unfilled_orders_at_end": n_unfilled,
-            "resizes": len(result.resizes),
+            # actual fill-time caps only; an uncapped anomaly record (D-082) is not a resize
+            "resizes": sum(1 for r in result.resizes if r.capped_quantity != r.requested_quantity),
             "resizes_price_move": sum(1 for r in result.resizes if r.kind == "price_move"),
             "resizes_anomaly": n_anomalies,
             "gap_fills": sum(1 for f in result.fills if f.gap_fill),
@@ -225,7 +226,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         "Run health: decisions "
         + ", ".join(f"{k}={v}" for k, v in sorted(health["decisions"].items()))
         + f"; fill rejections {health['fill_rejections']}"
-        + f"; resizes {health['resizes']} (price_move {health['resizes_price_move']}, "
+        + f"; resizes {health['resizes']} [actual caps]; sizing records "
+        + f"(price_move {health['resizes_price_move']}, "
         + f"anomaly {health['resizes_anomaly']})"
         + f"; gap fills {health['gap_fills']}"
         + f"; unfilled at end {health['unfilled_orders_at_end']}",

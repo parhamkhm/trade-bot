@@ -637,12 +637,22 @@ takes over. The new choice is kept at least 3 months, and every switch needs Par
    *Answered from the Turkey server (2026-10-04, curl):* recent-trades window; `limit=1000` accepted (~29 h of
    BTCUSDT); `time` in integer ms; ids global across markets (D-037). The full probe run will re-confirm.
 7. Whether CI should run on GitHub-hosted runners for a private repo (minutes cost) or a self-hosted runner.
-8. **Fee currency on LBank spot buys (before phase 5b live reconciliation; Parham 2026-10-11).** The
-   SimulatedBroker charges buy fees in the quote asset. Many exchanges deduct the spot-buy fee from the base asset
-   received instead. Check LBank's actual behaviour (and record it in `docs/vendor/`) before reconciling live fills
-   against the portfolio, or every buy will show a small base-quantity mismatch.
-9. **Quote-amount market buys on LBank (before phase 5b).** D-081 assumes a live market buy can be sized by
-   quote amount at the open, so it behaves like the backtest's fill-time cap. This is unverified for LBank. If
-   phase 5b must send base-quantity market orders, the live exchange would reject a buy that the backtest caps
-   and fills; the broker must then size from a fresh price and cash immediately before sending, and the
-   backtest assumption must be revisited.
+8. LBank spot-buy fee asset — moved to the phase 5b checklist (§10, item 2).
+9. LBank quote-amount market buys — moved to the phase 5b checklist (§10, item 1).
+
+---
+
+## 10. Phase 5b checklist (order code; every item must be VERIFIED before any order code ships)
+
+Items stay **UNVERIFIED** until checked against LBank itself (docs, and a read-only or minimum-size test once the
+key exists), with the evidence recorded in `docs/vendor/` and the date here.
+
+1. **UNVERIFIED — quote-amount (USDT) market buy.** Does LBank spot accept a market BUY sized by quote amount
+   (USDT), as the `SimulatedBroker` docstring and D-081 assume (the backtest caps a BUY at fill time to what cash
+   affords at the real price)? If not, the live path needs explicit fill-time quantity sizing: a fresh price and
+   the real cash immediately before sending, rounded to the step, so live cannot reject a buy the backtest fills.
+2. **UNVERIFIED — spot-buy fee asset.** Which asset does LBank deduct the spot-buy fee in, BTC (base) or USDT
+   (quote)? The `SimulatedBroker` charges it in USDT. If LBank deducts BTC, live reconciliation must expect a
+   base quantity of `filled × (1 − fee rate)`, or every buy shows a mismatch and halts trading.
+3. **Signed-client clock calibration (D-080).** Offset to LBank server time measured from minimum-RTT samples,
+   applied to every signed request, re-calibrated periodically and after any timestamp rejection, and logged.
