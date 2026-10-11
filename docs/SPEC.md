@@ -363,7 +363,7 @@ Every G3 number is reported twice (D-051): fill at the next bar's open, and fill
 gating delay is **6 h, fixed**: the fill price is the open of the Binance 1h bar that starts 6 h after the signal
 bar's close, adjusted by **adverse** slippage (buys fill higher, sells lower). The slippage model is a
 depth-at-size curve: for each side, the median over all recorder order-book snapshots from the G1b start to the
-day phase 3 starts (that window is then frozen) of the cost in bps of walking the book for a given notional,
+day G1b passes (that window is then frozen; D-085) of the cost in bps of walking the book for a given notional,
 **measured from the best bid/ask**, interpolated piecewise-linearly in notional and extrapolated beyond the
 deepest recorded level at the slope of the last two points, evaluated at the trade's own notional with backtest
 equity fixed at 10,000 USDT; half the median spread is then added exactly once. It is calibrated once, logged in `research/EXPERIMENTS.md`, and applied
@@ -555,10 +555,10 @@ that opened it (under S1 the netted position is treated as one position opened b
 takes over. The new choice is kept at least 3 months, and every switch needs Parham's written approval in
 `docs/reports/`.
 
-### 7.2 Phase 3 pre-registration — final text, pending Parham's approval of this exact text
+### 7.2 Phase 3 pre-registration — final text v2, pending Parham's approval of this exact text
 
-Status: **final text submitted 2026-10-11 for approval; not in force and nothing runs until Parham approves
-this exact text.** Labels: **[RECORDED]** = copied from decisions already in this document; **[DECIDED
+Status: **final text v2, submitted 2026-10-11 for approval after Parham's review of v1 (2f719a6, merged to main
+unapproved and never in force); not in force and nothing runs until Parham approves this exact text.** Labels: **[RECORDED]** = copied from decisions already in this document; **[DECIDED
 2026-10-11]** = Parham's decisions on the 2026-10-11 draft; **[OPERATIONAL]** = a detail needed to make a
 decided item exact, fixed now, before any result. Nothing below may change after any Phase 3 result is seen.
 Engine commits must be at or after `8d99335`; the sealed holdout (from `holdout_start` = 2025-10-01) stays sealed.
@@ -589,11 +589,42 @@ OOS series covers 2020-01-01 → 2025-09-30 (≈ 2,100 days).
   day before the period starts.
 - Each strategy is replayed from the anchor 2018-01-01 in every period [RECORDED §7.1]; a parameter change at a
   period boundary is charged as a trade [RECORDED §7.1].
-- **Per-period selection:** the grid point with the highest annualised Sharpe (365, after all costs, **6 h
-  manual-delay fills**) on the training window; ties go to the base point.
+- **Per-period selection** [DECIDED 2026-10-11]: among a candidate's eligible points, the one with the highest
+  annualised Sharpe (365, after all costs, **6 h manual-delay fills**) computed for every point over the
+  **same days**: the candidate's eligible points' **common tradable days** inside that training window (from the
+  latest first-tradable close among the eligible points to the end of the window), never over each point's own
+  span; ties go to the base point.
 - [OPERATIONAL] A grid point is **eligible** for a period only if it has at least 365 tradable days inside that
   period's training window (a point's first tradable close is the close at which all its indicators have their
-  full window). If no point of a candidate is eligible, the candidate is flat for that period.
+  full window). If no point of a candidate is eligible, the candidate is flat for that period. Training-window
+  days are the daily closes with ts in [2018-06-01 00:00, period start 00:00) UTC; the last research daily close
+  is 2025-09-30 00:00 UTC (the bar closing 2025-10-01 00:00 is sealed).
+- **Eligibility table** [OPERATIONAL, computed 2026-10-11 from the Binance BTCUSDT data on hand: 2,829 daily
+  closes 2018-01-02 → 2025-09-30 with no gaps, 16,963 4h closes; first tradable close = the first close at which
+  S0's σ̂ (151 daily closes), ATR20 (21) and every strategy window are full; ✓ = eligible, – = not]. Columns are
+  the start months of the 12 test periods.
+
+| Strategy | Point | First tradable close (UTC) | 2020-01 | 2020-07 | 2021-01 | 2021-07 | 2022-01 | 2022-07 | 2023-01 | 2023-07 | 2024-01 | 2024-07 | 2025-01 | 2025-07 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| C1 | (10, 28, 50) | 2018-06-01 00:00 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| C1 | (20, 55, 100) base | 2018-06-01 00:00 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| C1 | (40, 110, 200) | 2018-07-21 00:00 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| C2 | (15, 45, 90) | 2018-06-01 00:00 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| C2 | (30, 90, 180) base | 2018-07-01 00:00 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| C2 | (60, 180, 360) | 2018-12-28 00:00 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| C3 | 1d f=(8,16,32) | 2019-01-20 00:00 | – | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| C3 | 1d f=(16,32,64) base | 2020-02-08 00:00 | – | – | – | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| C3 | 1d f=(32,64,128) | 2022-03-17 00:00 | – | – | – | – | – | – | – | ✓ | ✓ | ✓ | ✓ | ✓ |
+| C3 | 4h f=(8,16,32) | 2018-06-01 00:00 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| C3 | 4h f=(16,32,64) | 2018-06-01 00:00 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| C3 | 4h f=(32,64,128) | 2018-09-15 16:00 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| C4 | p=10 | 2019-01-21 00:00 | – | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| C4 | p=20 base | 2019-01-21 00:00 | – | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| C4 | p=30 | 2019-01-21 00:00 | – | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| C5 | x=5 | 2018-07-20 00:00 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| C5 | x=10 base | 2018-07-20 00:00 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| C5 | x=15 | 2018-07-20 00:00 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+
 - Pooled OOS series = the 12 test periods concatenated [RECORDED §7.1].
 
 **C. Strategies and exact grids** [DECIDED 2026-10-11; exact definitions OPERATIONAL]
@@ -634,17 +665,25 @@ stress stays profitable.
 - PBO [DECIDED]: CSCV per candidate over its grid, on the daily manual-delay return matrix of the grid points over
   2018-06-01 → 2025-09-30, **S = 16** equal contiguous blocks, Sharpe as the measure. For C3 the grid is all 6
   points. A point is included from its first tradable close; days before it count as flat.
-- Neighbours [OPERATIONAL]: the ±1 step of a point is the adjacent scale (C1, C2, C3 speed), the adjacent p (C4)
-  or the adjacent x (C5); for C3 the timeframe is not a neighbour axis.
+- **Neighbour test for per-period-selected candidates** [DECIDED 2026-10-11]: take the grid point P that the
+  candidate's own selection procedure picks on the final training window ending at `holdout_start`; compute P's
+  **fixed-parameter** pooled OOS manual-delay Sharpe over the 12 test periods; each ±1-step neighbour of P, also
+  run with fixed parameters over the same days, must keep ≥ 70 % of it. The ±1 step is the adjacent scale (C1,
+  C2, C3 speed), the adjacent p (C4) or the adjacent x (C5); for C3 the timeframe is not a neighbour axis
+  [OPERATIONAL]. A point at the edge of its grid has one neighbour.
+- **Buy-and-hold benchmark for the G3 ratios** [DECIDED 2026-10-11]: BTCUSDT at weight 1, held continuously over
+  the pooled OOS days, with the same fee and slippage model and the entry charged once (no rebalancing); computed
+  in both fill modes, and the gating ratios (maxDD, Sharpe) use the manual-delay version.
 - All gating numbers use the pooled OOS manual-delay series; next-open numbers are reported alongside.
 
 **F. Costs** [RECORDED D-060, DECIDED 2026-10-11]
 - Fees: LBank spot VIP 0, taker 10 bps per side (taker assumed).
 - Slippage: the **D-067 provisional curve** (from the G0 probe). **Every Phase 3 number is labelled PROVISIONAL.**
-- **The G3 verdict is issued only after a recompute with the frozen LBank depth-at-size curve** (G3 model: the
-  median over recorder snapshots from the G1b start to the day G1b passes; that window is then frozen and logged).
-- In the recompute, every choice of the provisional run is **kept** (the per-period parameter choices and the grid
-  points included). Only returns, costs and the gate statistics are recomputed, so the recompute selects nothing.
+- **The G3 verdict comes from ONE complete rerun** of this whole pre-registered procedure (A–I) with the frozen
+  LBank depth-at-size curve (§7 G3 model; window from the G1b start to the day G1b passes, then frozen and logged,
+  D-085), **including per-period parameter selection**. The provisional results are informational only and never
+  enter the verdict. No choice between keeping and re-selecting parameters may be made after seeing any result
+  [DECIDED 2026-10-11; corrects v1].
 - ×2 cost stress: 20 bps fee per side plus twice the slippage curve, for S0 and S1 (gating) and reported for every
   candidate.
 
@@ -668,14 +707,25 @@ version.** Engine at or after `8d99335` (D-081 fill-time sizing, D-082 resize cl
 - Steps 1–5 are computed PROVISIONAL first (F). Steps 6–7 happen only after the frozen-curve recompute and Parham's
   G3 decision. S2 applies only from phase 7b; S3 is ablation only.
 
-**I. Robustness** [RECORDED G3, D-071]: ETH/USDT with the same rules and parameters (gating: Sharpe > 0). S&P 500
-and Nasdaq-100 (Stooq, daily, 252-day annualisation, price index) with the same daily rules (C3 on 1d only),
-reported for context only, never a gate.
+**I. Robustness** [RECORDED G3, D-071; DECIDED 2026-10-11]: ETH/USDT runs with the same rules and **BTC's
+per-period parameter choices unchanged** (no re-selection on ETH); gating: Sharpe > 0. S&P 500 and Nasdaq-100
+(Stooq, daily, 252-day annualisation, price index) run with the same daily rules and BTC's per-period choices
+unchanged (C3 on 1d only; a period whose BTC choice is a 4h point is flat for the indices), reported for context
+only, never a gate.
 
 **J. Data rules** [DECIDED 2026-10-11]
-- **D-040 open:** Phase 3 may run while D-040 is open. No Phase 3 strategy reads bar volume, enforced by
-  `tests/strategies/test_no_volume_dependency.py`. Any future strategy that uses volume is blocked until D-040 is
-  closed.
+- **D-040 open:** Phase 3 may run while D-040 is open. No Phase 3 strategy reads bar volume, enforced by two tests
+  kept side by side: the static `tests/strategies/test_no_volume_dependency.py`, and the behavioural
+  `tests/strategies/test_volume_invariance.py` — S0 and all 18 grid points run through the real engine path
+  twice, with the original volume and with volume replaced (random, and separately NaN); targets, orders and
+  equity must be bit-identical; parametrised over the registry `tbot.strategies.phase3_registry`; with a
+  negative control (a volume-dependent dummy strategy must make it fail). Any future strategy that uses volume
+  is blocked until D-040 is closed.
+- **4h ATR rule test:** `tests/strategies/test_c3_4h_daily_atr.py` proves the 4h C3 points use only S0's daily
+  ATR20 of the last COMPLETED daily bar (changing any daily bar that is not yet closed at a 4h decision, or any
+  4h-only data, leaves the stop level unchanged; changing the last completed daily bar changes it).
+- Until the strategies exist, the strategy-specific cases of both tests skip with the reason "not implemented
+  yet"; a strategy PR may not merge while any of its cases skips.
 - **C6 (order book):** option (ii), forward collection. Not evaluated in Phase 3 and **no proxy trials**, so the DSR
   trial count is not inflated. The LBank recorder keeps collecting. **Earliest evaluation date: 2027-10-10**
   (365 days of LBank book history from 2026-10-10 13:40 UTC). Any evaluation must be pre-registered before then
@@ -773,6 +823,7 @@ reported for context only, never a gate.
 | D-082 | **Resize anomalies by cause — post-review clarification, made before any Phase 3 result (Parham, 2026-10-11; replaces the fixed 1 % threshold briefly tried in review).** For EVERY BUY that carries a sizing reference (the signal-bar close and the cash at submit time, passed by the engine through `SimulatedBroker.submit(..., sizing_price=, sizing_cash=)`; `core/types.py` unchanged), the broker tests at fill time whether `requested_qty × sizing_price × (1 + taker fee) ≤ sizing_cash`. Not affordable ⇒ `anomaly` (a sizing bug), recorded whether or not a cap follows and whatever the price did, and the run is INVALID (CLI exit 3) like a fill rejection. Affordable but capped at fill ⇒ counted `price_move` (the reason says whether the open rose above the sizing price or only fees/slippage forced the cap), whatever the size of the move; the run stays valid. A capped BUY with no sizing reference ⇒ `anomaly` (fail safe); an uncapped BUY without a reference is not recorded. `ResizeRecord` carries `capped_quantity`, `filled`, `kind`, `sizing_price`, `sizing_cash`. Real data (laptop-measured, final engine, 6 h delay, SMA100 1d): 21 resizes, all `price_move`, 0 anomalies | a fixed percentage threshold would flag genuine 2–6 % price moves over a 6 h delay as bugs (six such moves in the BTC data) while missing an oversized order whose price then fell; testing affordability at the sizing reference separates a mis-sized order from price movement exactly |
 | D-083 | **G0 clock item: scope — post-hoc scoping clarification, written after the 2026-10-11 clock verdict (Parham, 2026-10-11).** G0 stays recorded as FAIL on the clock item (rule of commit 6dd5b07) and PASS on every other item; the criterion itself is unchanged. The clock item gates **signed (private) requests only**: it is a blocker for the first phase that sends any signed request (the postponed private G0 read, before phase 7a, and phase 5b), and it does **not** gate phases 1–4, which send no signed request. Before the first signed request the functional signed-request test (§10.3, once approved) must also pass | the clock item exists because LBank validates the timestamp of signed requests; phases 1–4 only read public endpoints and Binance files, so a clock offset cannot affect them; written after the verdict and labelled as such so it is not mistaken for a pre-registered rule |
 | D-084 | **Design constraint: network round trip Turkey server ↔ LBank public API ≈ 1.1–1.3 s** (min 1090 ms, median ≈ 1300 ms, p95 ≈ 2.8 s, max 6.8 s; 120 `timestamp.do` calls, 2026-10-11 16:17–17:17 UTC, `research/reports/g0_lbank_clock_20261011/`). **No strategy may depend on execution or reaction faster than a few seconds**; every latency assumption in a backtest or live component must be at least this slow | measured from the only server we have; a strategy that needs sub-second reaction would be untestable and unexecutable from here |
+| D-085 | **Slippage calibration window — amendment, decided 2026-10-11 before any Phase 3 result (Parham).** The G3 depth-at-size curve is the median over recorder snapshots from the **G1b start to the day G1b passes** (then frozen and logged), replacing "to the day phase 3 starts". §7 G3 and §7.2 F state the same single rule. Phase 3 runs first with the D-067 provisional curve, labelled PROVISIONAL; the G3 verdict comes only from one complete rerun with the frozen curve (§7.2 F) | phase 3 starts before the LBank book history is long enough: G1b can start no earlier than 2026-10-17, so a window ending when phase 3 starts would be empty or too short |
 
 ---
 
