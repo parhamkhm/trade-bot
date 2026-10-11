@@ -51,7 +51,11 @@ class RefParams:
     tick: Decimal = Decimal("0.01")
     step: Decimal = Decimal("0.00001")
     min_notional: Decimal = Decimal(1)
-    drift_tolerance: Decimal = Decimal("0.02")
+    # SPEC 7.1 S0 relative rebalance band (engine default 0.25): while invested, a resize trades only if
+    # |target - now| >= band * max(target, now). Entries from flat and exits to zero always trade. This
+    # reference is STOPLESS by construction (no protective stop), so it is compared with engine runs made
+    # with enforce_stops=False.
+    rebalance_band: Decimal = Decimal("0.25")
     initial_cash: Decimal = Decimal(10_000)
     # "close": the engine's rule, sized at close(t) (plus the optional buffer; the BUY is then capped at fill
     # time). "oracle_open": ablation only, sized with
@@ -155,7 +159,7 @@ def reference_orders(bars: Sequence[Bar], weights: pd.Series, params: RefParams 
         target = Decimal(str(float(w)))
         held = qty * bar.close
         weight_now = held / eq
-        if qty > 0 and target > 0 and abs(target - weight_now) < p.drift_tolerance:
+        if qty > 0 and target > 0 and abs(target - weight_now) < p.rebalance_band * max(target, weight_now):
             continue
         gap = target * eq - held
         if gap > 0:

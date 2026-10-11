@@ -34,7 +34,8 @@ from tbot.backtest.result import ORDER, BacktestResult
 __all__ = ["build_report", "is_run_invalid", "render_markdown"]
 
 CAVEATS = (
-    "Phase-2 engine: stops are not executed; the risk manager is a stub (sizing, filters, drift tolerance).",
+    "Phase-2/3 engine: the risk manager is a stub (sizing, filters, SPEC 7.1 relative rebalance band); "
+    "protective stops are executed by the engine when enforced (see the stops line).",
     "Vol-matched buy-and-hold uses the strategy realised volatility on the same window (ex post).",
 )
 
@@ -54,6 +55,7 @@ def _health_issues(
     rejections: int,
     unfilled: int,
     anomalies: int = 0,
+    cancelled: int = 0,
 ) -> list[str]:
     issues = []
     if rejections > 0:
@@ -64,11 +66,12 @@ def _health_issues(
             "sizing price, or carried no sizing reference (resize anomaly): a sizing bug, not price movement"
         )
     orders = decisions.get(ORDER, 0)
-    unresolved = orders - fills - unfilled
+    unresolved = orders - fills - unfilled - cancelled
     if unresolved > max(1, orders // 2):
         issues.append(
             f"{orders} order(s) were approved but only {fills} filled ({unfilled} still pending at the "
-            "end): decisions and fills have come apart (should not happen by construction)"
+            f"end, {cancelled} cancelled by the engine): decisions and fills have come apart (should not "
+            "happen by construction)"
         )
     return issues
 
@@ -77,7 +80,15 @@ def _result_issues(result: BacktestResult) -> list[str]:
     decisions = Counter(d.outcome for d in result.decisions)
     unfilled = len(result.unfilled_order_ids)
     anomalies = sum(1 for r in result.resizes if r.kind == "anomaly")
-    return _health_issues(decisions, len(result.fills), len(result.rejections), unfilled, anomalies)
+    strategy_fills = len(result.fills) - len(result.stop_fills)  # stop exits have no approved-order decision
+    return _health_issues(
+        decisions,
+        strategy_fills,
+        len(result.rejections),
+        unfilled,
+        anomalies,
+        result.orders_cancelled_by_engine,
+    )
 
 
 def is_run_invalid(report: dict[str, Any]) -> bool:
@@ -119,7 +130,13 @@ def build_report(result: BacktestResult, benchmarks: BenchmarkSet | None = None)
         # RiskManager passed to run_backtest may ignore these config values entirely.
         "stub_risk_manager": {
             "buy_buffer_bps": str(cfg.buy_buffer_bps),
-            "drift_tolerance": cfg.drift_tolerance,
+            "rebalance_band": cfg.rebalance_band,
+        },
+        "stops": {
+            "enforced": cfg.enforce_stops,
+            "stop_fills": len(result.stop_fills),
+            "entries_refused_invalid_stop": result.entries_refused_invalid_stop,
+            "orders_cancelled_by_engine": result.orders_cancelled_by_engine,
         },
         "health": {
             "decisions": dict(decisions),
@@ -186,6 +203,16 @@ _TRADE_ROWS: tuple[tuple[str, str, str], ...] = (
 )
 
 
+def _stops_line(stops: dict[str, Any]) -> str:
+    if not stops["enforced"]:
+        return "- Protective stops: NOT enforced in this run (benchmark / stopless cross-check)"
+    return (
+        f"- Protective stops: enforced; stop fills {stops['stop_fills']}, entries refused for an invalid "
+        f"stop {stops['entries_refused_invalid_stop']}, orders cancelled by the engine "
+        f"{stops['orders_cancelled_by_engine']}"
+    )
+
+
 def render_markdown(report: dict[str, Any]) -> str:
     metrics: dict[str, dict[str, Any]] = report["metrics"]
     names = {
@@ -206,8 +233,9 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- Window: {report['first_bar_close']} to {report['last_bar_close']} ({report['n_bars']} bars)",
         f"- Costs: taker {costs['taker_fee_bps']} bps, slippage {costs['slippage_bps']} bps per side; "
         f"fill delay {costs['fill_delay']}",
-        f"- Stub risk manager: buy buffer {stub['buy_buffer_bps']} bps, drift tolerance "
-        f"{stub['drift_tolerance']:g} (phase-2 stand-in -- see caveats)",
+        f"- Stub risk manager: buy buffer {stub['buy_buffer_bps']} bps, relative rebalance band "
+        f"{stub['rebalance_band']:g} (phase-2 stand-in -- see caveats)",
+        _stops_line(report["stops"]),
         f"- Start equity: {report['initial_cash']}",
         "",
         "| Metric | " + " | ".join(names[c] for c in cols) + " |",

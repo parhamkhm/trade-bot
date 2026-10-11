@@ -8,11 +8,15 @@ same ``RiskManager`` interface that live trading uses. It does exactly this and 
 * exchange filters: quantity floored to the step size, ``min_qty`` / ``min_notional`` refusals;
 * affordability: a BUY is capped so that notional + fee + slippage (+ optional buffer, default 0) fits
   into cash at the signal close; the broker re-caps it at fill time from the real fill price;
-* a drift tolerance so a constant target (e.g. buy-and-hold at weight 1.0) does not re-trade every bar
-  because of price drift. Entries from flat and exits to zero are never blocked by it. The real
-  rebalance-band rule (SPEC section 7.1, S0) needs the strategy state and belongs to the phase 3/4 allocator.
+* the SPEC section 7.1 (S0) rebalance rule: entries (flat -> invested) and exits (target 0) ALWAYS trade;
+  vol-driven resizing trades only while invested, and only when
+  ``|w_target - w_now| >= band * max(w_target, w_now)`` (default band 0.25, ``w_now`` = the weight drifted to
+  the signal close). The comparison is done in exact ``Decimal`` arithmetic on the equity-scaled values, so
+  the boundary (exactly 25 %) trades and 24.9 % does not, with no float noise. A band of 1.0 never resizes
+  while invested (what the buy-and-hold benchmarks need). Protective stops are executed by the engine, not
+  here, so they are never subject to the band.
 
-It does NOT check stops, exposure, loss limits, data staleness or trading states.
+It does NOT check exposure, loss limits, data staleness or trading states.
 """
 
 from __future__ import annotations
@@ -53,16 +57,18 @@ class StubRiskManager:
         taker_fee_bps: Decimal,
         slippage_bps: Decimal,
         buy_buffer_bps: Decimal = Decimal(0),
-        drift_tolerance: float = 0.02,
+        rebalance_band: float = 0.25,
         id_prefix: str = "bt",
     ) -> None:
+        if not 0.0 <= rebalance_band <= 1.0:
+            raise ValueError("rebalance_band must be in [0, 1]")
         # Cash needed per unit of notional at the signal close: slippage, fee on the slipped notional and an
         # optional extra buffer (default 0; the broker caps a BUY at fill time anyway) compound
         # multiplicatively (fee is charged on the slipped fill value).
         self._cost_factor = (
             (1 + slippage_bps / _BPS) * (1 + taker_fee_bps / _BPS) * (1 + buy_buffer_bps / _BPS)
         )
-        self._tolerance = drift_tolerance
+        self._band = Decimal(str(rebalance_band))
         self._prefix = id_prefix
         self._seq = 0
 
@@ -73,9 +79,13 @@ class StubRiskManager:
         target = Decimal(str(intent.target_weight))
         held_value = portfolio.base_qty * price
         gap_value = target * equity - held_value
-        drift = abs(intent.target_weight - weight_now)
-        if portfolio.base_qty > 0 and intent.target_weight > 0 and drift < self._tolerance:
-            return Approved(intent, None, f"within drift tolerance (now {weight_now:.4f})")
+        target_value = target * equity
+        if (
+            portfolio.base_qty > 0
+            and target > 0
+            and abs(gap_value) < self._band * max(target_value, held_value)
+        ):
+            return Approved(intent, None, f"within rebalance band (now {weight_now:.4f})")
         if gap_value > 0:
             side = Side.BUY
             budget = min(gap_value, portfolio.cash_quote / self._cost_factor)

@@ -43,14 +43,14 @@ def five_bars() -> list[Bar]:
 
 
 # ---------------------------------------------------------------------------------------------
-# the hand-computed 5-bar example (fee 0.5 %, slippage 1 %, start cash 10 000, tolerance 2 %)
+# the hand-computed 5-bar example (fee 0.5 %, slippage 1 %, start cash 10 000, 25 % band)
 # ---------------------------------------------------------------------------------------------
 #
 # bar  open close  decision at close
 #  0   100   100   target 0.50 -> BUY  50.00000 (5000 / 100)
 #  1   100   120   BUY fills at 100 * 1.01 = 101.00; notional 5050.00; fee 25.25
 #                  cash 4924.75, qty 50, equity 4924.75 + 50*120 = 10924.75
-#                  target 0.55 vs held 6000/10924.75 = 0.5492 -> |drift| < 0.02 -> no order
+#                  target 0.55 vs held 6000/10924.75 = 0.5492 -> |gap| 0.0008 < 25 % band -> no order
 #  2   120    90   equity 9424.75; target 0 -> SELL 50
 #  3    90    95   SELL fills at 90 * 0.99 = 89.10; notional 4455; fee 22.275; cash 9357.475, flat
 #                  target 0.40 -> BUY floor(9357.475*0.4 / 95, 5dp) = 39.39989
@@ -341,7 +341,9 @@ def test_delay_fill_lands_on_the_next_available_bar_when_the_deadline_bars_are_m
     gapped = [b for b in hours if b.open_ts not in missing]
     assert len(gapped) == len(hours) - 2
     cfg = make_config(fill_delay=timedelta(hours=6), exec_timeframe=Timeframe.H1)
-    res = run_backtest(BacktestFeed(days), Scripted([0.5, 0.5]), cfg, exec_feed=BacktestFeed(gapped))
+    # The second weight is 1.0, not 0.5: a 0.55-vs-0.5 drift is now inside the 25 % relative rebalance band
+    # (SPEC 7.1) and would create no second order, but this test needs a pending order at the end.
+    res = run_backtest(BacktestFeed(days), Scripted([0.5, 1.0]), cfg, exec_feed=BacktestFeed(gapped))
     (rec,) = res.fills
     assert rec.fill.ts == created + timedelta(hours=8)
     assert rec.gap_fill is True

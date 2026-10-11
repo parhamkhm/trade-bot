@@ -18,7 +18,7 @@ Feeds must be re-iterable (``BacktestFeed`` is), because each benchmark replays 
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 
 from tbot.backtest.config import BacktestConfig
@@ -66,10 +66,14 @@ def run_benchmarks(
     would force a second unsealing). The feeds given here must already be unsealed by the caller.
     ``now`` is the instant stamped on the holdout-log rows (``None``: the real UTC clock)."""
     warmup = effective_warmup_bars(strategy, regime)
+    # SPEC 7.2 E: buy-and-hold is held continuously, entry charged once, never stopped and never
+    # rebalanced. BuyAndHold still reports a (far) stop to satisfy D-050, so stops are switched off here,
+    # and a band of 1.0 means "never resize while invested".
+    bench_config = replace(config, enforce_stops=False, rebalance_band=1.0)
     bh = run_backtest(
         feed,
         BuyAndHold(warmup_bars=warmup),
-        config,
+        bench_config,
         exec_feed=exec_feed,
         allow_holdout=allow_holdout,
         now=now,
@@ -78,7 +82,7 @@ def run_benchmarks(
     vm = run_backtest(
         feed,
         BuyAndHold(weight=weight, warmup_bars=warmup),
-        config,
+        bench_config,
         exec_feed=exec_feed,
         allow_holdout=allow_holdout,
         now=now,
