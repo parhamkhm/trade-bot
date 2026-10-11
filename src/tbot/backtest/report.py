@@ -8,9 +8,14 @@ Two things make a run outright suspect, not just worth a footnote, and are surfa
 ``report["health"]["issues"]`` plus a prominent block at the top of the markdown (``is_run_invalid``
 summarises the same check for a caller, e.g. the CLI, that needs a single boolean):
 
-* any fill-time rejection (``fill_rejections > 0``) -- before the delay-mode BLOCKER fix (Phase 2a review),
-  a market move during the manual delay could reject every single BUY, silently leaving a benchmark or
-  strategy at weight 0 for the whole run;
+* any fill-time rejection (``fill_rejections > 0``) -- e.g. below min_notional, or a cash cap that leaves
+  nothing tradable;
+* any resize ANOMALY (``resizes_anomaly > 0``): in both fill modes a BUY is capped at fill time to what cash
+  affords at the real price (D-051). The cap is classified by cause: a request that was affordable at the
+  sizing price (the signal-bar close) and became unaffordable because the price moved is counted under
+  ``resizes_price_move`` and does not invalidate the run, however large the move; a request that was not
+  affordable even at the sizing price (or carried no sizing reference) was mis-sized, is an anomaly and
+  invalidates the run just like a rejection;
 * approved orders that neither filled nor are still pending at the end -- more than half of them vanishing
   this way means the accounting between decisions and fills has come apart, which should never happen by
   construction and is worth a loud flag if it ever does.
@@ -43,10 +48,21 @@ def _metrics_dict(m: Metrics) -> dict[str, Any]:
     return asdict(m)
 
 
-def _health_issues(decisions: Counter[str], fills: int, rejections: int, unfilled: int) -> list[str]:
+def _health_issues(
+    decisions: Counter[str],
+    fills: int,
+    rejections: int,
+    unfilled: int,
+    anomalies: int = 0,
+) -> list[str]:
     issues = []
     if rejections > 0:
         issues.append(f"{rejections} order(s) were rejected at fill time -- the result may be cost-biased")
+    if anomalies > 0:
+        issues.append(
+            f"{anomalies} BUY(s) were resized at fill time although the request was not affordable at the "
+            "sizing price, or carried no sizing reference (resize anomaly): a sizing bug, not price movement"
+        )
     orders = decisions.get(ORDER, 0)
     unresolved = orders - fills - unfilled
     if unresolved > max(1, orders // 2):
@@ -60,7 +76,8 @@ def _health_issues(decisions: Counter[str], fills: int, rejections: int, unfille
 def _result_issues(result: BacktestResult) -> list[str]:
     decisions = Counter(d.outcome for d in result.decisions)
     unfilled = len(result.unfilled_order_ids)
-    return _health_issues(decisions, len(result.fills), len(result.rejections), unfilled)
+    anomalies = sum(1 for r in result.resizes if r.kind == "anomaly")
+    return _health_issues(decisions, len(result.fills), len(result.rejections), unfilled, anomalies)
 
 
 def is_run_invalid(report: dict[str, Any]) -> bool:
@@ -76,6 +93,7 @@ def build_report(result: BacktestResult, benchmarks: BenchmarkSet | None = None)
     decisions = Counter(d.outcome for d in result.decisions)
     n_rejections = len(result.rejections)
     n_unfilled = len(result.unfilled_order_ids)
+    n_anomalies = sum(1 for r in result.resizes if r.kind == "anomaly")
     issues = _result_issues(result)
     caveats = list(CAVEATS)
     if costs.slippage_provisional:
@@ -107,7 +125,10 @@ def build_report(result: BacktestResult, benchmarks: BenchmarkSet | None = None)
             "decisions": dict(decisions),
             "fill_rejections": n_rejections,
             "unfilled_orders_at_end": n_unfilled,
-            "resizes": len(result.resizes),
+            # actual fill-time caps only; an uncapped anomaly record (D-082) is not a resize
+            "resizes": sum(1 for r in result.resizes if r.capped_quantity != r.requested_quantity),
+            "resizes_price_move": sum(1 for r in result.resizes if r.kind == "price_move"),
+            "resizes_anomaly": n_anomalies,
             "gap_fills": sum(1 for f in result.fills if f.gap_fill),
             "issues": issues,
         },
@@ -205,7 +226,9 @@ def render_markdown(report: dict[str, Any]) -> str:
         "Run health: decisions "
         + ", ".join(f"{k}={v}" for k, v in sorted(health["decisions"].items()))
         + f"; fill rejections {health['fill_rejections']}"
-        + f"; resizes {health['resizes']}"
+        + f"; resizes {health['resizes']} [actual caps]; sizing records "
+        + f"(price_move {health['resizes_price_move']}, "
+        + f"anomaly {health['resizes_anomaly']})"
         + f"; gap fills {health['gap_fills']}"
         + f"; unfilled at end {health['unfilled_orders_at_end']}",
         "",

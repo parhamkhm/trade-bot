@@ -220,13 +220,17 @@ class _Run:
 
     def _route(self, intent: TargetIntent, bar: Bar) -> None:
         market = MarketState(self.config.symbol, bar.ts, bar.close, self.config.filters)
-        decision = self.risk.evaluate(intent, self.portfolio.view(bar.ts, bar.close), market)
+        view = self.portfolio.view(bar.ts, bar.close)
+        decision = self.risk.evaluate(intent, view, market)
         if not isinstance(decision, Approved):
             self._log(intent, REFUSED, f"{decision.reason.value}: {decision.detail}")
         elif decision.order is None:
             self._log(intent, NO_ACTION, decision.note)
         else:
-            ack = self.broker.submit(decision.order)
+            # Backtest-only sizing reference (OrderRequest is frozen and has no such field): the risk manager
+            # sized this order at the signal close with this cash. The broker uses it to tell a fill-time cap
+            # caused by price movement from one caused by a sizing bug.
+            ack = self.broker.submit(decision.order, sizing_price=bar.close, sizing_cash=view.cash_quote)
             outcome = ORDER if ack.accepted else SUBMIT_REJECTED
             self._log(intent, outcome, ack.message or decision.note, decision.order.client_order_id)
 
@@ -287,6 +291,7 @@ def run_backtest(
         else None
     )
     guard = _SealGuard(allow_holdout=allow_holdout)
+    exec_timeframe = config.exec_timeframe or config.timeframe  # the bars orders actually fill on
     previous: Bar | None = None
     for bar in feed.bars(config.symbol, config.timeframe):
         if bar.symbol != config.symbol or bar.timeframe != config.timeframe:
@@ -298,6 +303,11 @@ def run_backtest(
         previous = bar
         guard.check(bar, caller="run_backtest:signal_feed")
         for exec_bar in cursor.pop_until(bar.ts) if cursor is not None else (bar,):
+            if exec_bar.symbol != config.symbol or exec_bar.timeframe != exec_timeframe:
+                raise EngineError(
+                    f"exec feed yielded {exec_bar.symbol}/{exec_bar.timeframe}, "
+                    f"expected {config.symbol}/{exec_timeframe}"
+                )
             guard.check(exec_bar, caller="run_backtest:exec_feed")
             run.execute(exec_bar)
         run.history.append(bar)

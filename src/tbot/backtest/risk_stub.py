@@ -6,7 +6,8 @@ same ``RiskManager`` interface that live trading uses. It does exactly this and 
 
 * long-only sizing of a target weight into a MARKET order, using only information at the signal-bar close;
 * exchange filters: quantity floored to the step size, ``min_qty`` / ``min_notional`` refusals;
-* affordability: a BUY is capped so that notional + fee + slippage + buffer fits into cash;
+* affordability: a BUY is capped so that notional + fee + slippage (+ optional buffer, default 0) fits
+  into cash at the signal close; the broker re-caps it at fill time from the real fill price;
 * a drift tolerance so a constant target (e.g. buy-and-hold at weight 1.0) does not re-trade every bar
   because of price drift. Entries from flat and exits to zero are never blocked by it. The real
   rebalance-band rule (SPEC section 7.1, S0) needs the strategy state and belongs to the phase 3/4 allocator.
@@ -51,12 +52,13 @@ class StubRiskManager:
         *,
         taker_fee_bps: Decimal,
         slippage_bps: Decimal,
-        buy_buffer_bps: Decimal = Decimal(10),
+        buy_buffer_bps: Decimal = Decimal(0),
         drift_tolerance: float = 0.02,
         id_prefix: str = "bt",
     ) -> None:
-        # Cash needed per unit of notional at the signal close: slippage, fee on the slipped notional and a
-        # safety buffer compound multiplicatively (fee is charged on the slipped fill value).
+        # Cash needed per unit of notional at the signal close: slippage, fee on the slipped notional and an
+        # optional extra buffer (default 0; the broker caps a BUY at fill time anyway) compound
+        # multiplicatively (fee is charged on the slipped fill value).
         self._cost_factor = (
             (1 + slippage_bps / _BPS) * (1 + taker_fee_bps / _BPS) * (1 + buy_buffer_bps / _BPS)
         )

@@ -21,6 +21,7 @@ from tbot.core.types import Bar, BarWindow, Strategy, SymbolFilters, TargetInten
 from tests.sim_helpers import SYMBOL, lbank_like_filters
 
 __all__ = [
+    "BPS_BUFFER_LEGACY",
     "BPS_FEE",
     "BPS_SLIP",
     "Peeker",
@@ -33,6 +34,9 @@ __all__ = [
 
 BPS_FEE = Decimal(10)  # D-060: LBank VIP-0 taker 0.10 % per side
 BPS_SLIP = Decimal(5)  # provisional flat slippage, 0.05 % per side
+# The engine's default buy buffer is 0 since 2026-10-11 (BUYs are capped at fill time). The 10 bps buffer of
+# the earlier engine is kept as a named constant for the tests that document that configuration explicitly.
+BPS_BUFFER_LEGACY = Decimal(10)
 
 
 def make_cfg(
@@ -41,7 +45,7 @@ def make_cfg(
     fee_bps: Decimal = BPS_FEE,
     slip_bps: Decimal = BPS_SLIP,
     delay_hours: int = 0,
-    buffer_bps: Decimal = Decimal(10),
+    buffer_bps: Decimal = Decimal(0),
     initial_cash: Decimal = Decimal(10_000),
     filters: SymbolFilters | None = None,
 ) -> BacktestConfig:
@@ -104,7 +108,7 @@ def snapshot(res: BacktestResult, upto: datetime) -> Snapshot:
         decisions=tuple(
             (d.ts, d.target_weight, d.outcome, d.client_order_id) for d in res.decisions if d.ts <= upto
         ),
-        resizes=tuple((z.ts, z.requested_quantity, z.filled_quantity) for z in res.resizes if z.ts < upto),
+        resizes=tuple((z.ts, z.requested_quantity, z.capped_quantity) for z in res.resizes if z.ts < upto),
         rejections=tuple((j.ts, j.reason) for j in res.rejections if j.ts < upto),
     )
 

@@ -21,8 +21,15 @@ class BacktestConfig:
 
     * next-open (default): ``fill_delay = 0`` and no exec feed. An order created at the close of signal
       bar ``t`` fills at the open of bar ``t+1`` plus slippage.
-    * manual-delay: ``fill_delay = 6h`` and ``exec_timeframe = 1h``. The order fills at the open of the
-      first hourly bar that opens at or after ``close(t) + fill_delay`` plus slippage.
+    * manual-delay: ``fill_delay = 6h`` and ``exec_timeframe = 1h`` (1h is enforced: coarser execution bars
+      would silently stretch the delay). The order fills at the open of the first hourly bar that opens at
+      or after ``close(t) + fill_delay`` plus slippage.
+      ``fill_delay`` must be a whole number of hours.
+
+    In BOTH models a BUY is capped at fill time to what cash affords at the real fill price (SPEC D-051 as
+    revised 2026-10-11). The cap is classified by cause: a request that was affordable at the signal-bar
+    close it was sized at is a ``price_move`` (valid run, however large the move); one that was not even
+    affordable there is a sizing bug, an ``anomaly``, and marks the run invalid.
 
     ``slippage_model`` is the hook for the depth-at-size model of SPEC section 7 (calibrated in phase 3);
     until one is supplied, the flat ``costs.slippage_bps`` placeholder applies.
@@ -40,7 +47,9 @@ class BacktestConfig:
     slippage_model: SlippageModel | None = field(default=None, compare=False)
     # StubRiskManager knobs (phase 2 stand-in only; the real RiskManager arrives in phase 4).
     drift_tolerance: float = 0.02
-    buy_buffer_bps: Decimal = Decimal(10)
+    # Default 0: the stub's sizing divisor already includes slippage and the taker fee, and the broker caps
+    # a BUY at fill time to what cash affords at the real fill price in both fill modes.
+    buy_buffer_bps: Decimal = Decimal(0)
 
     def __post_init__(self) -> None:
         if self.filters.symbol != self.symbol:
@@ -49,6 +58,11 @@ class BacktestConfig:
             raise ValueError("initial_cash must be a finite Decimal > 0")
         if self.fill_delay < timedelta(0):
             raise ValueError("fill_delay must be >= 0")
+        if self.fill_delay % timedelta(hours=1) != timedelta(0):
+            raise ValueError(
+                f"fill_delay must be a whole number of hours (got {self.fill_delay}): the delayed fill "
+                "model reads hourly execution bars, so a fractional hour would silently round to the next bar"
+            )
         if self.fill_delay > timedelta(0) and self.exec_timeframe is None:
             raise ValueError(
                 "fill_delay > 0 needs a finer exec_timeframe (and an exec feed): with signal bars only, "
@@ -56,6 +70,14 @@ class BacktestConfig:
             )
         if self.exec_timeframe is not None and self.exec_timeframe.delta >= self.timeframe.delta:
             raise ValueError("exec_timeframe must be finer than the signal timeframe")
+        if self.fill_delay > timedelta(0) and self.exec_timeframe is not Timeframe.H1:
+            # An order becomes eligible on the first execution bar OPENING at or after close + delay. With
+            # coarser bars the real delay silently stretches (6 h on daily bars = ~24 h and every fill
+            # flagged as a gap fill), so the delayed model is defined on 1h execution bars only.
+            raise ValueError(
+                f"fill_delay > 0 requires exec_timeframe = 1h (got {self.exec_timeframe}): coarser "
+                "execution bars would stretch the delay"
+            )
         if not 0.0 <= self.drift_tolerance < 1.0:
             raise ValueError("drift_tolerance must be in [0, 1)")
         if self.buy_buffer_bps < 0:
