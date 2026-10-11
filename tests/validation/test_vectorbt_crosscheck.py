@@ -114,7 +114,7 @@ def _assert_engine_equals_reference(res: BacktestResult, ref: RefResult) -> None
     assert [p.equity for p in res.equity] == ref.equity
     assert [p.cash for p in res.equity] == ref.cash
     assert [p.quantity for p in res.equity] == ref.quantity
-    assert [(z.requested_quantity, z.filled_quantity) for z in res.resizes] == [
+    assert [(z.requested_quantity, z.capped_quantity) for z in res.resizes] == [
         (z.requested, z.filled) for z in ref.resizes
     ], "fill-time BUY caps must match the reference one for one"
     assert len(res.rejections) == ref.rejected_buys == 0, "a valid run needs no fill-time rejection"
@@ -362,7 +362,7 @@ def test_zero_buffer_on_real_data_has_no_fill_rejections_and_caps_instead(name: 
     ref = _ref(bars, name)  # default RefParams: buffer 0, BUY capped at fill time
     assert ref.rejected_buys == 0
     # the independent reference caps the same BUYs by the same amounts
-    assert [(z.requested_quantity, z.filled_quantity) for z in res.resizes] == [
+    assert [(z.requested_quantity, z.capped_quantity) for z in res.resizes] == [
         (z.requested, z.filled) for z in ref.resizes
     ]
 
@@ -378,7 +378,7 @@ def test_zero_buffer_on_real_data_has_no_fill_rejections_and_caps_instead(name: 
     capped = [z for z in res.resizes if z.ts.date().isoformat() == first]
     filled = [f for f in res.fills if f.fill.ts.date().isoformat() == first and f.fill.side.value == "BUY"]
     assert len(capped) == 1 and len(filled) == 1
-    assert capped[0].filled_quantity == filled[0].fill.quantity < capped[0].requested_quantity
+    assert capped[0].capped_quantity == filled[0].fill.quantity < capped[0].requested_quantity
     assert capped[0].kind == "price_move"
     if name == "sma100":
         assert any(z.kind == "price_move" for z in res.resizes), "at least one ordinary price_move cap"

@@ -159,7 +159,7 @@ def hand_section() -> None:
     resg = run(hand.Scripted(scripted, gapped), gapped, make_cfg())
     z, fg = resg.resizes[0], resg.fills[0].fill
     print(
-        f"gap-up open 100.5: requested={z.requested_quantity} capped to {z.filled_quantity} kind={z.kind} "
+        f"gap-up open 100.5: requested={z.requested_quantity} capped to {z.capped_quantity} kind={z.kind} "
         f"price={fg.price} fee={fg.fee} rejections={len(resg.rejections)}"
     )
 
@@ -200,7 +200,7 @@ def vectorbt_section() -> None:
         eng = [(f.fill.side.value, f.fill.price, f.fill.quantity, f.fill.fee) for f in res.fills]
         same = eng == [(f.side, f.price, f.quantity, f.fee) for f in ref.fills]
         same_eq = [p.equity for p in res.equity] == ref.equity
-        same_rs = [(z.requested_quantity, z.filled_quantity) for z in res.resizes] == [
+        same_rs = [(z.requested_quantity, z.capped_quantity) for z in res.resizes] == [
             (z.requested, z.filled) for z in ref.resizes
         ]
         final = float(res.equity[-1].equity)

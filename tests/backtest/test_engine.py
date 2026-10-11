@@ -351,7 +351,7 @@ def test_delay_mode_buy_resizes_and_fills_in_a_rising_market() -> None:
     assert res.rejections == ()
     (resize,) = res.resizes  # the resize is logged, with the requested and the actually filled quantity
     assert resize.requested_quantity == Dec("98.51731")
-    assert resize.filled_quantity == Dec("97.34150")
+    assert resize.capped_quantity == Dec("97.34150")
     # 0.2 %/h for 6 h plus 1 % slippage is a 1.19 % cap. By the cause-based rule that is a price_move: the BUY
     # was affordable at the close it was sized at (100), the price then rose, and the run stays valid.
     assert resize.kind == "price_move" and resize.reason.startswith("price_move")
@@ -374,7 +374,7 @@ def test_delay_mode_realistic_drift_is_a_price_move_resize_and_not_invalid() -> 
     (resize,) = res.resizes
     # open 100.12 -> *1.0005 = 100.17006 -> ceil tick 100.18; unit cost 100.18 * 1.0035 = 100.53063
     assert resize.requested_quantity == Dec("99.60142")
-    assert resize.filled_quantity == Dec("99.47217")  # floor_5(10000 / 100.53063)
+    assert resize.capped_quantity == Dec("99.47217")  # floor_5(10000 / 100.53063)
     assert resize.kind == "price_move" and resize.reason.startswith("price_move")
     (rec,) = res.fills
     assert rec.fill.price == Dec("100.18") and rec.fill.fee == Dec("34.8779269671")
@@ -429,7 +429,7 @@ def test_gap_up_open_is_capped_not_rejected_in_both_fill_modes(
     assert res.rejections == ()
     (resize,) = res.resizes
     assert resize.requested_quantity == Dec("99.60142")  # floor_5(10000 / (1.0005 * 1.0035) / 100)
-    assert resize.filled_quantity == Dec(quantity)
+    assert resize.capped_quantity == Dec(quantity)
     (rec,) = res.fills
     assert rec.fill.price == Dec(price) and rec.fill.quantity == Dec(quantity)
     assert rec.fill.fee == Dec(fee)
@@ -445,17 +445,25 @@ def test_gap_up_open_is_capped_not_rejected_in_both_fill_modes(
     assert not is_run_invalid(build_report(res))
 
 
-def oversized_run(delay: timedelta) -> BacktestResult:
-    """A sizing BUG: a risk manager that asks for 2x what cash covers (sized at close 100, cash 10 000), in
-    next-open or 6 h delay mode. The prices do not move at all (open == close == 100)."""
-    day0, day1 = make_bar(0, "100", "100"), make_bar(0, "100", "100", start=make_bar(0, "100", "100").ts)
+def oversized_run(delay: timedelta, factor: str = "2", fill_open: str = "100") -> BacktestResult:
+    """A sizing BUG: a risk manager that asks for ``factor`` x what cash covers (sized at close 100, cash
+    10 000), in next-open or 6 h delay mode. By default the prices do not move at all (open == close == 100);
+    ``fill_open`` is the price level at the fill (next-open fill, or from the 06:00 hourly bar on)."""
+    day0 = make_bar(0, "100", "100")
+    exec_feed = None
     if delay == timedelta(0):
+        day1 = make_bar(0, fill_open, fill_open, start=day0.ts)
         cfg = make_config(fee="35", slip="5")
-        return run_backtest(BacktestFeed([day0, day1]), Scripted([1.0, 1.0]), cfg, risk=OversizedRisk(cfg))
-    cfg = make_config(fee="35", slip="5", fill_delay=delay, exec_timeframe=Timeframe.H1)
-    exec_feed = BacktestFeed(hour_bars_for_day(day1, ["100"] * 24))
+    else:
+        day1 = make_bar(0, "100", fill_open, start=day0.ts)
+        cfg = make_config(fee="35", slip="5", fill_delay=delay, exec_timeframe=Timeframe.H1)
+        exec_feed = BacktestFeed(hour_bars_for_day(day1, ["100"] * 6 + [fill_open] * 18))
     return run_backtest(
-        BacktestFeed([day0, day1]), Scripted([1.0, 1.0]), cfg, risk=OversizedRisk(cfg), exec_feed=exec_feed
+        BacktestFeed([day0, day1]),
+        Scripted([1.0, 1.0]),
+        cfg,
+        risk=OversizedRisk(cfg, Dec(factor)),
+        exec_feed=exec_feed,
     )
 
 
@@ -472,9 +480,9 @@ def test_unaffordable_request_at_the_sizing_price_is_an_anomaly_and_invalidates_
     assert resize.requested_quantity == Dec("199.20284") and resize.kind == "anomaly"
     assert "not affordable even at the sizing price" in resize.reason
     assert resize.sizing_price == Dec("100") and resize.sizing_cash == Dec("10000")
-    assert resize.filled_quantity == Dec("99.60142")  # 100 * 1.0005 -> 100.05; 10000 / (100.05 * 1.0035)
+    assert resize.capped_quantity == Dec("99.60142")  # 100 * 1.0005 -> 100.05; 10000 / (100.05 * 1.0035)
     (rec,) = res.fills
-    assert rec.fill.quantity == resize.filled_quantity
+    assert rec.fill.quantity == resize.capped_quantity
     report = build_report(res)
     assert report["health"]["resizes_anomaly"] == 1 and report["health"]["resizes_price_move"] == 0
     assert report["health"]["fill_rejections"] == 0 and is_run_invalid(report)
@@ -544,7 +552,7 @@ def test_exit_after_a_resized_buy_sells_exactly_the_held_quantity(delay: timedel
     (resize,) = res.resizes  # only the BUY was resized
     buy, sell = (r.fill for r in res.fills)
     assert (buy.side, sell.side) == (Side.BUY, Side.SELL)
-    assert buy.quantity == resize.filled_quantity == Dec("99.16531") < resize.requested_quantity
+    assert buy.quantity == resize.capped_quantity == Dec("99.16531") < resize.requested_quantity
     assert sell.quantity == buy.quantity  # exactly what was held, not the requested 99.60142
     assert res.equity[1].quantity == Dec("99.16531") and res.equity[2].quantity == Dec(0)
     assert res.unfilled_order_ids == ()
@@ -683,3 +691,82 @@ def test_benchmarks_take_allow_holdout_so_a_g4_run_unseals_exactly_once_per_run(
     monkeypatch.delenv("TBOT_UNSEAL_HOLDOUT")  # the env lock alone must not be enough either
     with pytest.raises(HoldoutLockError):
         run_benchmarks(feed, strat, cfg, res, allow_holdout=True)
+
+
+@pytest.mark.parametrize("delay", [timedelta(0), timedelta(hours=6)], ids=["next_open", "delay_6h"])
+def test_oversized_request_is_an_anomaly_even_if_the_price_falls_and_nothing_is_capped(
+    delay: timedelta,
+) -> None:
+    """The anomaly rule does not depend on price direction: the buggy risk manager asks for 1.02 x what cash
+    covers at the sizing close (101.59344 BTC x 100 x 1.0035 > 10 000), the price then FALLS 5 % to 95, so the
+    request fits at the fill price and fills in full. It is still an anomaly and the run is INVALID."""
+    res = oversized_run(delay, factor="1.02", fill_open="95")
+    assert res.rejections == ()
+    (rec,) = res.fills
+    assert rec.fill.quantity == Dec("101.59344")  # not capped
+    (resize,) = res.resizes
+    assert resize.kind == "anomaly" and resize.filled is True
+    assert resize.requested_quantity == resize.capped_quantity == rec.fill.quantity
+    assert resize.sizing_price == Dec("100") and resize.sizing_cash == Dec("10000")
+    report = build_report(res)
+    assert report["health"]["resizes_anomaly"] == 1 and report["health"]["resizes_price_move"] == 0
+    assert is_run_invalid(report) and any("resize anomaly" in issue for issue in report["health"]["issues"])
+
+
+@pytest.mark.parametrize("delay", [timedelta(0), timedelta(hours=6)], ids=["next_open", "delay_6h"])
+def test_sizing_price_is_the_signal_bar_close_not_its_open(delay: timedelta) -> None:
+    """The signal bar opens at 90 and closes at 100, and the stub sizes at the CLOSE (99.60142 BTC). The
+    recorded sizing price must be 100. Had the open (90) been used, the request (99.60142 x 90 x 1.0035 =
+    8996 USDT) would look affordable either way, so the test also runs with a sizing open ABOVE the close
+    (110 -> 100): there the open would make the request look unaffordable (an anomaly), the close does not."""
+    for open_, close in (("90", "100"), ("110", "100")):
+        day0 = make_bar(0, open_, close)
+        fill_open = "100.43"
+        if delay == timedelta(0):
+            day1 = make_bar(0, fill_open, fill_open, start=day0.ts)
+            cfg = make_config(fee="35", slip="5")
+            res = run_backtest(BacktestFeed([day0, day1]), Scripted([1.0, 1.0]), cfg)
+        else:
+            day1 = make_bar(0, close, fill_open, start=day0.ts)
+            cfg = make_config(fee="35", slip="5", fill_delay=delay, exec_timeframe=Timeframe.H1)
+            exec_feed = BacktestFeed(hour_bars_for_day(day1, [close] * 6 + [fill_open] * 18))
+            res = run_backtest(BacktestFeed([day0, day1]), Scripted([1.0, 1.0]), cfg, exec_feed=exec_feed)
+        (resize,) = res.resizes
+        assert resize.sizing_price == Dec("100") != day0.open
+        assert resize.kind == "price_move" and not is_run_invalid(build_report(res))
+
+
+def test_sizing_cash_is_the_cash_at_submit_time_not_the_initial_cash_nor_the_equity() -> None:
+    """Buy half, sell it, buy half again, then top up to full on a gap-up. At the top-up the portfolio holds
+    a position, so cash (about half of equity) differs from both the initial 10 000 and the equity. The cap
+    on that last BUY records exactly the cash that the equity curve shows at the signal bar."""
+    bars = [
+        make_bar(0, "100", "100"),
+        make_bar(1, "100", "110"),
+        make_bar(2, "110", "105"),
+        make_bar(3, "105", "108"),  # signal bar of the top-up: close 108
+        make_bar(4, "110", "110"),  # gap up between the signal close (108) and this open
+        make_bar(5, "110", "110"),
+    ]
+    cfg = make_config(fee="35", slip="5")
+    res = run_backtest(BacktestFeed(bars), Scripted([0.5, 0.0, 0.5, 1.0, 1.0, 1.0]), cfg)
+    assert len([f for f in res.fills if f.fill.side is Side.SELL]) == 1  # one completed round trip
+    (resize,) = [z for z in res.resizes if z.sizing_price == Dec("108")]
+    signal_point = next(p for p in res.equity if p.ts == bars[3].ts)  # the bar whose close sized the BUY
+    assert resize.sizing_cash == signal_point.cash
+    assert resize.sizing_cash != cfg.initial_cash and resize.sizing_cash != signal_point.equity
+    assert resize.kind == "price_move"
+
+
+@pytest.mark.parametrize("hours", [6.5, 0.5, 1.25])
+def test_non_integer_fill_delays_are_refused(hours: float) -> None:
+    with pytest.raises(ValueError, match="whole number of hours"):
+        make_config(fill_delay=timedelta(hours=hours), exec_timeframe=Timeframe.H1)
+
+
+@pytest.mark.parametrize("hours", [0, 1, 6, 12])
+def test_whole_hour_fill_delays_are_accepted(hours: int) -> None:
+    cfg = make_config(
+        fill_delay=timedelta(hours=hours), exec_timeframe=Timeframe.H1 if hours else None
+    )
+    assert cfg.fill_delay == timedelta(hours=hours)

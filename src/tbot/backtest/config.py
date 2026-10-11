@@ -24,6 +24,7 @@ class BacktestConfig:
     * manual-delay: ``fill_delay = 6h`` and ``exec_timeframe = 1h`` (1h is enforced: coarser execution bars
       would silently stretch the delay). The order fills at the open of the first hourly bar that opens at
       or after ``close(t) + fill_delay`` plus slippage.
+      ``fill_delay`` must be a whole number of hours.
 
     In BOTH models a BUY is capped at fill time to what cash affords at the real fill price (SPEC D-051 as
     revised 2026-10-11). The cap is classified by cause: a request that was affordable at the signal-bar
@@ -57,6 +58,11 @@ class BacktestConfig:
             raise ValueError("initial_cash must be a finite Decimal > 0")
         if self.fill_delay < timedelta(0):
             raise ValueError("fill_delay must be >= 0")
+        if self.fill_delay % timedelta(hours=1) != timedelta(0):
+            raise ValueError(
+                f"fill_delay must be a whole number of hours (got {self.fill_delay}): the delayed fill "
+                "model reads hourly execution bars, so a fractional hour would silently round to the next bar"
+            )
         if self.fill_delay > timedelta(0) and self.exec_timeframe is None:
             raise ValueError(
                 "fill_delay > 0 needs a finer exec_timeframe (and an exec feed): with signal bars only, "

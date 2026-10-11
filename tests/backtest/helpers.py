@@ -66,7 +66,7 @@ class OversizedRisk:
     """A BUGGY risk manager: the stub's BUY quantity multiplied by ``factor`` (default 2x), i.e. orders
     that cash could not cover even at the price they were sized at. Used to provoke the sizing-bug anomaly."""
 
-    def __init__(self, config: BacktestConfig, factor: int = 2) -> None:
+    def __init__(self, config: BacktestConfig, factor: Decimal = Decimal(2)) -> None:
         self._stub = StubRiskManager(
             taker_fee_bps=config.costs.taker_fee_bps,
             slippage_bps=config.costs.slippage_bps,
@@ -74,11 +74,13 @@ class OversizedRisk:
             drift_tolerance=config.drift_tolerance,
         )
         self._factor = factor
+        self._filters = config.filters
 
     def evaluate(self, intent: TargetIntent, portfolio: PortfolioView, market: MarketState) -> RiskDecision:
         decision = self._stub.evaluate(intent, portfolio, market)
         if isinstance(decision, Approved) and decision.order is not None and decision.order.side is Side.BUY:
-            big = replace(decision.order, quantity=decision.order.quantity * self._factor)
+            quantity = self._filters.floor_qty(decision.order.quantity * self._factor)
+            big = replace(decision.order, quantity=quantity)
             return Approved(decision.intent, big, decision.note)
         return decision
 

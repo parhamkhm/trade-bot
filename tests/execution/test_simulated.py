@@ -212,7 +212,8 @@ def test_buy_is_capped_rather_than_rejected_when_cash_falls_short(delay: timedel
     assert b.balances() == {"USDT": Dec("0.00042169825"), "BTC": Dec("0.99601")}
     (resize,) = rep.resizes
     assert resize.client_order_id == "big"
-    assert resize.requested_quantity == Dec("10") and resize.filled_quantity == Dec("0.99601")
+    assert resize.requested_quantity == Dec("10") and resize.capped_quantity == Dec("0.99601")
+    assert resize.filled is True
     assert resize.kind == "anomaly" and resize.reason.startswith("anomaly")  # 1000 USDT requested vs 100 cash
     assert resize.capped_fraction == Dec("0.900399")
     assert [r.client_order_id for r in rep.rejections] == ["short"]  # SELL still rejected whole
@@ -235,7 +236,7 @@ def test_capped_order_status_is_filled_with_requested_quantity_and_is_queryable(
     assert b.was_resized("big")
     record = b.resize_of("big")
     assert record is not None and record.requested_quantity == Dec("10")
-    assert record.filled_quantity == Dec("0.99601")
+    assert record.capped_quantity == Dec("0.99601")
     with pytest.raises(UnknownOrderError):
         b.was_resized("nope")
 
@@ -278,7 +279,7 @@ def test_buy_capped_to_zero_is_still_rejected(delay: timedelta) -> None:
     rep = b.advance(fill_bar(delay, "1"))
     assert rep.fills == ()
     (resize,) = rep.resizes
-    assert resize.filled_quantity == Dec("0")
+    assert resize.capped_quantity == Dec("0")
     assert "ZERO_QUANTITY" in rep.rejections[0].reason
     assert b.was_resized("dust") and b.get_order("dust").state is OrderState.REJECTED
     assert b.balances() == {"USDT": Dec("0.000001"), "BTC": Dec("0")}
@@ -299,7 +300,8 @@ def test_buy_capped_below_min_qty_is_still_rejected(delay: timedelta) -> None:
     rep = b.advance(fill_bar(delay, "100000"))
     assert rep.fills == ()
     (resize,) = rep.resizes
-    assert resize.requested_quantity == Dec("0.002") and resize.filled_quantity == Dec("0.0005")
+    assert resize.requested_quantity == Dec("0.002") and resize.capped_quantity == Dec("0.0005")
+    assert resize.filled is False  # the cap left 0.0005 but nothing was filled: the order was rejected
     (rej,) = rep.rejections
     assert "MIN_QUANTITY" in rej.reason
     assert b.balances() == {"USDT": Dec("50"), "BTC": Dec("0")}
@@ -313,7 +315,8 @@ def test_buy_capped_below_min_notional_is_still_rejected(delay: timedelta) -> No
     rep = b.advance(fill_bar(delay, "100"))
     assert rep.fills == ()
     (resize,) = rep.resizes
-    assert resize.requested_quantity == Dec("0.1") and resize.filled_quantity == Dec("0.005")
+    assert resize.requested_quantity == Dec("0.1") and resize.capped_quantity == Dec("0.005")
+    assert resize.filled is False
     (rej,) = rep.rejections
     assert "MIN_NOTIONAL" in rej.reason
     assert b.balances() == {"USDT": Dec("0.5"), "BTC": Dec("0")}
@@ -350,8 +353,25 @@ def test_price_move_cap_is_not_an_anomaly_whatever_the_size(
     # the reason states the cause with the numbers: requested cost at the sizing price vs cash at sizing
     # requested cost at the sizing price: 99.60142 * 100 * 1.0035 = 9995.002497000 <= cash 10000
     assert "9995.002497000" in resize.reason and "cash at sizing 10000" in resize.reason
-    assert resize.requested_quantity == Dec("99.60142") and resize.filled_quantity == Dec(quantity)
+    assert resize.requested_quantity == Dec("99.60142") and resize.capped_quantity == Dec(quantity)
+    assert resize.filled is True
+    assert "price moved up" in resize.reason and f"open {open_} > sizing price 100" in resize.reason
     assert b.resize_of("a") == resize
+
+
+@MODES
+def test_slippage_only_cap_does_not_claim_the_price_moved(delay: timedelta) -> None:
+    """open == sizing close: the request fits at 100 but not at 100.05 (slippage) * 1.0035 (fee), so it is
+    capped for fill-price slippage/fees only. Still a price_move (valid run), but the reason must say so."""
+    b = broker("10000", delay=delay)
+    # 99.65116 * 100 * 1.0035 = 9999.99... <= 10000 (affordable at the sizing price); at 100.05 only 99.60142
+    b.submit(req("a", Side.BUY, "99.65116"), sizing_price=Dec("100"), sizing_cash=Dec("10000"))
+    rep = b.advance(fill_bar(delay, "100"))
+    (resize,) = rep.resizes
+    assert resize.kind == "price_move" and resize.filled is True
+    assert resize.requested_quantity == Dec("99.65116") and resize.capped_quantity == Dec("99.60142")
+    assert "slippage/fees only" in resize.reason and "open 100 <= sizing price 100" in resize.reason
+    assert "price moved" not in resize.reason
 
 
 @MODES
@@ -368,6 +388,35 @@ def test_request_not_affordable_at_the_sizing_price_is_an_anomaly(delay: timedel
     assert resize.kind == "anomaly" and resize.reason.startswith("anomaly")
     assert "not affordable even at the sizing price" in resize.reason
     assert resize.sizing_price == Dec("100") and resize.sizing_cash == Dec("10000")
+
+
+@MODES
+def test_oversized_request_is_an_anomaly_even_when_the_price_falls_and_no_cap_happens(
+    delay: timedelta,
+) -> None:
+    """The cause test does not depend on a cap: 102 BTC x 100 = 10200 > 10000 cash at the sizing price, then
+    the price falls 5 % so 102 x 95 = 9690 fits and the order fills UNCAPPED. Still an anomaly."""
+    b = broker("10000", fee="0", slip="0", delay=delay)
+    b.submit(req("big", Side.BUY, "102"), sizing_price=Dec("100"), sizing_cash=Dec("10000"))
+    rep = b.advance(fill_bar(delay, "95"))
+    assert rep.rejections == ()
+    (rec,) = rep.fills
+    assert rec.fill.quantity == Dec("102") and rec.fill.price == Dec("95")
+    (resize,) = rep.resizes
+    assert resize.kind == "anomaly" and resize.filled is True
+    assert resize.requested_quantity == resize.capped_quantity == Dec("102")
+    assert resize.capped_fraction == 0
+    assert "not affordable even at the sizing price" in resize.reason and "filled in full" in resize.reason
+    assert b.resize_of("big") == resize and not b.was_resized("big")  # recorded, but nothing was resized
+
+
+@MODES
+def test_affordable_uncapped_buys_and_unreferenced_uncapped_buys_leave_no_record(delay: timedelta) -> None:
+    b = broker("10000", fee="0", slip="0", delay=delay)
+    b.submit(req("ok", Side.BUY, "50"), sizing_price=Dec("100"), sizing_cash=Dec("10000"))
+    b.submit(req("noref", Side.BUY, "10"))  # no reference and no cap: nothing is known to be wrong
+    rep = b.advance(fill_bar(delay, "100"))
+    assert len(rep.fills) == 2 and rep.resizes == () and rep.rejections == ()
 
 
 @MODES
@@ -490,7 +539,7 @@ def test_cap_reprices_slippage_at_the_final_quantity() -> None:
     assert cash_left == Dec("0.0980298010") and cash_left >= 0  # 1000 - 9.90099 * 100.99010
     assert rec.slippage_cost == Dec("9.8029701990")  # (100.99010 - 100) * 9.90099
     (resize,) = rep.resizes
-    assert resize.requested_quantity == Dec("10") and resize.filled_quantity == Dec("9.90099")
+    assert resize.requested_quantity == Dec("10") and resize.capped_quantity == Dec("9.90099")
 
 
 def test_cap_never_leaves_notional_plus_fee_above_cash() -> None:

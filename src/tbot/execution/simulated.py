@@ -27,7 +27,8 @@ is handed each execution bar as it becomes available:
 * The fill price is re-derived at the FINAL capped quantity (the slippage model may be size dependent, e.g.
   the depth curve of SPEC section 7): cap, re-price, re-check affordability, repeat until the quantity is
   stable (at most ``_MAX_CAP_ITERATIONS`` rounds; the quantity only ever shrinks). The books are never
-  overdrawn: if no stable quantity is found, the order is rejected with ``INSUFFICIENT_FUNDS``.
+  overdrawn: if the loop bound is hit, the last candidate still fills when cash affords it at its own
+  price, and is rejected with ``INSUFFICIENT_FUNDS`` only when it does not.
 * Resize kinds are decided by CAUSE, not by size (Parham, 2026-10-11). The risk manager sizes a BUY from the
   signal bar's close (the SIZING PRICE) and the cash on hand when the order is submitted (the SIZING CASH).
   The backtest engine hands both to :meth:`SimulatedBroker.submit` through the keyword-only ``sizing_price``
@@ -38,9 +39,14 @@ is handed each execution bar as it becomes available:
   Yes: the order was sized correctly and only the price moved afterwards -- ``"price_move"``, whatever the
   size of the move (+0.4 %, +5 %, a 6 h drift). No: the request exceeded cash even at the price it was sized
   with -- a sizing bug, ``"anomaly"``. The broker still fills an anomaly (the cap itself is correct), but the
-  backtest report flags the run INVALID exactly as it does for a fill rejection. FAIL SAFE: a capped BUY with
-  no sizing reference (a direct broker user that passed neither argument) is an ``"anomaly"`` with reason
-  "no sizing reference", because the broker cannot prove the cap was caused by price movement.
+  backtest report flags the run INVALID exactly as it does for a fill rejection.
+  The affordability test does NOT depend on a cap happening or on the price direction: it runs at FILL time,
+  on the reference stored at submit, for EVERY BUY that has one. An oversized request whose price then falls
+  fills uncapped, and is still recorded as an ``"anomaly"`` (a :class:`ResizeRecord` with
+  ``capped_quantity == requested_quantity``; :meth:`SimulatedBroker.was_resized` stays False for it).
+  FAIL SAFE: a capped BUY with no sizing reference (a direct broker user that passed neither argument) is an
+  ``"anomaly"`` with reason "no sizing reference", because the broker cannot prove the cap was caused by
+  price movement. An uncapped BUY with no reference is not recorded: nothing is known to be wrong.
 * A SELL is never capped in either mode: it is rejected whole if the position does not cover it -- a
   long-only book has no symmetric "resize down" for an exit.
 * LIMIT orders are rejected: SPEC defines no limit-fill semantics yet (needs a maker/queue model).
@@ -187,9 +193,14 @@ class OrderRejection:
 
 @dataclass(frozen=True, slots=True)
 class ResizeRecord:
-    """A BUY whose quantity was capped down at fill time because cash no longer covered the amount it
-    was sized at (see the module docstring). Logged whether the resized order then filled or was still
-    rejected (e.g. the resized quantity fell below ``min_qty``/``min_notional``).
+    """A fill-time sizing event for a BUY (see the module docstring): either the quantity was capped down
+    because cash no longer covered the amount it was sized at, or the request was not affordable at the
+    sizing price (an ``"anomaly"``, which is recorded even when no cap followed, so
+    ``capped_quantity == requested_quantity``). Logged whether the order then filled or was still rejected
+    (e.g. the capped quantity fell below ``min_qty``/``min_notional``): ``filled`` says which.
+
+    ``capped_quantity`` is the quantity the cap left, NOT necessarily what was filled: when ``filled`` is
+    False nothing was filled and the order is also in the report's rejections.
 
     ``kind`` is decided by cause. ``"price_move"``: the requested quantity WAS affordable at the sizing price
     (``requested_quantity * sizing_price * (1 + taker fee rate) <= sizing_cash``), so only the price moved
@@ -200,7 +211,8 @@ class ResizeRecord:
     client_order_id: str
     ts: datetime
     requested_quantity: Decimal
-    filled_quantity: Decimal
+    capped_quantity: Decimal
+    filled: bool
     reason: str
     kind: ResizeKind
     sizing_price: Decimal | None = None  # close of the signal bar the order was sized at
@@ -209,7 +221,7 @@ class ResizeRecord:
     @property
     def capped_fraction(self) -> Decimal:
         """Share of the requested quantity that was capped away, in ``[0, 1]``."""
-        return (self.requested_quantity - self.filled_quantity) / self.requested_quantity
+        return (self.requested_quantity - self.capped_quantity) / self.requested_quantity
 
 
 @dataclass(frozen=True, slots=True)
@@ -351,11 +363,13 @@ class SimulatedBroker:
         )
 
     def resize_of(self, client_order_id: str) -> ResizeRecord | None:
-        """The fill-time resize applied to this order (requested vs. filled quantity), if any."""
+        """The fill-time sizing record of this order (cap and/or anomaly), if any."""
         return self._get(client_order_id).resize
 
     def was_resized(self, client_order_id: str) -> bool:
-        return self.resize_of(client_order_id) is not None
+        """True when the order's quantity was actually capped (an uncapped anomaly record is not a resize)."""
+        rec = self.resize_of(client_order_id)
+        return rec is not None and rec.capped_quantity != rec.requested_quantity
 
     def open_orders(self, symbol: str) -> list[OrderStatus]:
         return [self.get_order(cid) for cid in self._pending if self._orders[cid].req.symbol == symbol]
@@ -459,40 +473,62 @@ class SimulatedBroker:
             price = self._fill_price(req.side, quantity, bar)
         return quantity, price
 
-    def _resize_record(self, order: _Order, bar: Bar, quantity: Decimal) -> ResizeRecord:
-        """Classify a fill-time BUY cap by cause (module docstring): affordable at the sizing price means
-        the price moved; not affordable there (or no reference at all) means the order was mis-sized."""
+    def _sizing_record(
+        self, order: _Order, bar: Bar, quantity: Decimal, *, filled: bool
+    ) -> ResizeRecord | None:
+        """Fill-time sizing record of a BUY, or ``None`` when there is nothing to report.
+
+        The cause test (module docstring) runs for every BUY with a sizing reference, capped or not:
+        ``requested * sizing_price * (1 + taker fee) > sizing_cash`` is an anomaly whatever the fill price
+        did. A capped BUY that was affordable at the sizing price is a ``price_move``; a capped BUY with no
+        reference is an anomaly (fail safe); an uncapped BUY with no reference gets no record."""
         req = order.req
         price, cash = order.sizing_price, order.sizing_cash
+        capped = quantity != req.quantity
         fraction = (req.quantity - quantity) / req.quantity
         kind: ResizeKind
         if price is None or cash is None:
-            kind = "anomaly"
+            if not capped:
+                return None
             reason = (
                 "anomaly: no sizing reference (sizing_price / sizing_cash) was supplied with the order, so "
                 f"the broker cannot show that the {fraction:.3%} cap was caused by price movement (fail safe)"
             )
-        else:
-            fee_rate = self._fees.taker_bps / _BPS
-            cost = req.quantity * price * (1 + fee_rate)
-            numbers = (
-                f"requested {req.quantity} x sizing price {price} x (1 + taker fee {fee_rate:.4%}) = "
-                f"{cost} {self._quote} vs cash at sizing {cash} {self._quote}"
+            return ResizeRecord(
+                req.client_order_id, bar.open_ts, req.quantity, quantity, filled, reason, "anomaly"
             )
-            if cost > cash:
-                kind = "anomaly"
-                reason = (
-                    f"anomaly: the request was not affordable even at the sizing price ({numbers}); "
-                    "sizing bug"
-                )
-            else:
-                kind = "price_move"
-                reason = (
-                    f"price_move: the request was affordable at the sizing price ({numbers}); the price "
-                    f"moved before the fill; {fraction:.3%} of the quantity was capped to what cash affords"
-                )
+        fee_rate = self._fees.taker_bps / _BPS
+        cost = req.quantity * price * (1 + fee_rate)
+        numbers = (
+            f"requested {req.quantity} x sizing price {price} x (1 + taker fee {fee_rate:.4%}) = "
+            f"{cost} {self._quote} vs cash at sizing {cash} {self._quote}"
+        )
+        if cost > cash:
+            kind = "anomaly"
+            outcome = (
+                f"the fill then capped {fraction:.3%} of the quantity"
+                if capped
+                else f"the fill price (open {bar.open}) needed no cap, so it filled in full"
+            )
+            reason = (
+                f"anomaly: the request was not affordable even at the sizing price ({numbers}); "
+                f"sizing bug; {outcome}"
+            )
+        elif capped:
+            kind = "price_move"
+            cause = (
+                f"the price moved up before the fill (open {bar.open} > sizing price {price})"
+                if bar.open > price
+                else f"fill-price slippage/fees only (open {bar.open} <= sizing price {price})"
+            )
+            reason = (
+                f"price_move: the request was affordable at the sizing price ({numbers}); {cause}; "
+                f"{fraction:.3%} of the quantity was capped to what cash affords"
+            )
+        else:
+            return None
         return ResizeRecord(
-            req.client_order_id, bar.open_ts, req.quantity, quantity, reason, kind, price, cash
+            req.client_order_id, bar.open_ts, req.quantity, quantity, filled, reason, kind, price, cash
         )
 
     def _fill_at_open(
@@ -500,11 +536,15 @@ class SimulatedBroker:
     ) -> tuple[FillRecord | OrderRejection, ResizeRecord | None]:
         req = order.req
         quantity, price = self._size_at_fill(req, bar)
-        resize = self._resize_record(order, bar, quantity) if quantity != req.quantity else None
-        order.resize = resize
         notional = price * quantity
         fee = self._fees.fee(notional)
         reason = self._fill_problem(req, quantity, price, notional, fee)
+        resize = (
+            self._sizing_record(order, bar, quantity, filled=reason is None)
+            if req.side is Side.BUY
+            else None
+        )
+        order.resize = resize
         if reason is not None:
             order.state, order.last_ts = OrderState.REJECTED, bar.open_ts
             return OrderRejection(req.client_order_id, bar.open_ts, reason), resize

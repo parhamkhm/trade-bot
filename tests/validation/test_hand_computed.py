@@ -150,7 +150,7 @@ def test_gap_up_buy_is_capped_at_fill_time_not_rejected() -> None:
     res = run(Scripted([1.0, 1.0, 0.0, 0.0, 0.0], bars), bars, make_cfg())
     assert not res.rejections
     (resize,) = res.resizes
-    assert (resize.requested_quantity, resize.filled_quantity, resize.kind) == (
+    assert (resize.requested_quantity, resize.capped_quantity, resize.kind) == (
         D("99.85017"),
         D("99.34377"),
         "price_move",

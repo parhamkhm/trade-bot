@@ -108,7 +108,7 @@ def snapshot(res: BacktestResult, upto: datetime) -> Snapshot:
         decisions=tuple(
             (d.ts, d.target_weight, d.outcome, d.client_order_id) for d in res.decisions if d.ts <= upto
         ),
-        resizes=tuple((z.ts, z.requested_quantity, z.filled_quantity) for z in res.resizes if z.ts < upto),
+        resizes=tuple((z.ts, z.requested_quantity, z.capped_quantity) for z in res.resizes if z.ts < upto),
         rejections=tuple((j.ts, j.reason) for j in res.rejections if j.ts < upto),
     )
 
