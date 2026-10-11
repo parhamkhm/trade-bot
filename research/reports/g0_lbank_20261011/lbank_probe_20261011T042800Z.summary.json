@@ -1,0 +1,749 @@
+{
+  "provenance": {
+    "hostname": "srv6950132412 (docker, image tbot-lbank-recorder @ 8a7d528)",
+    "utc_start": "2026-10-11T04:28:00.214929+00:00",
+    "utc_end": "2026-10-11T10:40:08.322989+00:00",
+    "python": "3.12.15",
+    "platform": "Linux-7.0.0-14-generic-x86_64-with-glibc2.36",
+    "script": "scripts/lbank_probe.py",
+    "git_commit": "8a7d528ec3d8dbb5bebb5a2ea8ba02f7adb761d8",
+    "git_commit_unknown": false,
+    "mode": "sampling",
+    "argv": [
+      "--out-dir",
+      "/out",
+      "--host-label",
+      "srv6950132412 (docker, image tbot-lbank-recorder @ 8a7d528)"
+    ],
+    "user_agent": "tbot-lbank-g0-probe/1 (public read-only market-data probe; contact: project owner)",
+    "data_source": "live",
+    "measured_from": "measured from srv6950132412 (docker, image tbot-lbank-recorder @ 8a7d528) at 2026-10-11T04:28:00.214929+00:00",
+    "local_clock_sync": "NOT checked by this script - the operator records chrony/timedatectl status separately"
+  },
+  "mode": "sampling",
+  "status": {
+    "finished": true,
+    "interrupted": false
+  },
+  "stopped_on_ban": null,
+  "plan": {
+    "planned_samples": 32,
+    "interval_s": 720.0,
+    "completed_samples": 32
+  },
+  "g0": {
+    "verdict": "FAIL",
+    "failed_checks": [
+      "clock_offset"
+    ],
+    "checks": {
+      "all_endpoints_200": {
+        "pass": true,
+        "observed": "worst per-endpoint success rate = 100.0%; ban-type response seen = False",
+        "threshold": ">= 95% success per endpoint, and no 429/403/418 ever",
+        "per_endpoint_rates": {
+          "accuracy": {
+            "n": 32,
+            "ok": 32,
+            "rate": 1.0
+          },
+          "depth": {
+            "n": 32,
+            "ok": 32,
+            "rate": 1.0
+          },
+          "kline_1d": {
+            "n": 32,
+            "ok": 32,
+            "rate": 1.0
+          },
+          "kline_1h": {
+            "n": 32,
+            "ok": 32,
+            "rate": 1.0
+          },
+          "kline_1m": {
+            "n": 32,
+            "ok": 32,
+            "rate": 1.0
+          },
+          "kline_4h": {
+            "n": 32,
+            "ok": 32,
+            "rate": 1.0
+          },
+          "perp_marketdata": {
+            "n": 32,
+            "ok": 32,
+            "rate": 1.0
+          },
+          "ticker24hr": {
+            "n": 32,
+            "ok": 32,
+            "rate": 1.0
+          },
+          "timestamp": {
+            "n": 32,
+            "ok": 32,
+            "rate": 1.0
+          },
+          "trades": {
+            "n": 32,
+            "ok": 32,
+            "rate": 1.0
+          }
+        },
+        "ban_type_response_seen": false,
+        "failures": []
+      },
+      "clock_offset": {
+        "threshold": "both < 1000 ms",
+        "uncertainty_ms": 595.5632419791073,
+        "pass": false,
+        "status": "inconclusive",
+        "observed": "median abs(delta) = 410 ms +/- half-RTT 596 ms straddles the 1000 ms threshold",
+        "reason": "RTT-uncertainty band crosses the threshold; cannot confirm pass or fail"
+      },
+      "accuracy_btc_usdt": {
+        "pass": true,
+        "observed": "32/32 samples list btc_usdt with readable price/quantity precision, min quantity and min order value",
+        "threshold": "all samples",
+        "fields_last_sample": {
+          "price_precision": {
+            "key": "priceAccuracy",
+            "raw": "2",
+            "ok": true
+          },
+          "quantity_precision": {
+            "key": "quantityAccuracy",
+            "raw": "5",
+            "ok": true
+          },
+          "min_qty": {
+            "key": "minTranQua",
+            "raw": "0.00001",
+            "ok": true
+          },
+          "min_order_value": {
+            "key": "minOrderAmount",
+            "raw": "1",
+            "ok": true
+          }
+        },
+        "row_keys_last_sample": [
+          "minOrderAmount",
+          "minTranQua",
+          "priceAccuracy",
+          "quantityAccuracy",
+          "symbol"
+        ]
+      },
+      "median_spread": {
+        "pass": true,
+        "observed": "median spread = 0.0000 %",
+        "threshold": "< 0.20 %"
+      }
+    },
+    "stopped_on_ban": null,
+    "plan": {
+      "samples": 32,
+      "min_samples": 30,
+      "span_hours": 6.2,
+      "min_span_hours": 6.0,
+      "plan_ok": true
+    }
+  },
+  "latency": {
+    "accuracy": {
+      "n": 32,
+      "ok": 32,
+      "http_not_200": 0,
+      "timeout_count": 0,
+      "p50_ms": 527.5,
+      "p95_ms": 3437.2449999999976,
+      "max_ms": 6787.5
+    },
+    "depth": {
+      "n": 32,
+      "ok": 32,
+      "http_not_200": 0,
+      "timeout_count": 0,
+      "p50_ms": 296.9,
+      "p95_ms": 1380.0249999999994,
+      "max_ms": 2728.4
+    },
+    "kline_1d": {
+      "n": 32,
+      "ok": 32,
+      "http_not_200": 0,
+      "timeout_count": 0,
+      "p50_ms": 289.20000000000005,
+      "p95_ms": 796.8899999999999,
+      "max_ms": 921.3
+    },
+    "kline_1h": {
+      "n": 32,
+      "ok": 32,
+      "http_not_200": 0,
+      "timeout_count": 0,
+      "p50_ms": 289.75,
+      "p95_ms": 806.8149999999998,
+      "max_ms": 1110.0
+    },
+    "kline_1m": {
+      "n": 32,
+      "ok": 32,
+      "http_not_200": 0,
+      "timeout_count": 0,
+      "p50_ms": 289.65,
+      "p95_ms": 911.1949999999999,
+      "max_ms": 1066.2
+    },
+    "kline_4h": {
+      "n": 32,
+      "ok": 32,
+      "http_not_200": 0,
+      "timeout_count": 0,
+      "p50_ms": 286.25,
+      "p95_ms": 905.15,
+      "max_ms": 1722.5
+    },
+    "perp_marketdata": {
+      "n": 32,
+      "ok": 32,
+      "http_not_200": 0,
+      "timeout_count": 0,
+      "p50_ms": 402.25,
+      "p95_ms": 519.9999999999999,
+      "max_ms": 1365.2
+    },
+    "ticker24hr": {
+      "n": 32,
+      "ok": 32,
+      "http_not_200": 0,
+      "timeout_count": 0,
+      "p50_ms": 288.85,
+      "p95_ms": 792.5199999999999,
+      "max_ms": 1703.0
+    },
+    "timestamp": {
+      "n": 32,
+      "ok": 32,
+      "http_not_200": 0,
+      "timeout_count": 0,
+      "p50_ms": 1191.15,
+      "p95_ms": 1780.925,
+      "max_ms": 6021.5
+    },
+    "trades": {
+      "n": 32,
+      "ok": 32,
+      "http_not_200": 0,
+      "timeout_count": 0,
+      "p50_ms": 1013.95,
+      "p95_ms": 4674.039999999999,
+      "max_ms": 7295.6
+    }
+  },
+  "clock": {
+    "n": 32,
+    "median_delta_ms": 408.8790283203125,
+    "median_abs_delta_ms": 410.3936767578125,
+    "p95_abs_delta_ms": 620.2568725585936,
+    "median_rtt_ms": 1191.1264839582145,
+    "median_half_rtt_ms": 595.5632419791073,
+    "delta_at_min_rtt_ms": -140.846923828125,
+    "min_rtt_ms": 515.5079662799835,
+    "note": "positive = LBank ahead of local; uncertainty about +/- half the round trip; local clock sync not checked by this script"
+  },
+  "book": {
+    "n_books": 32,
+    "spread_pct": {
+      "median": 1.2041733037747128e-05,
+      "p95": 2.406402802530396e-05,
+      "max": 2.4079213871457207e-05
+    },
+    "levels_returned": {
+      "requested_size": 200,
+      "max_bid_levels": 200,
+      "max_ask_levels": 200
+    },
+    "depth": {
+      "0.001": {
+        "bid": {
+          "n": 32,
+          "base_median": "16.07572",
+          "base_p10": "9.35358",
+          "quote_median": "1334062.39904865",
+          "quote_p10": "777939.9877712",
+          "truncated_samples": 0
+        },
+        "ask": {
+          "n": 32,
+          "base_median": "8.36111",
+          "base_p10": "3.04641",
+          "quote_median": "693641.6038858",
+          "quote_p10": "253156.6119102",
+          "truncated_samples": 0
+        }
+      },
+      "0.005": {
+        "bid": {
+          "n": 32,
+          "base_median": "16.076755",
+          "base_p10": "9.37089",
+          "quote_median": "1334148.0537138",
+          "quote_p10": "778146.7524436",
+          "truncated_samples": 0
+        },
+        "ask": {
+          "n": 32,
+          "base_median": "8.37178",
+          "base_p10": "3.18335",
+          "quote_median": "694530.3491568",
+          "quote_p10": "264586.0412022",
+          "truncated_samples": 0
+        }
+      },
+      "0.01": {
+        "bid": {
+          "n": 32,
+          "base_median": "26.716745",
+          "base_p10": "20.93724",
+          "quote_median": "2207045.3034954",
+          "quote_p10": "1731591.8776617",
+          "truncated_samples": 0
+        },
+        "ask": {
+          "n": 32,
+          "base_median": "21.479115",
+          "base_p10": "10.69843",
+          "quote_median": "1794735.3478725",
+          "quote_p10": "893122.4617306",
+          "truncated_samples": 0
+        }
+      }
+    },
+    "max_fill": {
+      "0.001": {
+        "vs_mid": {
+          "buy": {
+            "n": 32,
+            "base_median": "9.528161889600578334976718375",
+            "base_p10": "3.522434412559330079368532478",
+            "quote_median": "791331.1246488592817477969455",
+            "quote_p10": "292986.8631399835655771455792",
+            "truncated_samples": 0
+          },
+          "sell": {
+            "n": 32,
+            "base_median": "18.17334811889486535661345318",
+            "base_p10": "10.61527971794406375566530304",
+            "quote_median": "1507942.496736983719561067626",
+            "quote_p10": "880690.1806303951904160856660",
+            "truncated_samples": 0
+          }
+        },
+        "vs_touch": {
+          "buy": {
+            "n": 32,
+            "base_median": "9.528240687855737624045539955",
+            "base_p10": "3.522464713358919804351719005",
+            "quote_median": "791337.7167268150914253939475",
+            "quote_p10": "292989.4011110195692658545460",
+            "truncated_samples": 0
+          },
+          "sell": {
+            "n": 32,
+            "base_median": "18.17349900637332402978077988",
+            "base_p10": "10.61536597083231115749800766",
+            "quote_median": "1507954.925878956487830472434",
+            "quote_p10": "880697.2835246913241879442317",
+            "truncated_samples": 0
+          }
+        }
+      },
+      "0.005": {
+        "vs_mid": {
+          "buy": {
+            "n": 32,
+            "base_median": "18.94411725357540546330465616",
+            "base_p10": "7.273331815378426733521800215",
+            "quote_median": "1579146.221565962926313720274",
+            "quote_p10": "607394.1683004554857161139184",
+            "truncated_samples": 1
+          },
+          "sell": {
+            "n": 32,
+            "base_median": "27.82868736922562663732458750",
+            "base_p10": "21.58764868498790806925527770",
+            "quote_median": "2299812.184800390037293937895",
+            "quote_p10": "1785738.814239140281908668007",
+            "truncated_samples": 1
+          }
+        },
+        "vs_touch": {
+          "buy": {
+            "n": 32,
+            "base_median": "18.94427086435637328675108230",
+            "base_p10": "7.273350179253637710916613488",
+            "quote_median": "1579159.116131694431457999032",
+            "quote_p10": "607395.7384117860242833704533",
+            "truncated_samples": 1
+          },
+          "sell": {
+            "n": 32,
+            "base_median": "27.82871456772485240453919508",
+            "base_p10": "21.58767699892286961328364320",
+            "quote_median": "2299814.294177067930772980798",
+            "quote_p10": "1785742.864994034092678461543",
+            "truncated_samples": 1
+          }
+        }
+      }
+    }
+  },
+  "accuracy_row_last": {
+    "symbol": "btc_usdt",
+    "quantityAccuracy": "5",
+    "minOrderAmount": "1",
+    "minTranQua": "0.00001",
+    "priceAccuracy": "2"
+  },
+  "depth_size_discovery": {
+    "kind": "depth_size_discovery",
+    "attempts": [
+      {
+        "requested": 200,
+        "bids": 200,
+        "asks": 200,
+        "endpoint": "depth_size_discovery",
+        "status": 200,
+        "latency_ms": 1203.7,
+        "timeout_s": 10.0,
+        "nbytes": 8688,
+        "ok": true,
+        "error": null,
+        "payload_error": null,
+        "accepted": true
+      }
+    ],
+    "chosen_size": 200
+  },
+  "kline_history": {
+    "kind": "kline_history",
+    "timeframes": {
+      "1d": {
+        "type": "day1",
+        "bar_seconds": 86400,
+        "recent": {
+          "requested_size": 2000,
+          "requested_start_s": 1618892898,
+          "requested_start_utc": "2021-04-20T04:28:18+00:00",
+          "endpoint": "kline_1d_history_recent",
+          "status": 200,
+          "latency_ms": 2092.3,
+          "timeout_s": 10.0,
+          "nbytes": 121958,
+          "ok": true,
+          "error": null,
+          "payload_error": null,
+          "returned": 2000,
+          "first_ts_s": 1618848000,
+          "last_ts_s": 1791561600,
+          "first_utc": "2021-04-19T16:00:00+00:00",
+          "last_utc": "2026-10-09T16:00:00+00:00",
+          "ascending": true,
+          "non_contiguous_steps": 0
+        },
+        "earliest": {
+          "requested_size": 2000,
+          "requested_start_s": 1483228800,
+          "requested_start_utc": "2017-01-01T00:00:00+00:00",
+          "endpoint": "kline_1d_history_earliest",
+          "status": 200,
+          "latency_ms": 1535.7,
+          "timeout_s": 10.0,
+          "nbytes": 120583,
+          "ok": true,
+          "error": null,
+          "payload_error": null,
+          "returned": 2000,
+          "first_ts_s": 1520956800,
+          "last_ts_s": 1693670400,
+          "first_utc": "2018-03-13T16:00:00+00:00",
+          "last_utc": "2023-09-02T16:00:00+00:00",
+          "ascending": true,
+          "non_contiguous_steps": 0
+        },
+        "next_page": {
+          "requested_size": 2000,
+          "requested_start_s": 1693756800,
+          "requested_start_utc": "2023-09-03T16:00:00+00:00",
+          "endpoint": "kline_1d_history_next_page",
+          "status": 200,
+          "latency_ms": 1247.3,
+          "timeout_s": 10.0,
+          "nbytes": 68078,
+          "ok": true,
+          "error": null,
+          "payload_error": null,
+          "returned": 1134,
+          "first_ts_s": 1693756800,
+          "last_ts_s": 1791648000,
+          "first_utc": "2023-09-03T16:00:00+00:00",
+          "last_utc": "2026-10-10T16:00:00+00:00",
+          "ascending": true,
+          "non_contiguous_steps": 0,
+          "contiguous_with_previous_page": true
+        },
+        "max_bars_per_request_observed": 2000,
+        "cap_may_exceed_requested": true,
+        "history_start_utc": "2018-03-13T16:00:00+00:00",
+        "time_param_ignored_suspected": false,
+        "history_bars_estimate": 3134,
+        "history_days_estimate": 3133.5,
+        "pages_to_backfill_estimate": 2
+      },
+      "4h": {
+        "type": "hour4",
+        "bar_seconds": 14400,
+        "recent": {
+          "requested_size": 2000,
+          "requested_start_s": 1762892898,
+          "requested_start_utc": "2025-11-11T20:28:18+00:00",
+          "endpoint": "kline_4h_history_recent",
+          "status": 200,
+          "latency_ms": 1450.5,
+          "timeout_s": 10.0,
+          "nbytes": 117676,
+          "ok": true,
+          "error": null,
+          "payload_error": null,
+          "returned": 2000,
+          "first_ts_s": 1762891200,
+          "last_ts_s": 1791676800,
+          "first_utc": "2025-11-11T20:00:00+00:00",
+          "last_utc": "2026-10-11T00:00:00+00:00",
+          "ascending": true,
+          "non_contiguous_steps": 0
+        },
+        "earliest": {
+          "requested_size": 2000,
+          "requested_start_s": 1483228800,
+          "requested_start_utc": "2017-01-01T00:00:00+00:00",
+          "endpoint": "kline_4h_history_earliest",
+          "status": 200,
+          "latency_ms": 1310.1,
+          "timeout_s": 10.0,
+          "nbytes": 112210,
+          "ok": true,
+          "error": null,
+          "payload_error": null,
+          "returned": 2000,
+          "first_ts_s": 1521000000,
+          "last_ts_s": 1549785600,
+          "first_utc": "2018-03-14T04:00:00+00:00",
+          "last_utc": "2019-02-10T08:00:00+00:00",
+          "ascending": true,
+          "non_contiguous_steps": 0
+        },
+        "next_page": {
+          "requested_size": 2000,
+          "requested_start_s": 1549800000,
+          "requested_start_utc": "2019-02-10T12:00:00+00:00",
+          "endpoint": "kline_4h_history_next_page",
+          "status": 200,
+          "latency_ms": 1701.1,
+          "timeout_s": 10.0,
+          "nbytes": 113232,
+          "ok": true,
+          "error": null,
+          "payload_error": null,
+          "returned": 2000,
+          "first_ts_s": 1549800000,
+          "last_ts_s": 1578585600,
+          "first_utc": "2019-02-10T12:00:00+00:00",
+          "last_utc": "2020-01-09T16:00:00+00:00",
+          "ascending": true,
+          "non_contiguous_steps": 0,
+          "contiguous_with_previous_page": true
+        },
+        "max_bars_per_request_observed": 2000,
+        "cap_may_exceed_requested": true,
+        "history_start_utc": "2018-03-14T04:00:00+00:00",
+        "time_param_ignored_suspected": false,
+        "history_bars_estimate": 18799,
+        "history_days_estimate": 3133.0,
+        "pages_to_backfill_estimate": 10
+      },
+      "1h": {
+        "type": "hour1",
+        "bar_seconds": 3600,
+        "recent": {
+          "requested_size": 2000,
+          "requested_start_s": 1784492898,
+          "requested_start_utc": "2026-07-19T20:28:18+00:00",
+          "endpoint": "kline_1h_history_recent",
+          "status": 200,
+          "latency_ms": 1088.7,
+          "timeout_s": 10.0,
+          "nbytes": 116209,
+          "ok": true,
+          "error": null,
+          "payload_error": null,
+          "returned": 2000,
+          "first_ts_s": 1784491200,
+          "last_ts_s": 1791687600,
+          "first_utc": "2026-07-19T20:00:00+00:00",
+          "last_utc": "2026-10-11T03:00:00+00:00",
+          "ascending": true,
+          "non_contiguous_steps": 0
+        },
+        "earliest": {
+          "requested_size": 2000,
+          "requested_start_s": 1483228800,
+          "requested_start_utc": "2017-01-01T00:00:00+00:00",
+          "endpoint": "kline_1h_history_earliest",
+          "status": 200,
+          "latency_ms": 1265.0,
+          "timeout_s": 10.0,
+          "nbytes": 122149,
+          "ok": true,
+          "error": null,
+          "payload_error": null,
+          "returned": 2000,
+          "first_ts_s": 1521003600,
+          "last_ts_s": 1528200000,
+          "first_utc": "2018-03-14T05:00:00+00:00",
+          "last_utc": "2018-06-05T12:00:00+00:00",
+          "ascending": true,
+          "non_contiguous_steps": 0
+        },
+        "next_page": {
+          "requested_size": 2000,
+          "requested_start_s": 1528203600,
+          "requested_start_utc": "2018-06-05T13:00:00+00:00",
+          "endpoint": "kline_1h_history_next_page",
+          "status": 200,
+          "latency_ms": 2877.4,
+          "timeout_s": 10.0,
+          "nbytes": 104497,
+          "ok": true,
+          "error": null,
+          "payload_error": null,
+          "returned": 2000,
+          "first_ts_s": 1528203600,
+          "last_ts_s": 1535400000,
+          "first_utc": "2018-06-05T13:00:00+00:00",
+          "last_utc": "2018-08-27T20:00:00+00:00",
+          "ascending": true,
+          "non_contiguous_steps": 0,
+          "contiguous_with_previous_page": true
+        },
+        "max_bars_per_request_observed": 2000,
+        "cap_may_exceed_requested": true,
+        "history_start_utc": "2018-03-14T05:00:00+00:00",
+        "time_param_ignored_suspected": false,
+        "history_bars_estimate": 75192,
+        "history_days_estimate": 3133.0,
+        "pages_to_backfill_estimate": 38
+      },
+      "1m": {
+        "type": "minute1",
+        "bar_seconds": 60,
+        "recent": {
+          "requested_size": 2000,
+          "requested_start_s": 1791572898,
+          "requested_start_utc": "2026-10-09T19:08:18+00:00",
+          "endpoint": "kline_1m_history_recent",
+          "status": 200,
+          "latency_ms": 2286.0,
+          "timeout_s": 10.0,
+          "nbytes": 112908,
+          "ok": true,
+          "error": null,
+          "payload_error": null,
+          "returned": 2000,
+          "first_ts_s": 1791572880,
+          "last_ts_s": 1791692820,
+          "first_utc": "2026-10-09T19:08:00+00:00",
+          "last_utc": "2026-10-11T04:27:00+00:00",
+          "ascending": true,
+          "non_contiguous_steps": 0
+        },
+        "earliest": {
+          "requested_size": 2000,
+          "requested_start_s": 1483228800,
+          "requested_start_utc": "2017-01-01T00:00:00+00:00",
+          "endpoint": "kline_1m_history_earliest",
+          "status": 200,
+          "latency_ms": 983.5,
+          "timeout_s": 10.0,
+          "nbytes": 145547,
+          "ok": true,
+          "error": null,
+          "payload_error": null,
+          "returned": 2000,
+          "first_ts_s": 1521006900,
+          "last_ts_s": 1521126840,
+          "first_utc": "2018-03-14T05:55:00+00:00",
+          "last_utc": "2018-03-15T15:14:00+00:00",
+          "ascending": true,
+          "non_contiguous_steps": 0
+        },
+        "next_page": {
+          "requested_size": 2000,
+          "requested_start_s": 1521126900,
+          "requested_start_utc": "2018-03-15T15:15:00+00:00",
+          "endpoint": "kline_1m_history_next_page",
+          "status": 200,
+          "latency_ms": 2384.6,
+          "timeout_s": 10.0,
+          "nbytes": 147029,
+          "ok": true,
+          "error": null,
+          "payload_error": null,
+          "returned": 2000,
+          "first_ts_s": 1521126900,
+          "last_ts_s": 1521246840,
+          "first_utc": "2018-03-15T15:15:00+00:00",
+          "last_utc": "2018-03-17T00:34:00+00:00",
+          "ascending": true,
+          "non_contiguous_steps": 0,
+          "contiguous_with_previous_page": true
+        },
+        "max_bars_per_request_observed": 2000,
+        "cap_may_exceed_requested": true,
+        "history_start_utc": "2018-03-14T05:55:00+00:00",
+        "time_param_ignored_suspected": false,
+        "history_bars_estimate": 4511434,
+        "history_days_estimate": 3132.9,
+        "pages_to_backfill_estimate": 2256
+      }
+    }
+  },
+  "trades": {
+    "median_n": 600.0,
+    "median_span_s": 264.259,
+    "saturated_samples": 32
+  },
+  "ticker_latest_vs_mid_bps_median": 0.0006020165150430292,
+  "perp": {
+    "rows_found": 32,
+    "samples": 32,
+    "last_funding_rate": "-0.00001753"
+  },
+  "kline_sample_bars_returned_median": {
+    "1d": 10.0,
+    "4h": 10.0,
+    "1h": 10.0,
+    "1m": 10.0
+  },
+  "notes": [
+    "Max-fill figures are computed from the visible levels only; 'truncated' marks a lower bound.",
+    "vs_mid slippage includes the half-spread; vs_touch is measured from the best price consumed.",
+    "Latencies and clock deltas are valid only for the host and time in the provenance block.",
+    "The local clock's NTP sync is not checked by the script; the operator must record it separately."
+  ]
+}
