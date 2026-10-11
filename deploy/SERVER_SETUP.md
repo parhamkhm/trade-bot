@@ -1214,3 +1214,51 @@ optional -- Parham decides later whether to set it up; the monitor works the sam
   dead-man URL) are listed, commented out, in the env file.
 - To rotate the token: revoke it in BotFather (`/revoke`), paste the new one into the env file,
   `systemctl restart tbot-health-monitor`.
+
+### 19.8 Retiring a recorder
+
+When a recorder is shut down on purpose (for example the legacy Tabdeal recorder), tell the monitor, or
+it will alert about a "missing" container and a "stale" backup. `TBOT_MONITOR_RETIRED` takes
+comma-separated target names (`tabdeal`, `lbank`). A retired target is removed from every check:
+container state, heartbeat file and restart count. Retiring `tabdeal` also drops the
+`backup:trades` check, because that backup belongs to the Tabdeal recorder. LBank is not affected.
+
+Do this in a systemd drop-in, **not** in `/opt/tbot/health-monitor.env`: the value is not a secret and
+that file stays root-only and untouched.
+
+**First**, update `/opt/tbot/monitor-run` to the commit that contains this feature (section 19.0:
+`git -C /opt/tbot/monitor-run fetch`, `git -C /opt/tbot/monitor-run checkout --detach <commit>`). An older
+copy does not know the setting and would silently ignore it.
+
+Then, as `root`:
+
+```
+mkdir -p /etc/systemd/system/tbot-health-monitor.service.d
+cat > /etc/systemd/system/tbot-health-monitor.service.d/retire.conf <<'CONF'
+[Service]
+Environment=TBOT_MONITOR_RETIRED=tabdeal
+CONF
+systemctl daemon-reload && systemctl restart tbot-health-monitor
+```
+
+What you will see:
+
+- The "INFO monitor started" Telegram message ends with `RETIRED (not monitored): tabdeal`, and the
+  journal has a matching `monitor starting; retired (not monitored): tabdeal` line
+  (`journalctl -u tbot-health-monitor -n 20`).
+- If an alert was open for a retired key (`recorder:tabdeal`, `backup:trades`) you get exactly one
+  message `RETIRED <key>: no longer monitored (TBOT_MONITOR_RETIRED)` and the alert is closed. It is
+  never reported as RESOLVED, because the problem was not resolved; nothing is repeated afterwards.
+- A misspelled name (for example `tabdael`) makes the monitor log `configuration error` and exit with
+  code 2, and systemd does not restart it (`RestartPreventExitStatus=2`). Fix the name, then run
+  `systemctl daemon-reload && systemctl restart tbot-health-monitor`.
+
+To start monitoring the recorder again, delete the drop-in and restart:
+
+```
+rm /etc/systemd/system/tbot-health-monitor.service.d/retire.conf
+systemctl daemon-reload && systemctl restart tbot-health-monitor
+```
+
+`deploy/health_monitor.env.example` carries the same setting as a commented-out example
+(`#TBOT_MONITOR_RETIRED=tabdeal`) so the name is discoverable; leave it commented and use the drop-in.

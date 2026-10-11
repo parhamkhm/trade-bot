@@ -1786,3 +1786,217 @@ def test_default_targets_match_the_compose_container_names() -> None:
     lbank_compose = (REPO / "deploy" / "docker-compose.lbank.yml").read_text(encoding="utf-8")
     assert f"container_name: {LBANK.container}" in lbank_compose
     assert f"name: {LBANK.volume}" in lbank_compose
+
+
+# ---------------------------------------------------------------------------------------------
+# Retiring a recorder (TBOT_MONITOR_RETIRED)
+# ---------------------------------------------------------------------------------------------
+
+
+def _retired_settings(tmp_path: Path, **over: Any) -> Settings:
+    return make_settings(tmp_path, retired=("tabdeal",), confirm_cycles=1, **over)
+
+
+def _break_tabdeal(host: Host) -> None:
+    host.states["tbot-recorder"] = container_state(Status="exited", ExitCode=1)
+    host.dirs[hm.TRADES_BACKUP_DIR] = []  # no backup file at all
+
+
+def test_retiring_tabdeal_removes_its_container_heartbeat_and_backup_checks(
+    host: Host, tmp_path: Path
+) -> None:
+    settings = _retired_settings(tmp_path)
+    _break_tabdeal(host)
+    assert hm.collect_problems(settings, host.probes()) == {}
+    # Container state, heartbeat, restart count and the volume lookup are not even queried.
+    queried = {c[-1] for c in host.calls if c[:2] == ("docker", "inspect")}
+    assert "tbot-recorder" not in queried
+    assert not any("tbot-data" in c for c in host.calls)
+    # The same broken host with the default settings DOES alert on both.
+    broken = hm.collect_problems(make_settings(tmp_path), host.probes())
+    assert {"recorder:tabdeal", "backup:trades"} <= keys(broken)
+
+
+def test_retired_tabdeal_heartbeat_and_restart_count_are_not_checked(host: Host, tmp_path: Path) -> None:
+    settings = _retired_settings(tmp_path)
+    stale = json.dumps({"last_poll_ts": "2020-01-01T00:00:00Z"})
+    host.files[Path("/v/tbot-data") / "tabdeal/heartbeat.json"] = stale
+    host.restarts["tbot-recorder"] = 50
+    assert hm.collect_problems(settings, host.probes()) == {}
+    assert "tbot-recorder" not in host.memory.restart_counts
+    assert "tbot-recorder" not in host.memory.pending_restart_counts
+
+
+def test_retiring_tabdeal_leaves_lbank_fully_monitored(host: Host, tmp_path: Path) -> None:
+    settings = _retired_settings(tmp_path)
+    host.states["tbot-lbank-recorder"] = container_state(Status="exited", ExitCode=1)
+    host.lbank_status(ok=False, exit_code=3, message="boom")
+    host.failed_units = {"tbot-lbank-backup.service"}
+    found = keys(hm.collect_problems(settings, host.probes()))
+    assert found == {"recorder:lbank", "backup:lbank", "backup:unit:tbot-lbank-backup.service"}
+
+
+def test_retiring_lbank_keeps_tabdeal_and_its_backup_check(host: Host, tmp_path: Path) -> None:
+    settings = make_settings(tmp_path, retired=("lbank",))
+    _break_tabdeal(host)
+    host.states["tbot-lbank-recorder"] = container_state(Status="exited", ExitCode=1)
+    assert keys(hm.collect_problems(settings, host.probes())) == {"recorder:tabdeal", "backup:trades"}
+
+
+def test_empty_retired_setting_behaves_exactly_as_before(host: Host, tmp_path: Path) -> None:
+    assert hm.load_settings({}).retired == ()
+    assert hm.load_settings({hm.ENV_RETIRED: " , "}).retired == ()
+    plain = make_settings(tmp_path)
+    assert plain == make_settings(tmp_path, retired=())
+    assert plain.active_targets == hm.DEFAULT_TARGETS
+    assert plain.retired_keys == frozenset()
+    _break_tabdeal(host)
+    host.states["tbot-lbank-recorder"] = container_state(Status="exited", ExitCode=1)
+    assert keys(hm.collect_problems(plain, host.probes())) == {
+        "recorder:tabdeal",
+        "recorder:lbank",
+        "backup:trades",
+    }
+    out = Outbox()
+    make_monitor(plain, host, out).start()
+    assert "RETIRED" not in out.sent[0]
+
+
+def test_load_settings_parses_the_retired_list() -> None:
+    assert hm.load_settings({hm.ENV_RETIRED: "tabdeal"}).retired == ("tabdeal",)
+    assert hm.load_settings({hm.ENV_RETIRED: " Tabdeal , lbank,tabdeal"}).retired == ("tabdeal", "lbank")
+
+
+@pytest.mark.parametrize("value", ["tabdael", "tabdeal,bogus", "all"])
+def test_unknown_retired_name_is_a_config_error(value: str) -> None:
+    with pytest.raises(ConfigError) as info:
+        hm.load_settings({hm.ENV_RETIRED: value})
+    assert hm.ENV_RETIRED in str(info.value)
+    assert "valid: tabdeal, lbank" in str(info.value)
+
+
+def test_main_exits_2_for_an_unknown_retired_name(
+    cli: Host,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    seen = patch_urlopen(monkeypatch, FakeResponse(200, b'{"ok": true}'))
+    env = {hm.ENV_TOKEN: FAKE_TOKEN, hm.ENV_CHAT_ID: FAKE_CHAT, hm.ENV_RETIRED: "tabdael"}
+    with caplog.at_level(logging.ERROR):
+        assert hm.main([], env=env) == 2
+    assert "unknown target name" in caplog.text
+    assert "tabdael" in caplog.text
+    assert FAKE_TOKEN not in caplog.text + capsys.readouterr().out
+    assert seen == []  # nothing was sent, the monitor never started
+
+
+def test_main_check_mode_also_rejects_an_unknown_retired_name(cli: Host) -> None:
+    assert hm.main(["--check"], env={hm.ENV_RETIRED: "nope"}) == 2
+
+
+def test_started_message_and_log_list_the_retired_targets(
+    host: Host, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    out = Outbox()
+    with caplog.at_level(logging.INFO, logger="tbot.health_monitor"):
+        make_monitor(_retired_settings(tmp_path), host, out).start()
+    assert len(out.sent) == 1
+    assert "INFO monitor started" in out.sent[0]
+    assert "RETIRED (not monitored): tabdeal" in out.sent[0]
+    assert "retired (not monitored): tabdeal" in caplog.text
+
+
+def _open_retired_alerts(host: Host, tmp_path: Path, clock: Clock) -> StateStore:
+    """Run with Tabdeal NOT retired and broken so that both Tabdeal alerts are open; return the store."""
+    settings = make_settings(tmp_path, confirm_cycles=1)
+    store = StateStore(settings.state_dir / "state.json")
+    monitor = make_monitor(settings, host, Outbox(), store)
+    _break_tabdeal(host)
+    monitor.run_cycle()
+    assert set(store.load().tracked) == {"recorder:tabdeal", "backup:trades"}
+    clock.advance(minutes=5)
+    return store
+
+
+def test_open_retired_alerts_are_closed_with_one_retired_message_never_resolved(
+    host: Host, tmp_path: Path, clock: Clock
+) -> None:
+    store = _open_retired_alerts(host, tmp_path, clock)
+    settings = _retired_settings(tmp_path)
+    out = Outbox()
+    monitor = make_monitor(settings, host, out, store)
+    monitor.start()
+    retired_msgs = [m for m in out.sent if "] RETIRED " in m]
+    assert len(retired_msgs) == 2
+    assert any("RETIRED recorder:tabdeal: no longer monitored (TBOT_MONITOR_RETIRED)" in m for m in out.sent)
+    assert any("RETIRED backup:trades: no longer monitored (TBOT_MONITOR_RETIRED)" in m for m in out.sent)
+    assert store.load().tracked == {}  # not left open forever
+    sent_after_start = len(out.sent)
+    for _ in range(6):  # later cycles: no RESOLVED, no repeat, no alert, no reminder
+        clock.advance(hours=3)
+        assert monitor.run_cycle() == []
+    assert len(out.sent) == sent_after_start
+    assert not any("RESOLVED" in m for m in out.sent)
+    # and a restart of the monitor does not repeat it either
+    out2 = Outbox()
+    restarted = make_monitor(settings, host, out2, store)
+    clock.advance(minutes=10)
+    restarted.start()
+    restarted.run_cycle()
+    assert not any("] RETIRED " in m or "RESOLVED" in m for m in out2.sent)
+
+
+def test_retired_alert_is_never_resolved_even_if_start_was_not_called(
+    host: Host, tmp_path: Path, clock: Clock
+) -> None:
+    store = _open_retired_alerts(host, tmp_path, clock)
+    out = Outbox()
+    monitor = make_monitor(_retired_settings(tmp_path), host, out, store)
+    assert monitor.run_cycle() == []  # the first cycle closes them (retry path) -- still no RESOLVED
+    assert sum("] RETIRED " in m for m in out.sent) == 2
+    for _ in range(3):
+        clock.advance(minutes=1)
+        monitor.run_cycle()
+    assert not any("RESOLVED" in m for m in out.sent)
+    assert sum("] RETIRED " in m for m in out.sent) == 2
+
+
+def test_retired_close_is_retried_after_a_telegram_outage_and_never_resolved(
+    host: Host, tmp_path: Path, clock: Clock
+) -> None:
+    store = _open_retired_alerts(host, tmp_path, clock)
+    out = Outbox()
+    out.fail = TelegramError("connect error")
+    monitor = make_monitor(_retired_settings(tmp_path), host, out, store)
+    monitor.start()
+    for _ in range(3):  # Telegram down: the alerts stay open (not resolved, not lost)
+        clock.advance(minutes=30)
+        monitor.run_cycle()
+    assert set(store.load().tracked) == {"recorder:tabdeal", "backup:trades"}
+    out.fail = None
+    clock.advance(hours=1)
+    monitor.run_cycle()
+    assert store.load().tracked == {}
+    assert sum("] RETIRED " in m for m in out.sent) == 2
+    assert not any("RESOLVED" in m for m in out.sent)
+
+
+def test_retiring_does_not_close_alerts_of_other_targets(host: Host, tmp_path: Path) -> None:
+    settings = make_settings(tmp_path, confirm_cycles=1)
+    store = StateStore(settings.state_dir / "state.json")
+    host.states["tbot-lbank-recorder"] = container_state(Status="exited", ExitCode=1)
+    make_monitor(settings, host, Outbox(), store).run_cycle()
+    assert "recorder:lbank" in store.load().tracked
+    out = Outbox()
+    monitor = make_monitor(_retired_settings(tmp_path), host, out, store)
+    monitor.start()
+    monitor.run_cycle()
+    assert "recorder:lbank" in store.load().tracked
+    assert not any("RETIRED recorder:lbank" in m for m in out.sent)
+
+
+def test_retire_example_is_documented_in_the_env_example_as_a_comment_only() -> None:
+    text = (REPO / "deploy" / "health_monitor.env.example").read_text(encoding="utf-8")
+    assert "#TBOT_MONITOR_RETIRED=tabdeal" in text
+    assert not any(ln.startswith("TBOT_MONITOR_RETIRED") for ln in text.splitlines())
