@@ -36,6 +36,10 @@ Design notes
   backup failures alert at once. A disk alert clears only ``disk_clear_margin`` points below the limit.
 * **No secrets in children.** ``docker`` / ``systemctl`` run with a scrubbed environment; heartbeat and
   status files are read with ``O_NOFOLLOW`` and a size cap.
+* **Retiring a recorder.** ``TBOT_MONITOR_RETIRED=tabdeal`` (comma-separated target names; set it in a
+  systemd drop-in, not in the secrets file) removes that recorder from every check, including the
+  ``backup:trades`` check that belongs to Tabdeal. Open alerts for the retired keys are closed once with a
+  "RETIRED" message (never "RESOLVED"); the start message and the start log line list what is retired.
 * **Optional dead-man ping.** If ``TBOT_DEADMAN_URL`` is set, one GET is made after every completed
   cycle (healthchecks.io style); failures are ignored and the URL is never logged.
 """
@@ -109,6 +113,7 @@ log = logging.getLogger("tbot.health_monitor")
 
 ENV_TOKEN = "TBOT_TELEGRAM_BOT_TOKEN"
 ENV_CHAT_ID = "TBOT_TELEGRAM_CHAT_ID"
+ENV_RETIRED = "TBOT_MONITOR_RETIRED"  # non-secret: set in a systemd drop-in, never in the secrets file
 
 TELEGRAM_BASE_URL = "https://api.telegram.org"
 _STARTING_GRACE_S = 600.0  # a container may report Health "starting" for this long after start
@@ -160,10 +165,43 @@ class Settings:
     state_dir: Path = DEFAULT_STATE_DIR
     hostname: str = "server"
     deadman_url: str = field(default="", repr=False)  # secret-ish: never logged or printed
+    retired: tuple[str, ...] = ()  # target names no longer monitored (TBOT_MONITOR_RETIRED)
+
+    @property
+    def active_targets(self) -> tuple[Target, ...]:
+        """The recorder targets still being monitored (everything not retired)."""
+        return tuple(t for t in self.targets if t.name not in self.retired)
+
+    @property
+    def retired_keys(self) -> frozenset[str]:
+        """Alert keys that belong to retired targets; they are never checked, planned or resolved."""
+        keys: set[str] = set()
+        for target in self.targets:
+            if target.name in self.retired:
+                keys.add(recorder_key(target))
+                keys.update(_TARGET_BACKUP_KEYS.get(target.name, ()))
+        return frozenset(keys)
+
+
+# Alert keys of the backup check that belongs to a target (retiring the target retires them too).
+_TARGET_BACKUP_KEYS: dict[str, tuple[str, ...]] = {"tabdeal": ("backup:trades",)}
 
 
 class ConfigError(Exception):
     """Invalid configuration. The message never contains a secret value."""
+
+
+def _load_retired(env: Mapping[str, str]) -> tuple[str, ...]:
+    """``TBOT_MONITOR_RETIRED``: comma-separated target names. An unknown name is a ``ConfigError``
+    (a typo must never silently leave a recorder monitored, or hide the wrong one)."""
+    raw = env.get(ENV_RETIRED, "")
+    names = tuple(dict.fromkeys(n.strip().lower() for n in raw.split(",") if n.strip()))
+    known = [t.name for t in DEFAULT_TARGETS]
+    unknown = [n for n in names if n not in known]
+    if unknown:
+        shown = ", ".join(short(n, 40) for n in unknown[:5])
+        raise ConfigError(f"{ENV_RETIRED} has unknown target name(s): {shown} (valid: {', '.join(known)})")
+    return names
 
 
 def _env_float(env: Mapping[str, str], name: str, default: float, minimum: float) -> float:
@@ -202,7 +240,9 @@ def _load_deadman_url(env: Mapping[str, str]) -> str:
 
 
 def load_settings(env: Mapping[str, str], *, hostname: str | None = None) -> Settings:
-    """Optional tuning from the environment; every value has a safe default."""
+    """Optional tuning from the environment; every value has a safe default.
+
+    Raises ``ConfigError`` for an unknown name in ``TBOT_MONITOR_RETIRED``."""
     paths_raw = env.get("TBOT_MONITOR_DISK_PATHS", "").strip()
     disk_paths = tuple(Path(p.strip()) for p in paths_raw.split(",") if p.strip()) or DEFAULT_DISK_PATHS
     return Settings(
@@ -220,6 +260,7 @@ def load_settings(env: Mapping[str, str], *, hostname: str | None = None) -> Set
         trades_backup_dir=Path(env.get("TBOT_MONITOR_TRADES_BACKUP_DIR") or TRADES_BACKUP_DIR),
         state_dir=Path(env.get("TBOT_MONITOR_STATE_DIR") or DEFAULT_STATE_DIR),
         hostname=hostname or socket.gethostname(),
+        retired=_load_retired(env),
     )
 
 
@@ -651,7 +692,7 @@ def check_recorders(settings: Settings, probes: Probes) -> list[Problem]:
     """
     problems: list[Problem] = []
     try:
-        for target in settings.targets:
+        for target in settings.active_targets:
             problems.extend(_inspect_target(target, settings, probes))
     except ToolError as exc:
         return [Problem("tool:docker", f"docker unavailable: {exc.reason}", freeze=(_RECORDER_PREFIX,))]
@@ -757,6 +798,8 @@ def check_lbank_backup(settings: Settings, probes: Probes) -> list[Problem]:
 def check_trades_backup(settings: Settings, probes: Probes) -> list[Problem]:
     """Class 2 for the Tabdeal trades backup: newest ``trades-<UTC stamp>.sqlite`` must be recent."""
     key = "backup:trades"
+    if key in settings.retired_keys:  # belongs to the retired Tabdeal recorder
+        return []
     try:
         names = probes.list_names(settings.trades_backup_dir)
     except OSError as exc:
@@ -1062,13 +1105,19 @@ class Monitor:
         return True
 
     def start(self) -> None:
-        """Send the one "monitor started" message (suppressed during a rapid restart loop)."""
+        """Close alerts of retired targets, then send the one "monitor started" message (suppressed
+        during a rapid restart loop). The retired targets are always logged, never silently hidden."""
         now = self._probes.now()
+        if self._s.retired:
+            log.info("monitor starting; retired (not monitored): %s", ", ".join(self._s.retired))
+        self._close_retired(now)
         last = parse_iso(self._state.last_start_notice_ts)
         if last is not None and (now - last).total_seconds() < _START_NOTICE_MIN_GAP_S:
             log.info("start notice suppressed (sent %.0fs ago)", (now - last).total_seconds())
             return
         detail = f"{len(CHECKS)} checks every {self._s.interval_s:g}s"
+        if self._s.retired:
+            detail += f"; RETIRED (not monitored): {', '.join(self._s.retired)}"
         if self._try_send(self._text("INFO monitor started", None, detail, now), now):
             self._state.last_start_notice_ts = now.isoformat()
             self._store.save(self._state)
@@ -1083,9 +1132,28 @@ class Monitor:
         self._pending[problem.key] = seen
         return seen >= self._s.confirm_cycles
 
+    def _close_retired(self, now: datetime) -> None:
+        """Close every OPEN alert whose key belongs to a retired target with ONE "RETIRED" message.
+
+        Never "RESOLVED": the problem was not resolved, the target is simply no longer watched. The
+        entry is dropped from the persisted state only once the message was really sent, so a
+        Telegram outage delays it (retried next cycle) but never loses it; afterwards nothing is
+        left to repeat.
+        """
+        retired_keys = self._s.retired_keys
+        for key in sorted(k for k in self._state.tracked if k in retired_keys):
+            text = redact(f"[{self._s.hostname}] RETIRED {key}: no longer monitored ({ENV_RETIRED})")
+            text += f"\n{now:%Y-%m-%d %H:%M:%S} UTC"
+            if not self._try_send(text, now):
+                return
+            del self._state.tracked[key]
+            self._pending.pop(key, None)
+            self._store.save(self._state)
+
     def _plan(self, found: Collected, now: datetime) -> list[Event]:
         problems = found.problems
         tracked = self._state.tracked
+        retired_keys = self._s.retired_keys
         repeat = timedelta(hours=self._s.repeat_hours)
         events: list[Event] = []
         for key in [k for k in self._pending if k not in problems]:
@@ -1101,7 +1169,7 @@ class Monitor:
             if now - last_sent >= repeat:
                 events.append(Event("reminder", key, problem.summary))
         for key, item in tracked.items():
-            if key in problems:
+            if key in problems or key in retired_keys:  # retired: closed by _close_retired, not resolved
                 continue
             if found.is_frozen(key):  # unknown is not clear: keep the alert open, restart the count
                 item.clear_count = 0
@@ -1144,6 +1212,7 @@ class Monitor:
     def run_cycle(self) -> list[Event]:
         """Run all checks once. Returns the events that were actually sent."""
         now = self._probes.now()
+        self._close_retired(now)  # normally done in start(); this retries after a Telegram outage
         self._memory.open_keys = set(self._state.tracked)
         found = collect(self._s, self._probes)
         sent: list[Event] = []
@@ -1234,7 +1303,11 @@ def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None
     args = parser.parse_args(argv)
     environ = os.environ if env is None else env
     setup_logging()
-    settings = load_settings(environ)
+    try:
+        settings = load_settings(environ)
+    except ConfigError as exc:
+        log.error("configuration error: %s", exc)
+        return 2
     probes = Probes()
     if args.check:
         _print_problems(collect_problems(settings, probes))
