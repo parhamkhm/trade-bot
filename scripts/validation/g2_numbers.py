@@ -7,6 +7,10 @@ Run from the repository root::
 Without ``--with vectorbt`` the vectorbt section is reported as unavailable and everything else still runs.
 Data: Binance BTCUSDT 1d / 1h from the local Parquet store, bars closing before 2025-10-01 only (the loader
 used here cannot return the sealed holdout), plus seeded synthetic series where a section says so.
+
+Sizing: every section runs the engine's DEFAULT config (``buy_buffer_bps = 0``, BUYs capped at fill time, SPEC
+D-051 as revised 2026-10-11) unless it says otherwise. The 10 bps buffer of the earlier engine is passed
+explicitly (``BPS_BUFFER_LEGACY``) only where the section documents that configuration.
 """
 
 from __future__ import annotations
@@ -19,12 +23,13 @@ from itertools import pairwise
 
 import numpy as np
 import pandas as pd  # type: ignore[import-untyped]
+from tests.sim_helpers import make_bar
 from tests.validation import test_hand_computed as hand
 from tests.validation import test_metrics_independent as metrics_check
 from tests.validation import test_truncation as trunc
 from tests.validation import test_vectorbt_crosscheck as xcheck
 from tests.validation.data import find_parquet_root, real_bars
-from tests.validation.harness import Peeker, compare_prefix, make_cfg, run
+from tests.validation.harness import BPS_BUFFER_LEGACY, Peeker, compare_prefix, make_cfg, run
 from tests.validation.reference import (
     RefParams,
     pandas_signals,
@@ -59,7 +64,7 @@ def data_section() -> None:
         if abs(b.open / a.close - 1) > Decimal("0.001")
     ]
     largest = max(map(abs, gaps))
-    print(f"days with |open gap| above the 10 bps buy buffer: {len(gaps)} (largest {largest:.0f} bps)")
+    print(f"days with |open gap| above 10 bps (former buy buffer): {len(gaps)} (largest {largest:.0f} bps)")
 
 
 def _sources() -> list[str]:
@@ -137,14 +142,26 @@ def warmup_section() -> None:
 
 
 def hand_section() -> None:
-    section("HAND-COMPUTED 5-BAR EXAMPLE (10 bps fee, 5 bps slippage, 10 bps buy buffer)")
+    section("HAND-COMPUTED 5-BAR EXAMPLE (10 bps fee, 5 bps slippage; buffer 10 as derived, then default 0)")
     bars = hand.five_bars()
-    res = run(hand.Scripted([1.0, 1.0, 0.0, 0.0, 0.0], bars), bars, make_cfg())
+    scripted = [1.0, 1.0, 0.0, 0.0, 0.0]
+    res = run(hand.Scripted(scripted, bars), bars, make_cfg(buffer_bps=BPS_BUFFER_LEGACY))
     for r in res.fills:
         f = r.fill
-        print(f"{f.side.value} qty={f.quantity} price={f.price} fee={f.fee}")
+        print(f"buffer=10: {f.side.value} qty={f.quantity} price={f.price} fee={f.fee}")
     print("equity:", [str(p.equity) for p in res.equity])
     print(f"fees={res.fees_paid} slippage={res.slippage_cost} final={res.equity[-1].equity}")
+    res0 = run(hand.Scripted(scripted, bars), bars, make_cfg())
+    f0 = res0.fills[0].fill
+    print(f"buffer=0: BUY qty={f0.quantity} price={f0.price} fee={f0.fee} resizes={len(res0.resizes)}")
+    gapped = list(bars)
+    gapped[1] = make_bar(1, "100.5", "105")
+    resg = run(hand.Scripted(scripted, gapped), gapped, make_cfg())
+    z, fg = resg.resizes[0], resg.fills[0].fill
+    print(
+        f"gap-up open 100.5: requested={z.requested_quantity} capped to {z.filled_quantity} kind={z.kind} "
+        f"price={fg.price} fee={fg.fee} rejections={len(resg.rejections)}"
+    )
 
 
 def _vectorbt_importable() -> bool:
@@ -157,8 +174,19 @@ def _vectorbt_importable() -> bool:
     return True
 
 
+def _resize_summary(res: object) -> str:
+    resizes = res.resizes  # type: ignore[attr-defined]
+    kinds = [z.kind for z in resizes]
+    worst = max((float(z.capped_fraction) for z in resizes), default=0.0)
+    return (
+        f"fill rejections={len(res.rejections)} resizes={len(resizes)} "  # type: ignore[attr-defined]
+        f"(price_move={kinds.count('price_move')}, anomaly={kinds.count('anomaly')}; "
+        f"largest capped fraction {worst:.4%})"
+    )
+
+
 def vectorbt_section() -> None:
-    section("VECTORBT CROSS-CHECK (BTCUSDT 1d, fee 10 bps, slip 5 bps, next-open fills)")
+    section("VECTORBT CROSS-CHECK (BTCUSDT 1d, fee 10 bps, slip 5 bps, next-open fills, default buffer 0)")
     source = "real" if HAVE_STORE else "synthetic"
     bars = xcheck._bars(source)
     print(f"source={source} bars={len(bars)}")
@@ -172,13 +200,20 @@ def vectorbt_section() -> None:
         eng = [(f.fill.side.value, f.fill.price, f.fill.quantity, f.fill.fee) for f in res.fills]
         same = eng == [(f.side, f.price, f.quantity, f.fee) for f in ref.fills]
         same_eq = [p.equity for p in res.equity] == ref.equity
+        same_rs = [(z.requested_quantity, z.filled_quantity) for z in res.resizes] == [
+            (z.requested, z.filled) for z in ref.resizes
+        ]
         final = float(res.equity[-1].equity)
         print(f"[{name}] fills={len(res.fills)} fees={float(res.fees_paid):.5f} final={final:.4f}")
-        print(f"  A: Decimal reference identical fills={same} identical equity curve={same_eq}")
-        res0 = run(xcheck._strategy(name), bars, make_cfg(buffer_bps=Decimal(0)))
+        print(f"  sizing: {_resize_summary(res)}")
         print(
-            f"  buffer=0: final={float(res0.equity[-1].equity):.2f} "
-            f"INSUFFICIENT_FUNDS rejections={len(res0.rejections)}"
+            f"  A: Decimal reference identical fills={same} identical equity curve={same_eq} "
+            f"identical resizes={same_rs}"
+        )
+        res10 = run(xcheck._strategy(name), bars, make_cfg(buffer_bps=BPS_BUFFER_LEGACY))
+        print(
+            f"  legacy buffer=10: final={float(res10.equity[-1].equity):.2f} resizes={len(res10.resizes)} "
+            f"rejections={len(res10.rejections)}"
         )
         if not have_vbt:
             continue
@@ -194,17 +229,24 @@ def vectorbt_section() -> None:
         )
         naive = vectorbt_naive_all_in(bars, sig, **kw)
         nv = float(naive.value().iloc[-1])
-        pred = xcheck._predicted_buffer_shortfall(res, bars[-1].close)
         print(
-            f"  C: naive all-in vbt final={nv:.4f} engine/naive-1={e[-1] / nv - 1:+.4%} "
-            f"predicted by the buffer={pred:+.4%} orders naive={naive.orders.count()}"
+            f"  C (OFFICIAL, identical sizing): naive all-in vbt final={nv:.4f} "
+            f"engine/naive-1={e[-1] / nv - 1:+.3e} ({e[-1] / nv - 1:+.4%}) "
+            f"orders naive={naive.orders.count()} "
+            f"engine={len(res.fills)}"
+        )
+        e10 = xcheck._engine_equity(res10)
+        pred = xcheck._predicted_buffer_shortfall(res10, bars[-1].close)
+        print(
+            f"  C (literal, buffer 10, clarification): engine/naive-1={e10[-1] / nv - 1:+.4%} "
+            f"closed-form prediction from the 10 bps holdback={pred:+.4%}"
         )
         oracle = reference_orders(
             bars, sig, replace(RefParams(), sizing="oracle_open", buffer_bps=Decimal(0))
         )
         orc = vectorbt_run(bars, oracle, **kw)
         abl = float(orc.value().iloc[-1]) / nv - 1
-        print(f"     ablation (no buffer, fill price known) vs naive: {abl:+.2e}")
+        print(f"     ablation (oracle sizing, fill price known) vs naive: {abl:+.2e}")
 
 
 def metrics_section() -> None:

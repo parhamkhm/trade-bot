@@ -20,7 +20,7 @@ from tbot.core.types import Bar, BarWindow, TargetIntent, Timeframe
 from tbot.strategies.sma_filter import SmaFilter
 from tests.sim_helpers import make_bar
 from tests.validation.data import find_parquet_root, real_bars, synthetic_bars
-from tests.validation.harness import make_cfg, run
+from tests.validation.harness import BPS_BUFFER_LEGACY, make_cfg, run
 
 D = Decimal
 needs_store = pytest.mark.skipif(find_parquet_root() is None, reason="local Binance Parquet store not found")
@@ -56,6 +56,9 @@ def five_bars() -> list[Bar]:
 def test_five_bar_example_to_the_cent() -> None:
     """Long at the first close, flat at the third close; 10 bps fee, 5 bps slippage, 10 bps buy buffer.
 
+    The 10 bps buffer is passed EXPLICITLY: it is the configuration this example was derived for (the engine's
+    default buffer is 0 since 2026-10-11; the default is hand-computed in the two tests that follow).
+
     Derivation (initial cash 10 000, tick 0.01, step 0.00001):
 
     * close(0) = 100: target 1.0. cost_factor = (1 + 0.0005)(1 + 0.001)(1 + 0.001) = 1.0025020005, so the
@@ -74,7 +77,7 @@ def test_five_bar_example_to_the_cent() -> None:
       10798.00336 - 20.7470898558 - 10.9725462 = 10766.2837239442 exactly.
     """
     bars = five_bars()
-    res = run(Scripted([1.0, 1.0, 0.0, 0.0, 0.0], bars), bars, make_cfg())
+    res = run(Scripted([1.0, 1.0, 0.0, 0.0, 0.0], bars), bars, make_cfg(buffer_bps=BPS_BUFFER_LEGACY))
 
     buy, sell = (r.fill for r in res.fills)
     assert (buy.side.value, buy.quantity, buy.price, buy.fee) == (
@@ -113,6 +116,48 @@ def test_five_bar_example_without_costs_is_the_plain_arithmetic() -> None:
     assert res.fills[0].fill.quantity == D("100")  # 10000 / 100 exactly
     assert res.equity[-1].equity == D("10800")  # 100 * (108 - 100) + 10000
     assert res.fees_paid == 0 and res.slippage_cost == 0
+
+
+def test_five_bar_example_with_the_default_zero_buffer() -> None:
+    """Default engine config (buffer 0): the same example, derived by hand.
+
+    * close(0) = 100: cost_factor = (1 + 0.0005)(1 + 0.001) = 1.0015005; budget 10000 / 1.0015005 =
+      9985.0194...; quantity = floor(budget / 100, step) = 99.85017.
+    * open(1) = 100: BUY fills at 100.05 (no gap). The fill-time cap floor(10000 / (100.05 * 1.001), step) is
+      the same 99.85017, so nothing is capped. Notional 9990.0095085, fee 9.9900095085, cash left
+      0.0004819915.
+    """
+    bars = five_bars()
+    res = run(Scripted([1.0, 1.0, 0.0, 0.0, 0.0], bars), bars, make_cfg())
+    buy = res.fills[0].fill
+    assert (buy.quantity, buy.price, buy.fee) == (D("99.85017"), D("100.05"), D("9.9900095085"))
+    assert res.equity[1].cash == D("0.0004819915")
+    assert not res.rejections and not res.resizes
+
+
+def test_gap_up_buy_is_capped_at_fill_time_not_rejected() -> None:
+    """The new sizing rule on a hand-made gap: open(1) = 100.5 is 0.5 % above the close it was sized at.
+
+    * Sized at close(0) = 100 exactly as above: requested 99.85017.
+    * BUY price at open(1) = ceil(100.5 * 1.0005, tick) = 100.56. At that price the requested order costs
+      99.85017 * 100.56 * 1.001 = 10050.97 > 10000 cash, which the old engine rejected (INSUFFICIENT_FUNDS).
+    * Cap: floor(10000 / (100.56 * 1.001), step) = floor(10000 / 100.66056) = 99.34377 (-0.5072 % of the
+      request, below the 1 % anomaly threshold: kind "price_move"). Notional 9990.0095112, fee
+      9.9900095112, cash left 0.0004792888.
+    """
+    bars = five_bars()
+    bars[1] = make_bar(1, "100.5", "105")
+    res = run(Scripted([1.0, 1.0, 0.0, 0.0, 0.0], bars), bars, make_cfg())
+    assert not res.rejections
+    (resize,) = res.resizes
+    assert (resize.requested_quantity, resize.filled_quantity, resize.kind) == (
+        D("99.85017"),
+        D("99.34377"),
+        "price_move",
+    )
+    buy = res.fills[0].fill
+    assert (buy.quantity, buy.price, buy.fee) == (D("99.34377"), D("100.56"), D("9.9900095112"))
+    assert res.equity[1].cash == D("0.0004792888")
 
 
 @pytest.mark.parametrize(("fee_bps", "slip_bps"), [(0, 0), (10, 0), (0, 5), (10, 5), (20, 10)])

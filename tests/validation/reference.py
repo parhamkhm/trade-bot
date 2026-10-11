@@ -5,6 +5,9 @@
 
     decision at close(t)  ->  order sized at close(t)  ->  fill at open(t+1) with adverse slippage,
     fee charged on the slipped notional, price rounded adversely to the tick, quantity floored to the step.
+    A BUY that cash no longer affords at the real fill price is capped to
+    ``floor_to_step(cash / (fill_price * (1 + fee)))`` (SPEC D-051 as revised 2026-10-11) and logged as a
+    resize; it is rejected only if the capped order falls below the minimum notional.
 
 It is a plain Decimal loop, so the engine can be compared with it EXACTLY, and its order list can be fed to
 vectorbt as the independent portfolio accounting (``vectorbt_run``) for a float-precision comparison.
@@ -29,6 +32,7 @@ BPS = Decimal(10_000)
 __all__ = [
     "RefFill",
     "RefParams",
+    "RefResize",
     "RefResult",
     "pandas_signals",
     "reference_orders",
@@ -41,13 +45,16 @@ __all__ = [
 class RefParams:
     fee_bps: Decimal = Decimal(10)
     slip_bps: Decimal = Decimal(5)
-    buffer_bps: Decimal = Decimal(10)
+    # Default 0 = the engine's default (the sizing divisor already carries slippage and fee, and the BUY is
+    # capped at fill time). The literal pre-2026-10-11 configuration passes Decimal(10) explicitly.
+    buffer_bps: Decimal = Decimal(0)
     tick: Decimal = Decimal("0.01")
     step: Decimal = Decimal("0.00001")
     min_notional: Decimal = Decimal(1)
     drift_tolerance: Decimal = Decimal("0.02")
     initial_cash: Decimal = Decimal(10_000)
-    # "close": the engine's rule, sized at close(t) with the buffer. "oracle_open": ablation only, sized with
+    # "close": the engine's rule, sized at close(t) (plus the optional buffer; the BUY is then capped at fill
+    # time). "oracle_open": ablation only, sized with
     # knowledge of the fill price at open(t+1) and no buffer, i.e. spend (almost) all cash like a naive
     # all-in vectorbt run does; it is not causal and is used to attribute the buffer effect, never as a rule.
     sizing: str = "close"
@@ -63,12 +70,20 @@ class RefFill:
 
 
 @dataclass(frozen=True)
+class RefResize:
+    row: int  # index of the bar whose OPEN the capped BUY fills at
+    requested: Decimal
+    filled: Decimal
+
+
+@dataclass(frozen=True)
 class RefResult:
     fills: list[RefFill]
     equity: list[Decimal]  # marked at each bar close
     cash: list[Decimal]
     quantity: list[Decimal]
     rejected_buys: int
+    resizes: list[RefResize]
 
 
 def pandas_signals(bars: Sequence[Bar], kind: str, n: int = 100) -> pd.Series:
@@ -103,20 +118,26 @@ def reference_orders(bars: Sequence[Bar], weights: pd.Series, params: RefParams 
     cash_path: list[Decimal] = []
     qty_path: list[Decimal] = []
     rejected = 0
+    resizes: list[RefResize] = []
     for t, bar in enumerate(bars):
         if pending is not None:
             side, q = pending
             pending = None
             if side == "BUY":
                 price = _ceil(bar.open * (1 + slip), p.tick)
-                notional = price * q
-                fee_amt = notional * fee
-                if notional + fee_amt > cash:
-                    rejected += 1
-                else:
+                requested = q
+                if price * q * (1 + fee) > cash:  # price moved against the close-sized order: cap it
+                    q = _floor(cash / (price * (1 + fee)), p.step)
+                if q > 0 and price * q >= p.min_notional:
+                    if q < requested:
+                        resizes.append(RefResize(t, requested, q))
+                    notional = price * q
+                    fee_amt = notional * fee
                     cash -= notional + fee_amt
                     qty += q
                     fills.append(RefFill(t, side, price, q, fee_amt))
+                else:
+                    rejected += 1
             else:
                 price = _floor(bar.open * (1 - slip), p.tick)
                 notional = price * q
@@ -149,7 +170,7 @@ def reference_orders(bars: Sequence[Bar], weights: pd.Series, params: RefParams 
             q = qty if target == 0 else _floor(min(-gap / bar.close, qty), p.step)
             if q > 0 and bar.close * q >= p.min_notional:
                 pending = ("SELL", q)
-    return RefResult(fills, equity, cash_path, qty_path, rejected)
+    return RefResult(fills, equity, cash_path, qty_path, rejected, resizes)
 
 
 def _series(bars: Sequence[Bar], field: str) -> pd.Series:
