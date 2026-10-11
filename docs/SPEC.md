@@ -289,6 +289,12 @@ spread across ≥ 6 h. Every number carries where and when it was measured.
     and a millisecond server time; `min_rtt` and the fastest 10 % (`ceil(calls/10)` = 12) are taken over valid
     calls only, ties by call index (both choices can only make passing harder); a slot missed by more than
     min(5 s, spacing/2) is skipped, never made up, and counts as not valid;
+  - **G0 result (final, Parham 2026-10-11): FAIL on the clock item, PASS on every other item.** Sampling run
+    2026-10-11 04:28–10:40 UTC: endpoints 100 % valid, no ban response; `accuracy` 32/32; median spread one tick;
+    clock inconclusive. Re-test (D-079, rule in commit 6dd5b07) 16:17:45–17:17:18 UTC: |offset| + min_rtt/2 =
+    929.9 ms ≥ 500 ms ⇒ FAIL (120/120 valid calls; min RTT 1090 ms). G0 is never to be relabelled a pass. Its
+    scope is clarified in D-083 (post-hoc); evidence in `docs/reports/g0-lbank-report.md`,
+    `research/reports/g0_lbank_20261011/` and `research/reports/g0_lbank_clock_20261011/`;
   - `accuracy` lists `btc_usdt` with readable price/quantity precision, minimum quantity and minimum order value;
   - median best bid/ask spread < 0.20 %.
 - *Reported, not gating:*
@@ -637,6 +643,8 @@ takes over. The new choice is kept at least 3 months, and every switch needs Par
 | D-080 | **Signed-client clock calibration (phase 5b, approved by Parham 2026-10-11, independent of the D-079 result).** The LBank signed client measures its offset to LBank server time from minimum-RTT `timestamp.do` samples (as in D-079), applies it to every signed request's timestamp, re-calibrates periodically and after any timestamp/recvWindow rejection, and logs each calibration (offset, min RTT, sample count, UTC time). A calibration that fails or shows a large jump halts signed calls and alerts instead of guessing | LBank's time endpoint is slow (median RTT ≈ 1.2 s), so a naive single-call offset can be several hundred ms wrong; signed requests must not depend on that |
 | D-081 | **Buy sizing at fill time in both fill modes; resize classification in D-082 (Parham, 2026-10-11, locked before any phase 3 result; supersedes D-078's next-open rule).** (1) In next-open AND manual-delay mode a BUY is capped at fill time to `floor_to_step(cash / (fill_price × (1 + taker_fee_rate)))`; the fill price is re-derived at the final capped quantity (size-dependent slippage) and affordability re-checked, so notional + fee never exceeds cash. A cap that leaves zero or less than min qty / min notional is rejected; SELLs are never capped; exits are sized from the held quantity booked from fills. (2) The stub buy buffer is 0 (the cap covers the taker fee; the stub sizing covers fee and slippage). (3) Manual-delay mode requires 1h execution bars, so a 6 h delay fills exactly at signal close + 6 h. Real data (laptop-measured, 6 h delay, SMA100 1d): 21 resizes, all `price_move`, largest 6.25 % on 2020-04-30 | a live market buy is sized at the open from the real price and cash (quote-amount market order) and a manual order when it is placed; rejecting the whole buy on a gap-up biased every strategy and benchmark against entries in rising markets |
 | D-082 | **Resize anomalies by cause — post-review clarification, made before any Phase 3 result (Parham, 2026-10-11; replaces the fixed 1 % threshold briefly tried in review).** For EVERY BUY that carries a sizing reference (the signal-bar close and the cash at submit time, passed by the engine through `SimulatedBroker.submit(..., sizing_price=, sizing_cash=)`; `core/types.py` unchanged), the broker tests at fill time whether `requested_qty × sizing_price × (1 + taker fee) ≤ sizing_cash`. Not affordable ⇒ `anomaly` (a sizing bug), recorded whether or not a cap follows and whatever the price did, and the run is INVALID (CLI exit 3) like a fill rejection. Affordable but capped at fill ⇒ counted `price_move` (the reason says whether the open rose above the sizing price or only fees/slippage forced the cap), whatever the size of the move; the run stays valid. A capped BUY with no sizing reference ⇒ `anomaly` (fail safe); an uncapped BUY without a reference is not recorded. `ResizeRecord` carries `capped_quantity`, `filled`, `kind`, `sizing_price`, `sizing_cash`. Real data (laptop-measured, final engine, 6 h delay, SMA100 1d): 21 resizes, all `price_move`, 0 anomalies | a fixed percentage threshold would flag genuine 2–6 % price moves over a 6 h delay as bugs (six such moves in the BTC data) while missing an oversized order whose price then fell; testing affordability at the sizing reference separates a mis-sized order from price movement exactly |
+| D-083 | **G0 clock item: scope — post-hoc scoping clarification, written after the 2026-10-11 clock verdict (Parham, 2026-10-11).** G0 stays recorded as FAIL on the clock item (rule of commit 6dd5b07) and PASS on every other item; the criterion itself is unchanged. The clock item gates **signed (private) requests only**: it is a blocker for the first phase that sends any signed request (the postponed private G0 read, before phase 7a, and phase 5b), and it does **not** gate phases 1–4, which send no signed request. Before the first signed request the functional signed-request test (§10.3, once approved) must also pass | the clock item exists because LBank validates the timestamp of signed requests; phases 1–4 only read public endpoints and Binance files, so a clock offset cannot affect them; written after the verdict and labelled as such so it is not mistaken for a pre-registered rule |
+| D-084 | **Design constraint: network round trip Turkey server ↔ LBank public API ≈ 1.1–1.3 s** (min 1090 ms, median ≈ 1300 ms, p95 ≈ 2.8 s, max 6.8 s; 120 `timestamp.do` calls, 2026-10-11 16:17–17:17 UTC, `research/reports/g0_lbank_clock_20261011/`). **No strategy may depend on execution or reaction faster than a few seconds**; every latency assumption in a backtest or live component must be at least this slow | measured from the only server we have; a strategy that needs sub-second reaction would be untestable and unexecutable from here |
 
 ---
 
@@ -658,10 +666,12 @@ takes over. The new choice is kept at least 3 months, and every switch needs Par
 
 ---
 
-## 10. Phase 5b checklist (order code; every item must be VERIFIED before any order code ships)
+## 10. Pre-live checklists (phase 7a and phase 5b blockers)
 
 Items stay **UNVERIFIED** until checked against LBank itself (docs, and a read-only or minimum-size test once the
-key exists), with the evidence recorded in `docs/vendor/` and the date here.
+key exists), with the evidence recorded in `docs/vendor/` and the date here. Phases 1–4 are unaffected.
+
+### 10.1 Phase 5b checklist (order code; every item must be VERIFIED before any order code ships)
 
 1. **UNVERIFIED — quote-amount (USDT) market buy.** Does LBank spot accept a market BUY sized by quote amount
    (USDT), as the `SimulatedBroker` docstring and D-081 assume (the backtest caps a BUY at fill time to what cash
@@ -672,3 +682,57 @@ key exists), with the evidence recorded in `docs/vendor/` and the date here.
    base quantity of `filled × (1 − fee rate)`, or every buy shows a mismatch and halts trading.
 3. **Signed-client clock calibration (D-080).** Offset to LBank server time measured from minimum-RTT samples,
    applied to every signed request, re-calibrated periodically and after any timestamp rejection, and logged.
+
+### 10.2 Phase 7a blockers (planning only, no code)
+
+4. **Exchange account eligibility — clause verified 2026-10-11; the account holder's country of residence is to
+   be confirmed by Parham. Until then: UNVERIFIED, and live trading on LBank is BLOCKED.** LBank's own *LBank User
+   Service Agreement* (https://www.lbank.com/support/articles/21436496711705, page date **2026-07-22**, read
+   2026-10-11) says in its Important Notice: "This Platform does not accept registration or investment from
+   individuals in the following countries or regions: Afghanistan, Antigua and Barbuda, Azerbaijan, Bangladesh,
+   Burkina Faso, Burundi, Central African Republic, Crimea, Cuba, Democratic Republic of the Congo, Donetsk,
+   Egypt, Guinea-Bissau, Hong Kong SAR, Iran, Iraq, Kyrgyzstan, Lebanon, Lesotho, Libya, Luhansk, Macao SAR,
+   Mainland China, Mali, Mauritania, North Korea, Somalia, South Sudan, Sudan and Darfur, Syria, United States,
+   Uruguay, Yemen, and Canada." Its Special Disclaimer repeats it: "LBank has determined not to provide
+   services to clients from the following countries or regions: [...] Iran [...]". A secondary source
+   (cryptowinrate, updated 2026-09-30) also lists Iran. **If the account holder's country of residence is on
+   this list, live trading on LBank is blocked and the exchange choice returns to Parham for a decision before
+   phase 7a.** D-065 (venue risks accepted) does not override the exchange's own eligibility terms. This project
+   neither proposes nor supports any way of circumventing exchange restrictions.
+5. **Server location rule — UNVERIFIED for each location against the exchange's terms.** Every exchange-facing
+   service (recorder, signal/paper service, any signed client) runs from a location permitted by the exchange's
+   terms. Any server move requires re-running the G0 network checks (latency and the clock measurement) from the
+   new server, and restarts the G1b 7-day clock.
+
+### 10.3 DRAFT pre-registration — functional signed-request test (NOT final; Parham reviews before it is committed as final; not run)
+
+6. **Purpose.** With the D-080 offset correction, LBank must accept signed read-only requests without timestamp or
+   recv-window errors. Runs only after item 4 is resolved and a read-only key exists; G0's clock item stays FAIL
+   regardless (D-083).
+   - *LBank's rule* (LBank API docs, https://www.lbank.com/docs/index.html, read 2026-10-11): a signed request is
+     invalid if it is received more than **5000 ms** after its `timestamp`, or if its `timestamp` is more than
+     **1000 ms** ahead of server time; error 10600 "Request timeout, please check the difference between
+     timestamp and server time". Error 10028 "Wrong query time" is also counted as time-related.
+   - *Method.* Immediately before the run, calibrate per D-080: at least 30 `timestamp.do` calls, offset = median
+     of the fastest 10 % by RTT. Then **240 signed read-only calls** (one fixed read-only endpoint, e.g. account
+     balances), **30 s** apart over **2 h**, one in flight; each `timestamp` = host wall clock read immediately
+     before sending + calibrated offset (no added skew). Record per call the RTT, HTTP status and LBank error
+     code. A first-attempt time-related rejection is re-signed with a fresh timestamp and retried **once**,
+     immediately (read-only, so a retry is safe).
+   - *Pass iff all hold:* (a) no 429/403/418 at all (a ban-type response stops the run and fails it); (b) at least
+     216 of 240 calls (90 %) get an HTTP response; (c) **at least 97 % of the responded calls are accepted on the
+     first attempt** with no time-related error; (d) every first-attempt time-related rejection succeeds on its
+     single retry; (e) **no time-related rejection on any call whose own measured RTT is below 3000 ms**. Run
+     once; a re-run only for a documented infrastructure fault, after a new pre-registration.
+   - *Structural passability* (checked before registration, CLAUDE.md §3.5; uses only the 2026-10-11 clock
+     evidence: RTT min 1090 / median 1304 / p95 2785 / max 6807 ms, n = 120). Let `d` be the uplink delay
+     (0 ≤ d ≤ RTT) and `e` the offset-estimate error, bounded by path asymmetry to |e| ≤ min_rtt/2 = 545 ms. The
+     server sees `receive − timestamp = d + e`. The future check `d + e > −1000` always holds (d ≥ 0, e ≥ −545).
+     The late check `d + e < 5000` holds for every call with RTT < 5000 − 545 = 4455 ms. In the evidence 2/120 =
+     1.7 % of RTTs exceeded 4455 ms, so the worst-case first-attempt failure rate is about 1.7 % < 3 %: (c) is
+     passable. A call with RTT < 3000 ms has `d + e ≤ 3545 < 5000`, so (e) can fail only through a calibration
+     error larger than about 1.4 s, which is exactly what the test must detect. A rule of "zero time-related
+     errors in 240 calls" would be structurally fragile (at a 1.7 % spike rate a clean run has about a 2 % chance)
+     and is therefore not used.
+   - *Guardrail note.* LBank's signed read endpoints use HTTP POST, which the order-code guardrail blocks under
+     `src/` and `scripts/`; the client for this test needs Parham's explicit, scoped unlock and review.

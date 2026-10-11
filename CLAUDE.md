@@ -52,6 +52,11 @@ stop before live trading — that is a successful result of this process, not a 
    The **last 12 months of data are a sealed holdout**: no code may load them until gate G4, and only once.
    Every experiment (parameter set, variant) is logged in `research/EXPERIMENTS.md` so the trial count for
    Deflated Sharpe / PBO is honest.
+   **Before registering any criterion, check that it is not structurally unpassable** given known physical floors
+   (e.g. a measured network round trip, a data history that starts too late, a minimum sample size). This check
+   may only reject or redesign a criterion *before* registration; it must never tune a threshold to an observed
+   outcome. (Added 2026-10-11 after the G0 clock re-test, where half the minimum round trip, 545 ms, already
+   exceeded the 500 ms limit.)
 6. **Safety by default.**
    - Dry-run is the default mode. **No exchange order code exists before phase 5b** (see §9): until then the bot
      only emits signals and a human places orders by hand (phase 7a). From 5b on, the automated order path is only
