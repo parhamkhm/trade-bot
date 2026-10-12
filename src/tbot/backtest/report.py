@@ -137,6 +137,8 @@ def build_report(result: BacktestResult, benchmarks: BenchmarkSet | None = None)
             "stop_fills": len(result.stop_fills),
             "entries_refused_invalid_stop": result.entries_refused_invalid_stop,
             "orders_cancelled_by_engine": result.orders_cancelled_by_engine,
+            "stop_levels_from_later_window": result.stop_levels_from_later_window,
+            "p_ref_from_late_bar": result.p_ref_from_late_bar,
         },
         "health": {
             "decisions": dict(decisions),
@@ -209,7 +211,8 @@ def _stops_line(stops: dict[str, Any]) -> str:
     return (
         f"- Protective stops: enforced; stop fills {stops['stop_fills']}, entries refused for an invalid "
         f"stop {stops['entries_refused_invalid_stop']}, orders cancelled by the engine "
-        f"{stops['orders_cancelled_by_engine']}"
+        f"{stops['orders_cancelled_by_engine']}, stop levels from a later window "
+        f"{stops['stop_levels_from_later_window']}, P_ref from a late bar {stops['p_ref_from_late_bar']}"
     )
 
 

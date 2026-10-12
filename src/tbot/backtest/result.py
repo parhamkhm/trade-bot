@@ -27,6 +27,8 @@ STOP_FILL = "STOP_FILL"  # the engine sold the position at the stop
 STOP_REJECTED = "STOP_REJECTED"  # a stop exit was rejected by the broker (below min_notional)
 ENTRY_REFUSED = "ENTRY_REFUSED_INVALID_STOP"  # D-050: no valid stop at P_ref, pending entry cancelled
 CANCELLED_BY_STOP = "ORDER_CANCELLED_BY_STOP"  # a pending order cancelled when the stop sold the position
+STOP_LEVEL_LATER_WINDOW = "STOP_LEVEL_FROM_LATER_WINDOW"  # entry worked only after an earlier attempt failed
+P_REF_LATE = "P_REF_FROM_LATE_BAR"  # first execution bar was not the open at the signal close (missing bar)
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +89,18 @@ class BacktestResult:
         """Approved orders the engine cancelled before they could fill (refused entry, or pending when a
         stop sold the position). They are neither fills nor ``unfilled_order_ids``."""
         return sum(1 for e in self.stop_events if e.kind in (ENTRY_REFUSED, CANCELLED_BY_STOP))
+
+    @property
+    def stop_levels_from_later_window(self) -> int:
+        """Positions opened only after an earlier entry attempt failed (D-050 refusal, risk refusal or a
+        rejected order) while the strategy kept wanting to be long: the stop level was computed from a later
+        window than the strategy's own entry, so its own stop state can differ from the engine's."""
+        return sum(1 for e in self.stop_events if e.kind == STOP_LEVEL_LATER_WINDOW)
+
+    @property
+    def p_ref_from_late_bar(self) -> int:
+        """Entries whose P_ref was the open of a bar later than the signal close (a missing execution bar)."""
+        return sum(1 for e in self.stop_events if e.kind == P_REF_LATE)
 
     @property
     def initial_cash(self) -> Decimal:
