@@ -11,6 +11,7 @@ from types import ModuleType
 import pytest
 
 from tbot.core.types import Strategy
+from tbot.execution.simulated import DepthCurveSlippage
 from tbot.strategies.phase3_registry import PHASE3_ENTRIES, S0_VARIANTS, Phase3Entry
 from tbot.strategies.sma_filter import SmaFilter
 from tbot.validation.preflight import (
@@ -43,11 +44,9 @@ GRID_KEYS = [e.key for e in PHASE3_ENTRIES if e.key != "S0"]
 COMPLETE = HEADER + S0 + _grid_rows(GRID_KEYS)
 
 
-class _Curve:
-    """Stands in for the depth-curve model: anything with ``slippage_bps``."""
-
-    def slippage_bps(self, ctx: object) -> Decimal:  # noqa: ARG002
-        return Decimal(7)
+def _curve() -> DepthCurveSlippage:
+    pts = ((Decimal(0), Decimal(0)), (Decimal(1_000), Decimal(10)), (Decimal(5_000), Decimal(50)))
+    return DepthCurveSlippage(pts, pts, Decimal(1), Decimal(10_000))
 
 
 def test_complete_log_passes() -> None:
@@ -144,11 +143,12 @@ def test_flat_slippage_is_refused_unless_explicitly_allowed_for_tests() -> None:
 
 
 def test_a_slippage_model_object_satisfies_the_check_and_survives_the_stress() -> None:
-    costs = NORMAL_COSTS.with_model(_Curve(), "10 bps fee + curve")
+    costs = NORMAL_COSTS.with_model(_curve(), "10 bps fee + curve")
     assert not costs.is_flat_slippage and check_slippage(costs, allow_flat=False) == []
     stressed = costs.stressed()
     assert not stressed.is_flat_slippage and check_slippage(stressed, allow_flat=False) == []
     assert stressed.fee_bps == 2 * costs.fee_bps
+    assert isinstance(stressed.slippage_model, DepthCurveSlippage)
 
 
 def test_missing_data_is_a_refusal_naming_the_series() -> None:

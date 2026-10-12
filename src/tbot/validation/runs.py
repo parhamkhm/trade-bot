@@ -54,6 +54,7 @@ from tbot.backtest.engine import run_backtest
 from tbot.backtest.feed import BacktestFeed
 from tbot.backtest.result import BacktestResult
 from tbot.backtest.risk_stub import StubRiskManager
+from tbot.backtest.slippage import stressed as engine_stressed
 from tbot.core.config import CostConfig
 from tbot.core.types import (
     Approved,
@@ -68,7 +69,7 @@ from tbot.core.types import (
     TargetIntent,
     Timeframe,
 )
-from tbot.execution.simulated import SlippageContext, SlippageModel
+from tbot.execution.simulated import FlatSlippage, SlippageModel
 from tbot.strategies.buy_and_hold import BuyAndHold
 from tbot.validation.policy import (
     PENDING_ORDER_UNDER_DELAY,
@@ -87,7 +88,6 @@ __all__ = [
     "FillMode",
     "GatingRiskManager",
     "Market",
-    "ScaledSlippage",
     "SeriesRun",
     "StrategyFactory",
     "default_filters",
@@ -109,17 +109,6 @@ class FillMode(StrEnum):
 
 
 @dataclass(frozen=True)
-class ScaledSlippage:
-    """A slippage model with every fill's impact multiplied by ``factor`` (the x2 stress of a curve)."""
-
-    inner: SlippageModel
-    factor: Decimal
-
-    def slippage_bps(self, ctx: SlippageContext) -> Decimal:
-        return self.inner.slippage_bps(ctx) * self.factor
-
-
-@dataclass(frozen=True)
 class CostSpec:
     """Fee and slippage per side (SPEC 7.2 F). Every Phase 3 number built from these is PROVISIONAL.
 
@@ -135,7 +124,7 @@ class CostSpec:
 
     @property
     def is_flat_slippage(self) -> bool:
-        return self.slippage_model is None
+        return self.slippage_model is None or isinstance(self.slippage_model, FlatSlippage)
 
     def to_cost_config(self) -> CostConfig:
         return CostConfig(
@@ -149,13 +138,19 @@ class CostSpec:
         return dataclasses.replace(self, slippage_model=model, label=label)
 
     def stressed(self, factor: int = 2) -> CostSpec:
-        """Fees and slippage times ``factor`` (SPEC 7.2 E x2 stress); a curve is scaled, not replaced."""
-        model = None if self.slippage_model is None else ScaledSlippage(self.slippage_model, Decimal(factor))
+        """The cost stress (SPEC 7.2 E, x2) through the engine's ``stressed`` helper, never by hand.
+
+        ``tbot.backtest.slippage.stressed(costs, slippage_model, factor)`` moves fee, slippage bps and the
+        slippage model together; the harness only repackages its two outputs. Both are then passed to the
+        config by :func:`make_config`. A depth curve is scaled (every cost and the half spread), a flat
+        model or no model doubles the flat bps; any other model type raises ``TypeError`` there.
+        """
+        out = engine_stressed(self.to_cost_config(), self.slippage_model, factor)
         return CostSpec(
-            self.fee_bps * factor,
-            self.slippage_bps * factor,
+            out.costs.taker_fee_bps,
+            out.costs.slippage_bps,
             f"x{factor} stress of: {self.label}",
-            model,
+            out.slippage_model,
         )
 
 
