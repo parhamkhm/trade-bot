@@ -725,10 +725,13 @@ only, never a gate.
   negative control (a volume-dependent dummy strategy must make it fail). Any future strategy that uses volume
   is blocked until D-040 is closed.
 - **4h ATR rule test:** `tests/strategies/test_c3_4h_daily_atr.py` proves the 4h C3 points use only S0's daily
-  ATR20 of the last COMPLETED daily bar (changing any daily bar that is not yet closed at a 4h decision, or any
-  4h-only data, leaves the stop level unchanged; changing the last completed daily bar changes it). The same test
-  proves the 4h points' target weight uses only the σ̂ of the last COMPLETED daily close (changing the incomplete
-  day leaves the target weight unchanged; changing the last completed day changes it).
+  ATR20 of the last COMPLETED daily bar: changing the 4h bars of the incomplete day, or changing a 4h bar of a
+  completed day (its high, low and close) in a way that leaves that day's daily high, low and close unchanged,
+  leaves the stop level unchanged; changing the last completed day's daily range changes it. The same test
+  proves the 4h points' target weight uses only the σ̂ of the last COMPLETED daily close: changing the incomplete
+  day, or only the intrabar high/low of a 4h bar of a completed day with that day's daily high, low and close
+  unchanged, leaves the target weight unchanged; changing the last completed day changes it. A changed 4h close
+  is not covered for the target weight, because 4h closes feed the C3 signal by design (D-089).
 - Until the strategies exist, the strategy-specific cases of both tests skip with the reason "not implemented
   yet"; a strategy PR may not merge while any of its cases skips.
 - **C6 (order book):** option (ii), forward collection. Not evaluated in Phase 3 and **no proxy trials**, so the DSR
@@ -832,6 +835,7 @@ only, never a gate.
 | D-086 | **Venue decision by the owner (Parham, 2026-10-11): the venue remains LBank spot.** LBank's User Service Agreement (§10.2 item 4, quoted verbatim, page date 2026-07-22) restricts residents of listed countries; eligibility under these terms is the owner's responsibility, and the owner accepts the risk of account restriction or frozen funds. Phase 7a risk controls (risk-engineer scope): a hard capital cap set by Parham before 7a, the exchange balance kept to what the strategy needs with the excess withdrawn on a fixed schedule, and a Telegram alert on any account-restriction or KYC-related API error. No workaround of any exchange restriction is designed or documented | the owner's decision; the controls limit the loss if the account is restricted, consistent with D-065 (only capital Parham can afford to lose) |
 | D-087 | **C3 grid: the 1d point (32, 64, 128) is dropped — owner decision of 2026-10-12, made before any result (Parham).** C3 now has 5 points (1d: (8, 16, 32), **(16, 32, 64)**; 4h: (8, 16, 32), (16, 32, 64), (32, 64, 128)); total non-S0 trials 17; PBO for C3 over 5 points; the 1d base point keeps the single neighbour (8, 16, 32); the f = 128 forecast scalar 1.32 is used only by the 4h point; eligibility table and registry updated | under the common-tradable-days selection rule this point's first tradable close (2022-03-17) would cut the selection window of every C3 point from about 1,240 to about 470 days from period 2023-07 on, and the point itself is eligible in only 5 of the 12 periods |
 | D-088 | **SPEC §7.2 (Phase 3 pre-registration) v3 APPROVED by Parham on 2026-10-12 at commit `73c764660320ddbe8d844f5d159604dadc45c6e5`; in force from the merge of the status-flip PR.** Phase 3 runs only under this text; engine commits at or after `8d99335`; every change to it needs a new D-row and Parham's written approval of the exact head commit (CLAUDE.md §10) | pre-registration (CLAUDE.md §3.5): the evaluation rules are fixed and approved before any Phase 3 result exists |
+| D-089 | **§7.2 J 4h test bullet — text-precision fix, 2026-10-12, no rule change (Parham).** The claim "or any 4h-only data" is made exactly true and narrowed to what the extended `tests/strategies/test_c3_4h_daily_atr.py` proves: for the stop level, any change to a 4h bar of a completed day (high, low and close) that leaves that day's daily high, low and close unchanged leaves the stop unchanged, with a control that changes the day's high; for the target weight, only intrabar high/low changes of such a bar are covered, because 4h closes feed the C3 signal by design | a sentence in an in-force pre-registration must state exactly what its test proves; no evaluation rule, threshold, grid or data changes |
 
 ---
 
