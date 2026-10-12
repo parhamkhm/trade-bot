@@ -16,12 +16,15 @@ from typing import Any
 import pytest
 
 from tests.deploy.test_backup_lbank import (
+    LATE,
     NOW,
     OLD,
+    TODAY,
     GzipCodec,
     _count,
     _dirs,
     _make_day,
+    _stamp,
     _unzip_count,
     backup,
 )
@@ -141,7 +144,7 @@ def test_m1_source_changed_after_the_snapshot_is_never_deleted(
     real = backup._sync_all
 
     def late_writer() -> None:
-        _make_day(src / DAY, 1, mtime=OLD)  # a row lands between the snapshot and the delete
+        _make_day(src / DAY, 1, mtime=LATE)  # a row lands between the snapshot and the delete
         real()
 
     monkeypatch.setattr(backup, "_sync_all", late_writer)
@@ -267,6 +270,7 @@ def test_m5_archive_failure_keeps_source_and_takes_a_full_verified_copy(tmp_path
     partial = tmp_path / "partial.sqlite"
     _make_day(partial, 5)  # last night's 02:40 copy: only the first rows of the day
     shutil.copyfile(partial, dst / DAY)
+    _stamp(dst / DAY, OLD - 3600)  # copyfile stamps the real clock; last night's copy is older
     assert backup.run(src, dst, codec=FailingCompress(), now=NOW) == 1
     assert _count(src / DAY) == 50  # never deleted
     assert not list(src.glob("*.zst*"))
@@ -286,6 +290,7 @@ def test_m5_archive_failure_keeps_source_and_takes_a_full_verified_copy(tmp_path
 def test_m5_if_even_the_full_copy_fails_the_run_says_so(tmp_path: Path) -> None:
     src, dst = _dirs(tmp_path)
     (src / DAY).write_bytes(b"garbage" * 200)
+    _stamp(src / DAY, OLD)  # a closed day: untouched for longer than the grace period (not "just created")
     assert backup.run(src, dst, codec=GzipCodec(), now=NOW) == 2
     assert (src / DAY).exists() and not (dst / DAY).exists()
     status = _status(dst)
@@ -299,7 +304,7 @@ def test_m5_if_even_the_full_copy_fails_the_run_says_so(tmp_path: Path) -> None:
 def test_m6_status_json_schema_on_success(tmp_path: Path) -> None:
     src, dst = _dirs(tmp_path)
     _make_day(src / DAY, 3)
-    _make_day(src / "lbank-2026-10-12.sqlite", 2, mtime=None)
+    _make_day(src / "lbank-2026-10-12.sqlite", 2, mtime=TODAY)
     assert backup.run(src, dst, codec=GzipCodec(), now=NOW) == 0
     status = _status(dst)
     assert set(status) == {
@@ -530,4 +535,6 @@ def test_minor5_unreadable_dest_means_needs_copy(tmp_path: Path) -> None:
     counts = backup._source_counts(src / DAY)
     assert backup._dest_is_current_copy(src / DAY, dst / DAY, counts) is False  # missing
     (dst / DAY).write_bytes(b"x" * 10)
+    newer = (src / DAY).stat().st_mtime + 3600  # newer than the source, never the real clock
+    os.utime(dst / DAY, (newer, newer))
     assert backup._dest_is_current_copy(src / DAY, dst / DAY, counts) is False  # garbage

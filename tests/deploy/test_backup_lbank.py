@@ -26,9 +26,13 @@ def _load() -> ModuleType:
 
 backup = _load()
 
-# "now" is 2026-10-12 04:00 UTC: 10-10 and 10-11 are closed (if untouched for 2 h), 10-12 is open
+# "now" is 2026-10-12 04:00 UTC: 10-10 and 10-11 are closed (if untouched for 2 h), 10-12 is open.
+# Every file mtime a test creates is stamped relative to NOW, never taken from the real clock: the
+# backup reads mtimes (is_closed, the "source changed" check), so a real-clock mtime is a time bomb.
 NOW = datetime(2026, 10, 12, 4, 0, tzinfo=UTC)
-OLD = datetime(2026, 10, 12, 0, 30, tzinfo=UTC).timestamp()
+OLD = datetime(2026, 10, 12, 0, 30, tzinfo=UTC).timestamp()  # NOW - 3.5 h: outside the 2 h grace
+LATE = OLD + 120  # a write that lands after OLD but is still outside the grace period
+TODAY = datetime(2026, 10, 12, 3, 55, tzinfo=UTC).timestamp()  # NOW - 5 min: the open day, just written
 
 
 class GzipCodec:
@@ -49,17 +53,22 @@ class GzipCodec:
         dst.write_bytes(gzip.decompress(src.read_bytes()))
 
 
-def _make_day(path: Path, rows: int, mtime: float | None = OLD) -> None:
+def _stamp(path: Path, mtime: float) -> None:
+    """Set the mtime of ``path`` and of whichever of its ``-wal`` / ``-shm`` exist right now."""
+    for p in (path, path.with_name(path.name + "-wal"), path.with_name(path.name + "-shm")):
+        if p.exists():
+            os.utime(p, (mtime, mtime))
+
+
+def _make_day(path: Path, rows: int, mtime: float = OLD) -> None:
+    """Add ``rows`` rows to the (WAL-mode) day file and stamp it -- and any sidecar -- with ``mtime``."""
     conn = sqlite3.connect(path)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("CREATE TABLE IF NOT EXISTS t (x INTEGER)")
     conn.executemany("INSERT INTO t VALUES (?)", [(i,) for i in range(rows)])
     conn.commit()
     conn.close()
-    if mtime is not None:
-        for p in (path, path.with_name(path.name + "-wal")):
-            if p.exists():
-                os.utime(p, (mtime, mtime))
+    _stamp(path, mtime)
 
 
 def _count(path: Path) -> int:
@@ -98,7 +107,7 @@ def test_closed_day_is_archived_verified_backed_up_then_removed(tmp_path: Path) 
 
 def test_open_day_gets_a_plain_copy_and_is_never_removed(tmp_path: Path) -> None:
     src, dst = _dirs(tmp_path)
-    _make_day(src / "lbank-2026-10-12.sqlite", 3, mtime=None)  # today, written just now
+    _make_day(src / "lbank-2026-10-12.sqlite", 3, mtime=TODAY)  # today, written 5 min before NOW
     assert backup.run(src, dst, codec=GzipCodec(), now=NOW) == 0
     assert (src / "lbank-2026-10-12.sqlite").exists()
     assert _count(dst / "lbank-2026-10-12.sqlite") == 3
