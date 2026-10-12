@@ -61,6 +61,49 @@ def test_read_trial_log_reads_a_file(tmp_path: Path) -> None:
     assert read_trial_log(path).n_non_s0 == 1
 
 
+RESULTS_TABLE = "\n| # | metric | value |\n|---|---|---|\n| R1 | sharpe | 0.5 |\n| R2 | maxdd | 0.2 |\n"
+
+
+def test_only_the_trial_table_is_parsed() -> None:
+    """A second table whose header also starts with '#' (results, disclosures) is not part of the count."""
+    text = HEADER + S0_ROW + _row(1, "C1") + "\n\nSome prose.\n" + RESULTS_TABLE
+    log = parse_trial_log(text)
+    assert log.n_non_s0 == 1 and len(log.rows) == 2
+
+
+def test_a_table_before_the_trial_table_is_ignored() -> None:
+    other = "| name | value |\n|---|---|\n| foo | 1 |\n| bar | 2 |\n\n"
+    assert parse_trial_log(other + HEADER + _row(1, "C1")).n_non_s0 == 1
+
+
+def test_a_file_without_a_trial_table_is_an_error_not_zero_trials() -> None:
+    with pytest.raises(ValueError, match="no trial table"):
+        parse_trial_log("# EXPERIMENTS\n\njust prose\n")
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        "| S0-SMA50 | 2026-10-12 | 3 | S0 variant SMA50 | p | r | 1d | BTCUSDT | none | n |\n",
+        "| T9 | 2026-10-12 | 3 | S0 `sma100_1d` vol 0.20 | p | r | 1d | BTCUSDT | none | n |\n",
+        "| T9 | 2026-10-12 | 3 | `S0var-vol40` | p | r | 1d | BTCUSDT | none | n |\n",
+    ],
+)
+def test_s0_family_rows_are_never_counted(row: str) -> None:
+    log = parse_trial_log(HEADER + S0_ROW + _row(1, "C1") + row)
+    assert log.n_non_s0 == 1 and len(log.s0_rows) == 2
+    assert log.s0_registered
+
+
+def test_s0_registered_needs_the_exact_s0_row() -> None:
+    log = parse_trial_log(HEADER + "| S0-SMA50 | d | p | S0 variant | p | r | 1d | B | n | n |\n")
+    assert not log.s0_registered and log.n_non_s0 == 0
+
+
+def test_a_c_row_starting_with_s_is_not_s0() -> None:
+    assert parse_trial_log(HEADER + _row(1, "S1 blend")).n_non_s0 == 1
+
+
 def test_the_repository_log_registers_s0() -> None:
     """Reads the real log (read-only): S0 must be registered. Skips if the file is absent.
 

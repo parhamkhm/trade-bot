@@ -19,6 +19,7 @@ from collections.abc import Sequence
 
 from tbot.validation.gates import GateResult
 from tbot.validation.pipeline import Phase3Evaluation, StrategyEval
+from tbot.validation.policy import POLICY_SUMMARY
 from tbot.validation.runs import FillMode, SeriesRun
 from tbot.validation.walk_forward import WalkForwardSpec
 
@@ -108,6 +109,11 @@ def _header(spec: WalkForwardSpec, ev: Phase3Evaluation) -> list[str]:
         f"{spec.first_test_start:%Y-%m-%d} to {spec.last_test_end:%Y-%m-%d} (exclusive). "
         "Training is anchored and expanding. The sealed holdout (from 2025-10-01) was not loaded.",
         f"Logged non-S0 trials used for the DSR: {ev.n_trials}.",
+        "Open SPEC readings (current behaviour, each one named switch in `validation.policy`): "
+        f"{POLICY_SUMMARY}.",
+        "Data notes: the 4h points' daily sigma-hat and ATR are computed from the completed UTC days "
+        "of the 4h bars; 10 4h bars are missing before 2018-09-15 (the data-quality report), "
+        "long before the first test day.",
         "",
     ]
 
@@ -213,12 +219,16 @@ def _robustness_section(ev: Phase3Evaluation) -> list[str]:
             rows.append([f"{s.name} ETH/USDT ({mode.value})", _num(run.sharpe), _pct(run.max_drawdown)])
         for label, run in s.indices.items():
             rows.append([f"{s.name} {label} (next-open, 252-day)", _num(run.sharpe), _pct(run.max_drawdown)])
-    if not rows:
-        return ["## Robustness: ETH/USDT and indices", "", "Not supplied to this run.", ""]
+    note = (
+        []
+        if any(s.indices for s in _strategies(ev))
+        else ["Stooq indices: not run (informational only; an absent index never fails a gate).", ""]
+    )
     return [
         "## Robustness: ETH/USDT and indices (BTC choices reused unchanged)",
         "",
         *_table(["series", "Sharpe", "maxDD"], rows),
+        *note,
     ]
 
 
@@ -260,7 +270,7 @@ def _selection_procedure(ev: Phase3Evaluation, spec: WalkForwardSpec) -> list[st
     out += [
         "Not evaluated here: the regime-overlay keep/drop part of G4 (phase 4), the holdout band and the "
         "one-shot "
-        "unsealing (H6-H7), and the six section-7.1 robustness variants of S0 unless they were registered.",
+        "unsealing (H6-H7).",
         "",
     ]
     return out

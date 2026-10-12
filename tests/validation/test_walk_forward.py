@@ -28,11 +28,13 @@ from tbot.strategies.buy_and_hold import BuyAndHold
 from tbot.validation.grid import HOLDOUT_START, SPEC_PERIODS, make_periods
 from tbot.validation.runs import (
     NORMAL_COSTS,
+    STRESS_COSTS,
     BlendStrategy,
     CompositeStrategy,
     FillMode,
     Market,
     SeriesRun,
+    run_fixed,
 )
 from tbot.validation.stats import annualised_sharpe
 from tbot.validation.walk_forward import (
@@ -40,6 +42,9 @@ from tbot.validation.walk_forward import (
     CandidateResult,
     Selection,
     WalkForwardSpec,
+    _baseline,
+    _end,
+    anchor_schedule,
     benchmark_runs,
     blend_run,
     pooled_run,
@@ -243,6 +248,54 @@ def test_composite_is_flat_before_its_first_start_and_while_the_key_is_none(mark
     assert run.n_fills >= 1  # it did trade once the key appeared
 
 
+@pytest.mark.parametrize("mode", [NO, MD])
+@pytest.mark.parametrize("costs", [NORMAL_COSTS, STRESS_COSTS])
+def test_pooled_series_of_one_point_is_a_slice_of_its_fixed_anchored_run(
+    market: Market, mode: FillMode, costs: object
+) -> None:
+    """SPEC 7.1: folds never restart the strategy, they only slice the replayed series.
+
+    A candidate that holds one point in every period must reproduce ``run_fixed`` (the same engine from the
+    data start) bar for bar on the test days: same equity, same fills inside the slice.
+    """
+    from tbot.validation.runs import CostSpec
+
+    assert isinstance(costs, CostSpec)
+    key = "T-sma10"
+    sched = [(p.start, key) for p in SPEC.periods]
+    pooled = pooled_run(market, sched, factory, {key: D1}, SPEC, mode, costs, strategy_id="x")
+    baseline, end = _baseline(market, SPEC.first_test_start), _end(market, SPEC)
+    fixed = run_fixed(market, factory(key), D1, mode, costs, end=end)
+    keep = [i for i, t in enumerate(fixed.ts) if t >= baseline]
+    assert pooled.ts == tuple(fixed.ts[i] for i in keep)
+    assert pooled.equity == tuple(fixed.equity[i] for i in keep)  # exact: the very same engine arithmetic
+    # the run had history before the slice (otherwise this test would not distinguish anchoring)
+    assert keep[0] > 100
+    assert pooled.n_fills <= fixed.n_fills
+    assert pooled.fees_paid <= fixed.fees_paid + 1e-9
+
+
+def test_a_position_entered_before_the_first_test_day_is_carried_into_it(market: Market) -> None:
+    """A flat-start replay is 0.0 on day one if no signal formed that day; the anchored one is invested."""
+    key = "T-sma10"
+    anchored = pooled_run(market, [(SPEC.periods[0].start, key)], factory, {key: D1}, SPEC, NO, NORMAL_COSTS)
+    baseline = _baseline(market, SPEC.first_test_start)
+    fixed = run_fixed(market, factory(key), D1, NO, NORMAL_COSTS, end=_end(market, SPEC))
+    entries_before = fixed.n_fills - anchored.n_fills
+    assert entries_before >= 1  # at least one trade happened before 2020-01-01 and is NOT in the slice
+    assert anchored.ts[0] == baseline
+
+
+def test_anchor_schedule_applies_the_first_choice_from_the_data_start(market: Market) -> None:
+    sched = [(SPEC.periods[0].start, "a"), (BOUNDARY, "b")]
+    anchored = anchor_schedule(market, sched)
+    assert anchored[0] == (market.anchor, "a")
+    assert anchored[1:] == sched[1:]
+    assert market.anchor < SPEC.first_test_start
+    with pytest.raises(ValueError, match="empty"):
+        anchor_schedule(market, [])
+
+
 def test_key_at_and_decision_bars(market: Market) -> None:
     comp = CompositeStrategy(
         strategy_id="c",
@@ -267,7 +320,9 @@ def test_key_at_and_decision_bars(market: Market) -> None:
 
 def _const(weights: dict[str, float]) -> Callable[[str], Strategy]:
     def make(key: str) -> Strategy:
-        return BuyAndHold(weight=weights[key])
+        # stop_fraction 0.99: the stand-in's protective stop (engine-enforced since PR #26) sits at 1 % of
+        # the entry price, so it can never trigger and these tests isolate the boundary trade
+        return BuyAndHold(weight=weights[key], stop_fraction=0.99)
 
     return make
 
@@ -279,8 +334,9 @@ def test_a_parameter_change_at_a_boundary_is_charged_as_a_trade(market: Market) 
     a_then_b = pooled_run(
         market, [(SPEC.periods[0].start, "a"), (BOUNDARY, "b")], fac, tf, SPEC, NO, NORMAL_COSTS
     )
-    assert only_a.n_fills == 1  # one entry, nothing else
-    assert a_then_b.n_fills > only_a.n_fills  # the cut from 1.0 to 0.4 sold
+    assert only_a.n_fills == 0  # entered at the anchor, long before the slice: no trade inside it
+    # the cut from 1.0 to 0.4 at the boundary is a sale inside the slice (later band rebalances may add more)
+    assert a_then_b.n_fills >= 1
     assert a_then_b.fees_paid > only_a.fees_paid
 
 

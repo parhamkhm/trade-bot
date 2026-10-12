@@ -9,9 +9,9 @@
 * **ETH/USDT and indices** (``reuse_run``): BTC's per-period choices are reused unchanged, nothing is
   re-selected. For the indices (Stooq, daily, 252-day annualisation) a period whose BTC choice is a 4h point
   is flat (``index_schedule``); they are reported for context only and never gate.
-* **x2 cost stress**: the BTC schedule is kept and the pooled series is re-run with ``STRESS_COSTS``
-  (selection is NOT redone under the stressed costs: stress asks whether the selected strategy survives dearer
-  trading, not what a different selection would have been).
+* **x2 cost stress**: the BTC schedule is kept and the pooled series is re-run with the stressed costs
+  (``CostSpec.stressed``; selection is NOT redone under the stressed costs: stress asks whether the
+  selected strategy survives dearer trading, not what a different selection would have been).
 """
 
 from __future__ import annotations
@@ -27,7 +27,6 @@ from tbot.core.types import Bar, Timeframe
 from tbot.validation.gates import GateResult, neighbour_gate
 from tbot.validation.grid import HOLDOUT_START, GridPoint, neighbours
 from tbot.validation.runs import (
-    STRESS_COSTS,
     CostSpec,
     FillMode,
     Market,
@@ -151,8 +150,8 @@ def stress_run(
     candidate: Candidate,
     factory: StrategyFactory,
     spec: WalkForwardSpec,
+    costs: CostSpec,
     mode: FillMode = FillMode.MANUAL_DELAY,
-    costs: CostSpec = STRESS_COSTS,
 ) -> SeriesRun:
     """The BTC schedule (selected under the normal costs) re-run with the stressed costs."""
     return reuse_run(market, result, candidate, factory, spec, mode, costs)

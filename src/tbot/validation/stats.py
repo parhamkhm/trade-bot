@@ -35,6 +35,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from tbot.backtest.metrics import sharpe_ratio
+from tbot.validation.policy import PBO_ZERO_LOGIT_IS_OVERFIT
 
 __all__ = [
     "EULER_MASCHERONI",
@@ -290,7 +291,9 @@ def _combo_sharpes(
     return out
 
 
-def pbo_cscv(matrix: FloatArray, *, n_blocks: int = 16) -> PboResult:
+def pbo_cscv(
+    matrix: FloatArray, *, n_blocks: int = 16, zero_logit_is_overfit: bool = PBO_ZERO_LOGIT_IS_OVERFIT
+) -> PboResult:
     """Probability of Backtest Overfitting by CSCV on a ``(T, N)`` daily return matrix.
 
     ``matrix[:, j]`` is trial ``j``'s daily returns, all on the SAME days. The rows are cut into
@@ -300,7 +303,8 @@ def pbo_cscv(matrix: FloatArray, *, n_blocks: int = 16) -> PboResult:
     tie) is ranked among all trials out of sample (average rank on ties, 1 = worst),
     ``omega = rank / (N + 1)``
     and ``logit = ln(omega / (1 - omega))``. ``PBO`` is the share of combinations with ``logit <= 0``
-    (the in-sample winner is at or below the out-of-sample median).
+    (the in-sample winner is at or below the out-of-sample median); with ``zero_logit_is_overfit=False`` the
+    share with ``logit < 0``. The default is ``validation.policy.PBO_ZERO_LOGIT_IS_OVERFIT`` (open reading).
     """
     if n_blocks < 2 or n_blocks % 2:
         raise ValueError("n_blocks must be an even number >= 2")
@@ -331,5 +335,5 @@ def pbo_cscv(matrix: FloatArray, *, n_blocks: int = 16) -> PboResult:
     rank = below + (equal + 1) / 2.0  # average 1-based rank of the tied group
     omega = rank / (n + 1.0)
     logits = [float(x) for x in np.log(omega / (1.0 - omega))]
-    pbo = sum(1 for x in logits if x <= 0.0) / len(logits)
+    pbo = sum(1 for x in logits if (x <= 0.0 if zero_logit_is_overfit else x < 0.0)) / len(logits)
     return PboResult(pbo, len(logits), n_blocks, block_len, dropped, n, tuple(logits))
