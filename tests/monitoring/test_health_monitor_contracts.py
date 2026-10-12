@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import gzip
 import importlib.util
+import json
 import sys
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
@@ -107,6 +108,8 @@ def test_contract_real_ok_backup_run_is_quiet_through_the_monitor(tmp_path: Path
     now = datetime(2026, 10, 12, 4, 0, tzinfo=UTC)
     _make_day(src / "lbank-2026-10-11.sqlite", 5)
     assert backup_lbank.run(src, dest, codec=_GzipCodec(), now=now) == 0
+    status = json.loads((dest / "status.json").read_text(encoding="utf-8"))
+    assert status["days_archived"] == ["2026-10-11"]  # the day really was treated as closed and archived
 
     settings = make_settings(tmp_path, lbank_status_file=dest / "status.json")
     sent: list[str] = []

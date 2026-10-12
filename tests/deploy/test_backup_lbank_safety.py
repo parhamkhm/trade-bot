@@ -535,4 +535,6 @@ def test_minor5_unreadable_dest_means_needs_copy(tmp_path: Path) -> None:
     counts = backup._source_counts(src / DAY)
     assert backup._dest_is_current_copy(src / DAY, dst / DAY, counts) is False  # missing
     (dst / DAY).write_bytes(b"x" * 10)
+    newer = (src / DAY).stat().st_mtime + 3600  # newer than the source, never the real clock
+    os.utime(dst / DAY, (newer, newer))
     assert backup._dest_is_current_copy(src / DAY, dst / DAY, counts) is False  # garbage
