@@ -71,7 +71,7 @@ class OversizedRisk:
             taker_fee_bps=config.costs.taker_fee_bps,
             slippage_bps=config.costs.slippage_bps,
             buy_buffer_bps=config.buy_buffer_bps,
-            drift_tolerance=config.drift_tolerance,
+            rebalance_band=config.rebalance_band,
         )
         self._factor = factor
         self._filters = config.filters
