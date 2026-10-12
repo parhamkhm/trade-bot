@@ -58,7 +58,13 @@ class _GzipCodec:
         dst.write_bytes(gzip.decompress(src.read_bytes()))
 
 
+# Last write of a closed test day file, fixed relative to the tests' `now` (2026-10-12 04:00 UTC) so the
+# backup's "untouched for GRACE" rule never depends on the real clock.
+_DAY_WRITTEN = datetime(2026, 10, 12, 0, 30, tzinfo=UTC).timestamp()
+
+
 def _make_day(path: Path, rows: int) -> None:
+    import os
     import sqlite3
 
     conn = sqlite3.connect(path)
@@ -66,6 +72,7 @@ def _make_day(path: Path, rows: int) -> None:
     conn.executemany("INSERT INTO t VALUES (?)", [(i,) for i in range(rows)])
     conn.commit()
     conn.close()
+    os.utime(path, (_DAY_WRITTEN, _DAY_WRITTEN))
 
 
 def make_settings(tmp_path: Path, **over: Any) -> Settings:
