@@ -559,8 +559,8 @@ takes over. The new choice is kept at least 3 months, and every switch needs Par
 
 Status: **final text v3, submitted 2026-10-12 after Parham's review of v2 (d9c6c38; v1 2f719a6 and v2 were
 merged to main unapproved and never in force); APPROVED by Parham on 2026-10-12 at commit 73c7646; IN FORCE
-from the merge of this PR.** **Amended by D-090–D-093** (decided 2026-10-12, before any Phase 3 result; in force
-from the merge of the amendment PR, after Parham's written approval of its exact head commit). Labels: **[RECORDED]** = copied from decisions already in this document; **[DECIDED
+from the merge of PR #24 (D-088).** **Amended by D-090–D-093** (decided 2026-10-12, before any Phase 3 result; in
+force from the merge of PR #31, after Parham's written approval of its exact head commit). Labels: **[RECORDED]** = copied from decisions already in this document; **[DECIDED
 2026-10-11]** = Parham's decisions on the 2026-10-11 draft; **[DECIDED 2026-10-12]** = Parham's decisions of 2026-10-12, before any Phase 3 result (D-090–D-093);
 **[OPERATIONAL]** = a detail needed to make a decided item exact, fixed now, before any result. Nothing below may change after any Phase 3 result is seen.
 Engine commits must be at or after `8d99335`; the sealed holdout (from `holdout_start` = 2025-10-01) stays sealed.
@@ -665,9 +665,10 @@ stress stays profitable.
 - PBO [DECIDED]: CSCV per candidate over its grid, on the daily manual-delay return matrix of the grid points over
   2018-06-01 → 2025-09-30, **S = 16** equal contiguous blocks, Sharpe as the measure. For C3 the grid is its 2
   points (D-087, D-090). A point is included from its first tradable close; days before it count as flat.
-- PBO convention [DECIDED 2026-10-12, D-093]: in each CSCV split, λ = logit of the out-of-sample relative rank
-  of the in-sample winner; the split counts as **overfit when λ ≤ 0** (a winner that lands exactly on the
-  out-of-sample median rank counts as overfit). PBO = the share of overfit splits, and this value is the one
+- PBO convention [DECIDED 2026-10-12, D-093]: in each CSCV split, the in-sample winner's out-of-sample rank r
+  among the N points (r = 1 the worst, r = N the best; ties take the average rank) gives ω = r / (N + 1) and
+  λ = ln(ω / (1 − ω)) [OPERATIONAL]; the split counts as **overfit when λ ≤ 0** (a winner that lands exactly on
+  the out-of-sample median rank counts as overfit). PBO = the share of overfit splits, and this value is the one
   used for the gate. The share of splits with λ < 0 is reported next to it for information only.
 - **Neighbour test for per-period-selected candidates** [DECIDED 2026-10-11]: take the grid point P that the
   candidate's own selection procedure picks on the final training window ending at `holdout_start`; compute P's
@@ -685,12 +686,14 @@ stress stays profitable.
 - Slippage: the **D-067 provisional curve** (from the G0 probe). **Every Phase 3 number is labelled PROVISIONAL.**
   Construction [DECIDED 2026-10-12, D-091; the §7 G3 statistic, not a new rule]: the **per-notional median**. Per
   side (a buy walks the asks, a sell the bids), the points are (0, 0), (the median over the probe samples of
-  the largest market order that fills within 0.1 % of the best price, 10 bps) and (the same within 0.5 %,
-  50 bps). Each sample's cost rises monotonically with notional, so the median of those order sizes is exactly
-  the notional at which the median cost is 10 or 50 bps: these are points of the §7 G3 per-notional median
-  curve. Interpolation, extrapolation, the 10,000 USDT equity normaliser and half the median spread (added once)
-  are as in §7 G3. The one 0.5 % sample that reached the end of the visible book is a lower bound on a large
-  size, so it changes neither the median nor the p10 of the sizes.
+  the largest market order whose volume-weighted fill price stays within 0.1 % of the best price, 10 bps) and
+  (the same within 0.5 %, 50 bps). Each sample's cost (VWAP walking the book) rises monotonically with notional,
+  so a quantile of those order sizes is the notional at which the opposite quantile of cost equals 10 or 50 bps:
+  exactly for the nearest-rank p10, and for the median (the mean of the two middle of 32 samples) up to the gap
+  between those two samples. These are points of the §7 G3 per-notional median curve. Interpolation,
+  extrapolation, the 10,000 USDT equity normaliser and half the median spread (added once) are as in §7 G3. At
+  0.5 %, one sample per side reached the end of the visible 200-level book, so its size is a lower bound; it can
+  affect only the segment beyond the 0.1 % point, which orders at the 10,000 USDT normaliser never reach.
 - Slippage sensitivity [DECIDED 2026-10-12, D-091], **reported only, never gating**: the adverse tail, the
   per-notional **p90 of cost** (thin book). By the same argument its points are the **p10 of the order sizes**,
   plus half the p95 spread (the probe stores no p90 spread; p95 is the more adverse choice).
@@ -715,7 +718,13 @@ version.** Engine at or after `8d99335` (D-081 fill-time sizing, D-082 resize cl
    leave-one-out when compared with a candidate C. *Stops* [DECIDED 2026-10-12, D-092]: S1 has **no protective
    stop of its own**. It follows each member's own daily state through that member's target weight (a member in
    STOPPED contributes 0). A reduction of S1's target caused by a member's stop-out **always trades** and is never
-   blocked by the 25 % band (§7.1 rule 3). The report states that S1 has no intraday stop of its own.
+   blocked by the 25 % band (§7.1 rule 3); [OPERATIONAL] at a close where any member enters STOPPED, S1 trades to
+   its full new target (other members' moves at that close included), ignoring the band. Other changes of S1's
+   target, including a member's ordinary signal exit, keep S0's rebalance rule on the netted position. The report
+   states that S1 has no intraday stop of its own. *Open item, outside Phase 3:* CLAUDE.md §5 and D-050 require a
+   valid protective stop for every long that the phase 4 RiskManager approves; how S1 meets that live (for
+   example a stop per member sub-position) must be decided by Parham before S1 can be deployed. Phase 3 is not
+   affected (it uses the stub risk manager).
 4. C qualifies only if it passes the walk-forward gates, its pooled OOS manual-delay Sharpe exceeds S0's and S1's
    (S1 without C), it beats S0 in at least half of the periods, and DSR(C) ≥ 0.95 with every variant counted.
 5. X = the qualifying C with the highest pooled OOS Sharpe; if none, the better of S0/S1 among those passing the
