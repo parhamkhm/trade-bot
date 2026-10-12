@@ -2,8 +2,9 @@
 
 The run script refuses to start while ANY of these fails, so a result can never be produced against an
 incomplete trial log, an engine without the SPEC stop/band mechanics, a registry whose strategy modules are
-missing, missing ETH data, unregistered S0 robustness variants or a flat-slippage placeholder. A missing input
-is a reason to refuse, never a failed gate. Each check returns a list of plain-text problems (empty = ok);
+missing, missing ETH data, unregistered S0 robustness variants, a flat-slippage placeholder or a grid
+strategy that cannot report its own daily stop-outs (S1 needs that, D-092). A missing input is a reason to
+refuse, never a failed gate. Each check returns a list of plain-text problems (empty = ok);
 nothing here runs a backtest.
 """
 
@@ -15,7 +16,7 @@ from pathlib import Path
 
 from tbot.core.types import Strategy
 from tbot.strategies.phase3_registry import PHASE3_ENTRIES, S0_VARIANTS, Phase3Entry
-from tbot.validation.runs import CostSpec, engine_supports_stops_and_band
+from tbot.validation.runs import CostSpec, StopOutAware, engine_supports_stops_and_band
 from tbot.validation.trials import TrialLog
 
 __all__ = [
@@ -28,11 +29,12 @@ __all__ = [
     "check_registry_importable",
     "check_s0_variants",
     "check_slippage",
+    "check_stop_out_aware",
     "check_trial_log",
     "preflight",
 ]
 
-EXPECTED_GRID_POINTS = 17
+EXPECTED_GRID_POINTS = 14  # D-090: C1 3 + C2 3 + C3 2 + C4 3 + C5 3
 ENGINE_MIN_COMMIT = "8d99335"  # the Phase 2 engine merge (PR #15): the oldest engine the harness may run on
 # (sma_n, vol_target) of the six SPEC 7.1 variants
 EXPECTED_S0_VARIANTS = frozenset({(50, 0.30), (75, 0.30), (150, 0.30), (200, 0.30), (100, 0.20), (100, 0.40)})
@@ -40,7 +42,7 @@ _REPO = Path(__file__).resolve().parents[3]
 
 
 def check_trial_log(log: TrialLog, entries: Sequence[Phase3Entry] = PHASE3_ENTRIES) -> list[str]:
-    """SPEC 7.2 D: exactly the 17 grid points are logged as trials and S0 is registered, before the run."""
+    """SPEC 7.2 D: exactly the 14 grid points are logged as trials and S0 is registered, before the run."""
     keys = [e.key for e in entries if e.key != "S0"]
     problems: list[str] = []
     if len(keys) != EXPECTED_GRID_POINTS:
@@ -108,9 +110,30 @@ def check_slippage(costs: CostSpec, *, allow_flat: bool) -> list[str]:
     if costs.is_flat_slippage and not allow_flat:
         return [
             "flat slippage is a PROVISIONAL placeholder: supply the depth-curve model "
-            "(--slippage-model) or, in tests only, --allow-flat-slippage-for-tests"
+            "(--g0-summary or --slippage-model) or, in tests only, --allow-flat-slippage-for-tests"
         ]
     return []
+
+
+def check_sensitivity(
+    costs: CostSpec, sensitivity: CostSpec | None, *, allow_flat: bool
+) -> list[str]:
+    """D-091: a real run also computes the adverse-p90-cost sensitivity, so it cannot be skipped by omission.
+
+    Required whenever the run is real (``allow_flat`` False). It must be a depth curve and not the run's own
+    model object (a copy of the median curve would make the "sensitivity" block meaningless).
+    """
+    if allow_flat:
+        return []
+    if sensitivity is None:
+        return [
+            "D-091: the adverse-p90-cost sensitivity costs are missing: give --g0-summary (builds both "
+            "curves) or --sensitivity-slippage-model"
+        ]
+    problems = check_slippage(sensitivity, allow_flat=False)
+    if sensitivity.slippage_model is not None and sensitivity.slippage_model is costs.slippage_model:
+        problems.append("D-091: the sensitivity curve is the run's own curve; it must be the adverse-p90 one")
+    return problems
 
 
 def check_data(missing_series: Sequence[str]) -> list[str]:
@@ -133,6 +156,27 @@ def check_registry_importable(
     return problems
 
 
+def check_stop_out_aware(
+    loader: Callable[[Phase3Entry], Strategy], entries: Sequence[Phase3Entry] = PHASE3_ENTRIES
+) -> list[str]:
+    """Every grid strategy implements ``stopped_out_on(window)`` (D-092): S1 follows its members' stop-outs.
+
+    A strategy that fails to load is skipped here (``check_registry_importable`` reports it). S0 is not an S1
+    member, so it is not asked.
+    """
+    problems: list[str] = []
+    for entry in entries:
+        if entry.key == "S0":
+            continue
+        try:
+            strategy = loader(entry)
+        except Exception:
+            continue
+        if not isinstance(strategy, StopOutAware):
+            problems.append(f"{entry.key}: no stopped_out_on(window); S1 cannot follow its stop-outs (D-092)")
+    return problems
+
+
 def preflight(
     log: TrialLog,
     loader: Callable[[Phase3Entry], Strategy],
@@ -140,11 +184,15 @@ def preflight(
     *,
     variants: Sequence[Phase3Entry] = S0_VARIANTS,
     costs: CostSpec | None = None,
+    sensitivity_costs: CostSpec | None = None,
     allow_flat_slippage: bool = False,
     missing_series: Sequence[str] = (),
     engine_repo: Path = _REPO,
 ) -> list[str]:
-    """Every check. ``costs=None`` skips only the slippage check (unit tests of the other checks)."""
+    """Every check. ``costs=None`` skips only the slippage checks (unit tests of the other checks).
+
+    A real run (``allow_flat_slippage`` False) must also supply ``sensitivity_costs`` (D-091).
+    """
     problems = [
         *check_trial_log(log, entries),
         *check_s0_variants(variants),
@@ -152,7 +200,9 @@ def preflight(
         *check_engine_commit(engine_repo),
         *check_data(missing_series),
         *check_registry_importable(loader, [*entries, *variants]),
+        *check_stop_out_aware(loader, entries),
     ]
     if costs is not None:
         problems.extend(check_slippage(costs, allow_flat=allow_flat_slippage))
+        problems.extend(check_sensitivity(costs, sensitivity_costs, allow_flat=allow_flat_slippage))
     return problems

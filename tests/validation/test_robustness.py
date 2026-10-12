@@ -1,4 +1,4 @@
-"""Robustness helpers: neighbours, index schedule, Stooq parsing, stress and reuse (SPEC 7.2 E, I)."""
+"""Robustness helpers: neighbours, Stooq parsing, stress and reuse (SPEC 7.2 E, I)."""
 
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ from tbot.core.types import Timeframe
 from tbot.execution.simulated import DepthCurveSlippage
 from tbot.validation.grid import HOLDOUT_START
 from tbot.validation.robustness import (
-    index_schedule,
     neighbour_test,
     parse_stooq_csv,
     reuse_run,
@@ -29,7 +28,7 @@ from tests.validation.wf_fixtures import (
     make_market,
 )
 
-D1, H4 = Timeframe.D1, Timeframe.H4
+D1 = Timeframe.D1
 T0 = datetime(2019, 1, 1, tzinfo=UTC)
 CLOSES = [T0 + timedelta(days=i + 1) for i in range(11)]
 
@@ -86,15 +85,6 @@ def test_flat_final_selection_fails_with_a_reason() -> None:
 def test_non_positive_reference_sharpe_fails() -> None:
     fixed = _runs({"T-sma10": 0.003, "T-sma20": -0.004, "T-sma40": 0.003})
     assert not neighbour_test(CANDIDATE, _selection("T-sma20"), fixed).gate.passed
-
-
-# -- index schedule --------------------------------------------------------------------------------------
-
-
-def test_index_schedule_flattens_non_daily_choices_only() -> None:
-    t = {"a": D1, "b": H4}
-    sched = [(CLOSES[0], "a"), (CLOSES[1], "b"), (CLOSES[2], None)]
-    assert index_schedule(sched, t) == [(CLOSES[0], "a"), (CLOSES[1], None), (CLOSES[2], None)]
 
 
 # -- Stooq parsing ---------------------------------------------------------------------------------------
@@ -159,15 +149,15 @@ def btc_result() -> CandidateResult:
 
 def test_reuse_keeps_the_btc_schedule_and_does_not_reselect(btc_result: CandidateResult) -> None:
     eth = make_market(seed=13, symbol="ETHUSDT")
-    run = reuse_run(eth, btc_result, CANDIDATE, factory, SPEC, FillMode.NEXT_OPEN, NORMAL_COSTS)
+    run = reuse_run(eth, btc_result, factory, SPEC, FillMode.NEXT_OPEN, NORMAL_COSTS)
     assert run.return_ts[0] >= SPEC.first_test_start
     assert run.return_ts[-1] < SPEC.last_test_end
 
 
 def test_stress_run_costs_more_than_the_normal_run(btc_result: CandidateResult) -> None:
     market = make_market()
-    normal = reuse_run(market, btc_result, CANDIDATE, factory, SPEC, FillMode.MANUAL_DELAY, NORMAL_COSTS)
-    stressed = stress_run(market, btc_result, CANDIDATE, factory, SPEC, STRESS_COSTS)
+    normal = reuse_run(market, btc_result, factory, SPEC, FillMode.MANUAL_DELAY, NORMAL_COSTS)
+    stressed = stress_run(market, btc_result, factory, SPEC, STRESS_COSTS)
     assert stressed.n_fills == normal.n_fills  # same schedule, same trades ...
     assert stressed.fees_paid + stressed.slippage_cost > normal.fees_paid + normal.slippage_cost  # ... dearer
     assert STRESS_COSTS.fee_bps == 2 * NORMAL_COSTS.fee_bps
@@ -180,8 +170,8 @@ def test_stress_run_with_a_depth_curve_scales_the_curve_in_the_engine(btc_result
     curve = DepthCurveSlippage(pts, pts, Decimal(1), Decimal(10_000))
     normal_costs = NORMAL_COSTS.with_model(curve, "curve")
     market = make_market()
-    normal = reuse_run(market, btc_result, CANDIDATE, factory, SPEC, FillMode.MANUAL_DELAY, normal_costs)
-    stressed = stress_run(market, btc_result, CANDIDATE, factory, SPEC, normal_costs.stressed())
+    normal = reuse_run(market, btc_result, factory, SPEC, FillMode.MANUAL_DELAY, normal_costs)
+    stressed = stress_run(market, btc_result, factory, SPEC, normal_costs.stressed())
     assert stressed.n_fills == normal.n_fills
     assert normal.slippage_cost > 0 and stressed.traded_notional > 0
     # per unit traded: the dearer run has its own equity path, so absolute totals are not comparable

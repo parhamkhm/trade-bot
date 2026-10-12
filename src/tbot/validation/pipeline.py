@@ -1,6 +1,6 @@
 """The T6 selection procedure, steps H1-H5 (docs/SPEC.md section 7.2 H), on top of the walk-forward harness.
 
-H1  S0 (no search) and the 17 grid points through the walk-forward, both fill modes.
+H1  S0 (no search) and the 14 grid points through the walk-forward, both fill modes.
 H2  The walk-forward gates (G3, section 7.2 E) for each candidate. The regime-overlay keep/drop part of G4 is
     phase 4 and is not computed here.
 H3  S1 = equal-weight blend of every strategy that passed G3 (S0 included if it passed); for a candidate C the
@@ -13,10 +13,15 @@ H5  X = the qualifying C with the highest pooled OOS Sharpe; else the better of 
 
 Steps H6-H7 (the holdout band and the one-shot unsealing) are not here, by design. Nothing in this module
 loads data: it receives ``Market`` objects. Every number it produces is PROVISIONAL (SPEC 7.2 F).
+
+D-091 sensitivity. When ``EvalInputs.sensitivity_costs`` is set, every contender's (and the benchmark's) FIXED
+schedule is re-run under those costs in both fill modes and kept in ``StrategyEval.sensitivity``. It is
+reported only ("sensitivity, not gating (D-091)"): it never feeds selection, a gate, DSR, PBO or X.
 """
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -96,6 +101,7 @@ class EvalInputs:
     indices: Mapping[str, Market] = field(default_factory=dict)  # informational only; empty = "not run"
     costs: CostSpec = NORMAL_COSTS
     stress_costs: CostSpec | None = None  # default: ``costs.stressed()`` (x2 fees and slippage, curve scaled)
+    sensitivity_costs: CostSpec | None = None  # D-091: adverse-p90 curve; REPORTED ONLY, never gating
 
     @property
     def stress(self) -> CostSpec:
@@ -120,6 +126,7 @@ class StrategyEval:
     reported: tuple[GateResult, ...]  # reported but not gating (candidates' x2 stress)
     walk: CandidateResult | None = None
     members: tuple[str, ...] = ()
+    sensitivity: Mapping[FillMode, SeriesRun] = field(default_factory=dict)  # D-091, not gating
 
     @property
     def passes(self) -> bool:
@@ -143,6 +150,7 @@ class Phase3Evaluation:
     x_reason: str
     trial_sharpes: Mapping[str, float]
     n_trials: int
+    sensitivity_benchmark: Mapping[FillMode, SeriesRun] = field(default_factory=dict)  # D-091, not gating
 
 
 def _period_score(sharpe: float | None) -> float:
@@ -219,7 +227,6 @@ def evaluate(inp: EvalInputs) -> Phase3Evaluation:
         raise ValueError("the six S0 robustness variants must be supplied (the pre-flight refuses otherwise)")
     spec, btc, factory = inp.spec, inp.btc, inp.factory
     points = [p for c in inp.candidates for p in c.points]
-    timeframes = {p.key: p.timeframe for p in [S0_POINT, *points]}
     first = {**inp.first_tradable}
 
     bh = benchmark_runs(btc, spec, inp.costs, MODES)
@@ -229,7 +236,7 @@ def evaluate(inp: EvalInputs) -> Phase3Evaluation:
     trial_sharpes = trial_daily_sharpes(trial_runs)
 
     # -- H1: S0
-    s0 = _evaluate_s0(inp, bh, timeframes)
+    s0 = _evaluate_s0(inp, bh)
 
     # -- H1/H2: candidates
     fixed = run_fixed_points(btc, points, factory, (FillMode.MANUAL_DELAY,), inp.costs)
@@ -238,17 +245,15 @@ def evaluate(inp: EvalInputs) -> Phase3Evaluation:
         walk = run_candidate(
             cand, btc, spec, factory=factory, first_tradable=first, fixed=fixed, costs=inp.costs
         )
-        evals.append(_evaluate_candidate(inp, cand, walk, fixed, bh, trial_runs, trial_sharpes, timeframes))
+        evals.append(_evaluate_candidate(inp, cand, walk, fixed, bh, trial_runs, trial_sharpes))
 
     # -- H3: S1 and leave-one-out blends
     passing = [e for e in [s0, *evals] if e.passes]
-    s1 = _evaluate_s1(inp, passing, bh, trial_sharpes, timeframes) if passing else None
+    s1 = _evaluate_s1(inp, passing, bh, trial_sharpes) if passing else None
     s1_without: dict[str, SeriesRun | None] = {}
     for e in evals:
         others = [m for m in passing if m.name != e.name]
-        s1_without[e.name] = (
-            _blend(inp, others, FillMode.MANUAL_DELAY, timeframes, inp.btc) if others else None
-        )
+        s1_without[e.name] = _blend(inp, others, FillMode.MANUAL_DELAY, inp.btc) if others else None
 
     # -- H4
     s0_run = s0.pooled[FillMode.MANUAL_DELAY]
@@ -274,6 +279,9 @@ def evaluate(inp: EvalInputs) -> Phase3Evaluation:
     x, reason = choose_x(
         qualified, (s0.passes, s0.sharpe), (contender.passes, contender.sharpe) if contender else None
     )
+    sens_bh: dict[FillMode, SeriesRun] = {}
+    if inp.sensitivity_costs is not None:
+        s0, evals, s1, sens_bh = _with_sensitivity(inp, s0, evals, s1)
     return Phase3Evaluation(
         benchmark=bh,
         s0=s0,
@@ -286,7 +294,34 @@ def evaluate(inp: EvalInputs) -> Phase3Evaluation:
         x_reason=reason,
         trial_sharpes=trial_sharpes,
         n_trials=inp.logged_non_s0_trials,
+        sensitivity_benchmark=sens_bh,
     )
+
+
+def _with_sensitivity(
+    inp: EvalInputs, s0: StrategyEval, evals: list[StrategyEval], s1: StrategyEval | None
+) -> tuple[StrategyEval, list[StrategyEval], StrategyEval | None, dict[FillMode, SeriesRun]]:
+    """D-091: re-run every contender's fixed schedule under ``inp.sensitivity_costs`` (both fill modes).
+
+    Nothing here is read by a gate, by the selection, by DSR/PBO or by X: the results are attached to the
+    evaluation for the report block "sensitivity, not gating (D-091)". The selection stays the one made
+    under the run costs.
+    """
+    costs = inp.sensitivity_costs
+    assert costs is not None
+    spec, btc, factory = inp.spec, inp.btc, inp.factory
+    bench = benchmark_runs(btc, spec, costs, MODES)
+    s0_sens = {m: fixed_pooled(btc, S0_POINT, factory, spec, m, costs) for m in MODES}
+    out_evals: list[StrategyEval] = []
+    for e in evals:
+        assert e.walk is not None
+        sens = {m: reuse_run(btc, e.walk, factory, spec, m, costs) for m in MODES}
+        out_evals.append(dataclasses.replace(e, sensitivity=sens))
+    out_s1 = s1
+    if s1 is not None:
+        sens_s1 = {m: blend_run(btc, list(s1.schedule_members), factory, spec, m, costs) for m in MODES}
+        out_s1 = dataclasses.replace(s1, sensitivity=sens_s1)
+    return dataclasses.replace(s0, sensitivity=s0_sens), out_evals, out_s1, dict(bench)
 
 
 # -- pieces ---------------------------------------------------------------------------------------
@@ -296,15 +331,13 @@ def _s0_schedule(spec: WalkForwardSpec) -> list[tuple[datetime, str | None]]:
     return [(spec.first_test_start, "S0")]
 
 
-def _evaluate_s0(
-    inp: EvalInputs, bh: Mapping[FillMode, SeriesRun], timeframes: Mapping[str, Timeframe]
-) -> StrategyEval:
+def _evaluate_s0(inp: EvalInputs, bh: Mapping[FillMode, SeriesRun]) -> StrategyEval:
     spec, btc, factory = inp.spec, inp.btc, inp.factory
     pooled = {m: fixed_pooled(btc, S0_POINT, factory, spec, m, inp.costs) for m in MODES}
     stress = fixed_pooled(btc, S0_POINT, factory, spec, FillMode.MANUAL_DELAY, inp.stress)
     schedule = _s0_schedule(spec)
-    eth = _reuse_all(inp, inp.eth, schedule, timeframes, "S0")
-    indices = _index_runs(inp, schedule, timeframes, "S0")
+    eth = _reuse_all(inp, inp.eth, schedule, "S0")
+    indices = _index_runs(inp, schedule, "S0")
     run = pooled[FillMode.MANUAL_DELAY]
     dd, sh = _core_gates(pooled, bh)
     variants = _s0_variants(inp, run)
@@ -337,27 +370,21 @@ def _reuse_all(
     inp: EvalInputs,
     market: Market,
     schedule: Sequence[tuple[datetime, str | None]],
-    timeframes: Mapping[str, Timeframe],
     name: str,
 ) -> dict[FillMode, SeriesRun]:
     return {
-        m: pooled_run(market, schedule, inp.factory, timeframes, inp.spec, m, inp.costs, strategy_id=name)
-        for m in MODES
+        m: pooled_run(market, schedule, inp.factory, inp.spec, m, inp.costs, strategy_id=name) for m in MODES
     }
 
 
 def _index_runs(
     inp: EvalInputs,
     schedule: Sequence[tuple[datetime, str | None]],
-    timeframes: Mapping[str, Timeframe],
     name: str,
 ) -> dict[str, SeriesRun]:
-    from tbot.validation.robustness import index_schedule
-
-    sched = index_schedule(schedule, timeframes)
     return {
         label: pooled_run(
-            market, sched, inp.factory, timeframes, inp.spec, FillMode.NEXT_OPEN, inp.costs, strategy_id=name
+            market, schedule, inp.factory, inp.spec, FillMode.NEXT_OPEN, inp.costs, strategy_id=name
         )
         for label, market in inp.indices.items()
     }
@@ -371,7 +398,6 @@ def _evaluate_candidate(
     bh: Mapping[FillMode, SeriesRun],
     trial_runs: Mapping[str, SeriesRun],
     trial_sharpes: Mapping[str, float],
-    timeframes: Mapping[str, Timeframe],
 ) -> StrategyEval:
     spec, btc, factory = inp.spec, inp.btc, inp.factory
     run = walk.pooled[FillMode.MANUAL_DELAY]
@@ -386,9 +412,9 @@ def _evaluate_candidate(
     )
     dsr = candidate_dsr(run.returns, trial_sharpes, inp.logged_non_s0_trials)
     nb = neighbour_test(cand, walk.final_selection, trial_runs)
-    eth = {m: reuse_run(inp.eth, walk, cand, factory, spec, m, inp.costs) for m in MODES}
-    stress = reuse_run(btc, walk, cand, factory, spec, FillMode.MANUAL_DELAY, inp.stress)
-    indices = _index_runs(inp, walk.schedule, timeframes, cand.name)
+    eth = {m: reuse_run(inp.eth, walk, factory, spec, m, inp.costs) for m in MODES}
+    stress = reuse_run(btc, walk, factory, spec, FillMode.MANUAL_DELAY, inp.stress)
+    indices = _index_runs(inp, walk.schedule, cand.name)
     dd, sh = _core_gates(walk.pooled, bh)
     gates = (dd, sh, pbo_gate(pbo.pbo), dsr_gate(dsr.dsr if dsr else None), nb.gate, _eth_gate(eth))
     zero, vs_bh = candidate_min_trl(run.returns, bh[FillMode.MANUAL_DELAY].returns)
@@ -415,12 +441,11 @@ def _blend(
     inp: EvalInputs,
     members: Sequence[StrategyEval],
     mode: FillMode,
-    timeframes: Mapping[str, Timeframe],
     market: Market,
     costs: CostSpec | None = None,
 ) -> SeriesRun:
     scheds = [sched for m in members for sched in m.schedule_members[:1]]
-    return blend_run(market, scheds, inp.factory, timeframes, inp.spec, mode, costs or inp.costs)
+    return blend_run(market, scheds, inp.factory, inp.spec, mode, costs or inp.costs)
 
 
 def _evaluate_s1(
@@ -428,11 +453,10 @@ def _evaluate_s1(
     members: Sequence[StrategyEval],
     bh: Mapping[FillMode, SeriesRun],
     trial_sharpes: Mapping[str, float],
-    timeframes: Mapping[str, Timeframe],
 ) -> StrategyEval:
-    pooled = {m: _blend(inp, members, m, timeframes, inp.btc) for m in MODES}
-    stress = _blend(inp, members, FillMode.MANUAL_DELAY, timeframes, inp.btc, inp.stress)
-    eth = {m: _blend(inp, members, m, timeframes, inp.eth) for m in MODES}
+    pooled = {m: _blend(inp, members, m, inp.btc) for m in MODES}
+    stress = _blend(inp, members, FillMode.MANUAL_DELAY, inp.btc, inp.stress)
+    eth = {m: _blend(inp, members, m, inp.eth) for m in MODES}
     run = pooled[FillMode.MANUAL_DELAY]
     dd, sh = _core_gates(pooled, bh)
     dsr = candidate_dsr(run.returns, trial_sharpes, inp.logged_non_s0_trials)

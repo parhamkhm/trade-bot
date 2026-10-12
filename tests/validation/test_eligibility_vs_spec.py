@@ -1,8 +1,12 @@
 """The SPEC 7.2 B eligibility table, recomputed from the REAL local Binance BTCUSDT data (every cell).
 
 The table in docs/SPEC.md is parsed from the markdown (so a later edit of the SPEC table changes what is
-compared) and compared with ``eligibility_table`` over the 17 grid points: the first-tradable-close column and
+compared) and compared with ``eligibility_table`` over the 14 grid points: the first-tradable-close column and
 every check/dash of the 12 period columns. Skipped when the local Parquet store is absent (CI).
+
+D-090 removed the three C3 4h points from Phase 3. Until the amended SPEC (PR #31) is merged, the SPEC on
+this branch may still list them; ``parse_spec_table`` therefore drops rows whose point is a 4h point (a
+no-op once the amended table is in place).
 
 Synthetic tests of the rules themselves (which need no store) are below.
 """
@@ -58,6 +62,8 @@ def parse_spec_table() -> dict[str, tuple[datetime, tuple[bool, ...]]]:
         if not m:
             continue
         cells = [c.strip() for c in m.group("cells").split("|")]
+        if m.group("point").strip().startswith("4h"):
+            continue  # D-090: the 4h points are out of Phase 3 (no-op on the amended SPEC)
         flags = tuple(c == "✓" for c in cells)
         assert all(c in {"✓", chr(0x2013)} for c in cells), line  # check mark / en dash
         first = datetime.strptime(m.group("first"), "%Y-%m-%d %H:%M").replace(tzinfo=UTC)
@@ -65,7 +71,7 @@ def parse_spec_table() -> dict[str, tuple[datetime, tuple[bool, ...]]]:
     return table
 
 
-def test_parse_finds_all_17_rows_matching_the_registry() -> None:
+def test_parse_finds_all_14_rows_matching_the_registry() -> None:
     table = parse_spec_table()
     assert set(table) == set(grid_points()), set(table) ^ set(grid_points())
     assert all(len(flags) == 12 for _, flags in table.values())
@@ -84,12 +90,8 @@ def test_periods_are_the_twelve_of_the_spec() -> None:
 
 @pytest.mark.skipif(find_parquet_root() is None, reason="local Binance Parquet store not present")
 def test_eligibility_equals_the_spec_table_on_real_data() -> None:
-    bars = {
-        Timeframe.D1: real_bars("BTCUSDT", Timeframe.D1, HISTORY_START, HOLDOUT_START),
-        Timeframe.H4: real_bars("BTCUSDT", Timeframe.H4, HISTORY_START, HOLDOUT_START),
-    }
+    bars = {Timeframe.D1: real_bars("BTCUSDT", Timeframe.D1, HISTORY_START, HOLDOUT_START)}
     assert len(bars[Timeframe.D1]) == 2829  # SPEC 7.2 B: 2018-01-02 .. 2025-09-30, no gaps
-    assert len(bars[Timeframe.H4]) == 16_963
     spec = parse_spec_table()
     points = list(grid_points().values())
     rows = {r.key: r for r in eligibility_table(points, bars, SPEC_PERIODS)}
@@ -120,13 +122,12 @@ def test_first_tradable_is_floored_at_the_s0_close_and_uses_the_present_bars() -
     assert first_tradable_close(pts["C1-(20,55,100)"], by_tf) == TRAIN_START  # 101 < 151: S0 floor
     assert first_tradable_close(pts["C1-(40,110,200)"], by_tf) == HISTORY_START + timedelta(days=201)
     assert first_tradable_close(pts["C4-p20"], by_tf) == HISTORY_START + timedelta(days=385)
-    # 4h counts the bars that exist: drop 3 bars and the 1536th present bar is 3 bars later
-    h4 = synthetic_bars(1600, start=HISTORY_START, timeframe=Timeframe.H4)
-    pt = pts["C3-4h-(32,64,128)"]
-    full = first_tradable_close(pt, {Timeframe.H4: h4})
-    holes = [b for i, b in enumerate(h4) if i not in {10, 11, 12}]
-    assert first_tradable_close(pt, {Timeframe.H4: holes}) == h4[1535 + 3].ts
-    assert full == h4[1535].ts
+    # the count is of daily closes that exist: drop 3 bars and the 768th present close is 3 bars later
+    pt = pts["C3-1d-(16,32,64)"]
+    full = first_tradable_close(pt, by_tf)
+    holes = [b for i, b in enumerate(daily) if i not in {10, 11, 12}]
+    assert full == daily[767].ts
+    assert first_tradable_close(pt, {Timeframe.D1: holes}) == daily[767 + 3].ts
 
 
 def test_tradable_days_and_the_365_day_threshold_are_exact() -> None:
@@ -139,8 +140,8 @@ def test_tradable_days_and_the_365_day_threshold_are_exact() -> None:
     assert tradable_days(first, closes, first) == 0
 
 
-def test_build_grid_has_17_points_one_base_per_family() -> None:
+def test_build_grid_has_14_points_one_base_per_family() -> None:
     grid = build_grid()
-    assert sum(len(v) for v in grid.values()) == 17
-    assert [len(grid[f]) for f in ("C1", "C2", "C3", "C4", "C5")] == [3, 3, 5, 3, 3]
+    assert sum(len(v) for v in grid.values()) == 14
+    assert [len(grid[f]) for f in ("C1", "C2", "C3", "C4", "C5")] == [3, 3, 2, 3, 3]
     assert all(sum(p.is_base for p in pts) == 1 for pts in grid.values())

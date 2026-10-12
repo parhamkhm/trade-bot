@@ -20,7 +20,9 @@ from tbot.validation.preflight import (
     check_engine_commit,
     check_registry_importable,
     check_s0_variants,
+    check_sensitivity,
     check_slippage,
+    check_stop_out_aware,
     check_trial_log,
     preflight,
 )
@@ -65,15 +67,15 @@ def test_unregistered_s0_is_a_problem() -> None:
     assert any("S0 is not registered" in p for p in problems)
 
 
-def test_s0_family_rows_do_not_count_toward_the_seventeen() -> None:
+def test_s0_family_rows_do_not_count_toward_the_fourteen() -> None:
     extra = "| S0-SMA50 | d | 3 | S0 variant | p | r | 1d | BTCUSDT | none | n |\n"
     assert check_trial_log(parse_trial_log(COMPLETE + extra)) == []
 
 
-def test_an_eighteenth_non_s0_row_is_refused() -> None:
+def test_a_fifteenth_non_s0_row_is_refused() -> None:
     extra = "| T99 | d | 3 | C9 an extra trial | p | r | 1d | BTCUSDT | none | n |\n"
     problems = check_trial_log(parse_trial_log(COMPLETE + extra))
-    assert any("18 non-S0 trial rows logged, exactly 17 required" in p for p in problems)
+    assert any("15 non-S0 trial rows logged, exactly 14 required" in p for p in problems)
 
 
 def test_the_six_registered_variants_pass() -> None:
@@ -130,11 +132,46 @@ def test_preflight_aggregates_every_check() -> None:
     assert isinstance(check_engine(), list)
 
 
-@pytest.mark.parametrize("n", [16, 18])
-def test_a_registry_that_is_not_17_points_is_refused(n: int) -> None:
-    entries = PHASE3_ENTRIES[: n + 1] if n < 17 else (*PHASE3_ENTRIES, PHASE3_ENTRIES[-1])
+@pytest.mark.parametrize("n", [13, 15])
+def test_a_registry_that_is_not_14_points_is_refused(n: int) -> None:
+    entries = PHASE3_ENTRIES[: n + 1] if n < 14 else (*PHASE3_ENTRIES, PHASE3_ENTRIES[-1])
     problems = check_trial_log(parse_trial_log(COMPLETE), entries)
-    assert any("pre-registers 17" in p for p in problems)
+    assert any("pre-registers 14" in p for p in problems)
+
+
+def test_the_registry_has_14_grid_points_and_no_4h_point() -> None:
+    keys = [e.key for e in PHASE3_ENTRIES if e.key != "S0"]
+    assert len(keys) == 14 and not any("4h" in k for k in keys)
+
+
+class _AwareStrategy:
+    warmup_bars = 1
+    id = "aware"
+
+    def stopped_out_on(self, window: object) -> bool:  # noqa: ARG002
+        return False
+
+
+def test_a_grid_strategy_without_stopped_out_on_is_refused_for_s1() -> None:
+    """D-092: S1 follows its members' stop-outs, so a member that cannot report one stops the run."""
+
+    def loader(entry: Phase3Entry) -> Strategy:
+        if entry.key == "C2-(15,45,90)":
+            return SmaFilter(100)  # no stopped_out_on
+        return _AwareStrategy()  # type: ignore[return-value]
+
+    problems = check_stop_out_aware(loader)
+    assert problems == [
+        "C2-(15,45,90): no stopped_out_on(window); S1 cannot follow its stop-outs (D-092)"
+    ]
+    assert check_stop_out_aware(lambda _e: _AwareStrategy()) == []  # type: ignore[arg-type,return-value]
+
+
+def test_a_strategy_that_fails_to_load_is_reported_by_the_importable_check_not_twice() -> None:
+    def loader(entry: Phase3Entry) -> Strategy:
+        raise ModuleNotFoundError("x", name="x")
+
+    assert check_stop_out_aware(loader) == []
 
 
 def test_flat_slippage_is_refused_unless_explicitly_allowed_for_tests() -> None:
@@ -248,3 +285,83 @@ def test_the_script_does_not_import_the_tests_package() -> None:
         elif isinstance(node, ast.ImportFrom) and node.module:
             modules.append(node.module)
     assert modules and not any(m == "tests" or m.startswith("tests.") for m in modules)
+
+
+# -- D-091: the adverse-p90 sensitivity cannot be skipped ------------------------------------------------
+
+G0_SUMMARY = (
+    Path(__file__).resolve().parents[2]
+    / "research/reports/g0_lbank_20261011/lbank_probe_20261011T042800Z.summary.json"
+)
+
+
+def test_a_real_run_without_sensitivity_costs_is_refused_and_a_test_run_is_not() -> None:
+    run = NORMAL_COSTS.with_model(_curve(), "run curve")
+    other = NORMAL_COSTS.with_model(_curve(), "adverse curve")
+    assert any("sensitivity" in p for p in check_sensitivity(run, None, allow_flat=False))
+    assert check_sensitivity(run, other, allow_flat=False) == []
+    assert check_sensitivity(run, None, allow_flat=True) == []  # unit tests of other checks only
+    assert any("flat slippage" in p for p in check_sensitivity(run, NORMAL_COSTS, allow_flat=False))
+    assert any("own curve" in p for p in check_sensitivity(run, run, allow_flat=False))
+
+
+def test_preflight_requires_the_sensitivity_for_a_real_run() -> None:
+    def loader(entry: Phase3Entry) -> Strategy:
+        raise ModuleNotFoundError("x", name="x")
+
+    run = NORMAL_COSTS.with_model(_curve(), "run curve")
+    other = NORMAL_COSTS.with_model(_curve(), "adverse curve")
+    log = parse_trial_log(HEADER)
+    assert any("sensitivity" in p for p in preflight(log, loader, costs=run))
+    assert not any("sensitivity" in p for p in preflight(log, loader, costs=run, sensitivity_costs=other))
+
+
+def test_g0_summary_builds_the_median_run_curve_and_a_distinct_adverse_p90_sensitivity_curve() -> None:
+    from scripts.validation.phase3_run import _g0_costs
+
+    run, sensitivity = _g0_costs(G0_SUMMARY)
+    assert not run.is_flat_slippage and not sensitivity.is_flat_slippage
+    assert run.slippage_model != sensitivity.slippage_model
+    assert check_sensitivity(run, sensitivity, allow_flat=False) == []
+
+
+def test_run_script_accepts_g0_summary_as_both_curves_but_a_hand_given_curve_alone_is_refused(
+    tmp_path: Path, script: ModuleType, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    log = tmp_path / "EXPERIMENTS.md"
+    log.write_text(COMPLETE, encoding="utf-8")
+    monkeypatch.setattr(script, "EXPERIMENTS", log)
+    script.main(["--preflight-only", "--g0-summary", str(G0_SUMMARY)])
+    err = capsys.readouterr().err
+    assert "sensitivity" not in err and "flat slippage" not in err
+    monkeypatch.setattr(script, "_slippage_cost", lambda _spec: NORMAL_COSTS.with_model(_curve(), "hand"))
+    assert script.main(["--preflight-only", "--slippage-model", "m:f"]) == 2
+    assert "sensitivity" in capsys.readouterr().err
+
+
+def test_run_script_passes_the_adverse_costs_to_the_evaluation_and_requires_the_report_block(
+    script: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, object] = {}
+
+    class _Market:
+        def series(self, _tf: object) -> list[object]:
+            return []
+
+    def fake_evaluate(inputs: object) -> str:
+        seen["costs"] = inputs.costs  # type: ignore[attr-defined]
+        seen["sens"] = inputs.sensitivity_costs  # type: ignore[attr-defined]
+        return "evaluation"
+
+    monkeypatch.setattr(script, "_load_market", lambda *_a: _Market())
+    monkeypatch.setattr(script, "first_tradable_close", lambda *_a: None)
+    monkeypatch.setattr(script, "evaluate", fake_evaluate)
+    monkeypatch.setattr(script, "registry_candidates", lambda: [])
+    log = parse_trial_log(COMPLETE)
+    run, sensitivity = script._g0_costs(G0_SUMMARY)
+    monkeypatch.setattr(script, "render_report", lambda _ev, _spec: "no block here")
+    with pytest.raises(RuntimeError, match="D-091"):
+        script._evaluate_and_render([], run, sensitivity, log)
+    assert seen["costs"] is run and seen["sens"] is sensitivity
+    monkeypatch.setattr(script, "render_report", lambda _ev, _spec: f"## x ({script.SENSITIVITY_BLOCK})")
+    assert script._evaluate_and_render([], run, sensitivity, log).endswith(")")

@@ -31,7 +31,6 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from tbot.core.types import Timeframe
 from tbot.validation.eligibility import is_eligible, tradable_days
 from tbot.validation.grid import (
     HOLDOUT_START,
@@ -111,7 +110,7 @@ class Candidate:
 
 
 def registry_candidates() -> list[Candidate]:
-    """C1..C5 from the Phase 3 registry (17 points)."""
+    """C1..C5 from the Phase 3 registry (14 points, D-090)."""
     return [Candidate(name, points) for name, points in build_grid().items()]
 
 
@@ -223,11 +222,6 @@ def run_fixed_points(
     return out
 
 
-def _feed_timeframe(keys: Sequence[str | None], timeframes: Mapping[str, Timeframe]) -> Timeframe:
-    chosen = {timeframes[k] for k in keys if k is not None}
-    return Timeframe.H4 if Timeframe.H4 in chosen else Timeframe.D1
-
-
 def _baseline(market: Market, first_test_start: datetime) -> datetime:
     closes = market.daily_closes
     idx = bisect_left(closes, first_test_start)
@@ -257,7 +251,6 @@ def pooled_run(
     market: Market,
     schedule: Sequence[tuple[datetime, str | None]],
     factory: StrategyFactory,
-    timeframes: Mapping[str, Timeframe],
     spec: WalkForwardSpec,
     mode: FillMode,
     costs: CostSpec,
@@ -270,19 +263,15 @@ def pooled_run(
     series from the first test day on is returned (``anchor_schedule``, ``run_composite``).
     """
     schedule = anchor_schedule(market, schedule)
-    feed_tf = _feed_timeframe([k for _, k in schedule], timeframes)
     composite = CompositeStrategy(
         strategy_id=strategy_id,
         market=market,
         schedule=schedule,
         factory=factory,
-        timeframes=timeframes,
-        feed_timeframe=feed_tf,
     )
     return run_composite(
         market,
         composite,
-        feed_tf,
         mode,
         costs,
         baseline=_baseline(market, spec.first_test_start),
@@ -294,32 +283,29 @@ def blend_run(
     market: Market,
     member_schedules: Sequence[Sequence[tuple[datetime, str | None]]],
     factory: StrategyFactory,
-    timeframes: Mapping[str, Timeframe],
     spec: WalkForwardSpec,
     mode: FillMode,
     costs: CostSpec,
     *,
     strategy_id: str = "S1",
 ) -> SeriesRun:
-    """Equal-weight blend of several members' schedules (S1), pooled over the test days."""
+    """Equal-weight blend of several members' schedules (S1), pooled over the test days.
+
+    S1 has no stop of its own and follows its members' daily stopped states (D-092); see ``runs``.
+    """
     member_schedules = [anchor_schedule(market, sched) for sched in member_schedules]
-    keys = [k for sched in member_schedules for _, k in sched]
-    feed_tf = _feed_timeframe(keys, timeframes)
     members = [
         CompositeStrategy(
             strategy_id=f"{strategy_id}/{i}",
             market=market,
             schedule=sched,
             factory=factory,
-            timeframes=timeframes,
-            feed_timeframe=feed_tf,
         )
         for i, sched in enumerate(member_schedules)
     ]
     return run_composite(
         market,
         BlendStrategy(strategy_id, members),
-        feed_tf,
         mode,
         costs,
         baseline=_baseline(market, spec.first_test_start),
@@ -365,9 +351,8 @@ def run_candidate(
         periods_per_year=market.periods_per_year,
     )
     schedule = build_schedule(spec, selections)
-    timeframes = {p.key: p.timeframe for p in candidate.points}
     pooled = {
-        mode: pooled_run(market, schedule, factory, timeframes, spec, mode, costs, strategy_id=candidate.name)
+        mode: pooled_run(market, schedule, factory, spec, mode, costs, strategy_id=candidate.name)
         for mode in modes
     }
     return CandidateResult(

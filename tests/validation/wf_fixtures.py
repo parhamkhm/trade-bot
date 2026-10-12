@@ -12,7 +12,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from functools import cache
 
-from tbot.core.types import Bar, Strategy, Timeframe
+from tbot.core.types import Bar, BarWindow, Strategy, Timeframe
 from tbot.strategies.sma_filter import SmaFilter
 from tbot.validation.grid import GridPoint, make_periods
 from tbot.validation.runs import Market, SeriesRun
@@ -27,6 +27,7 @@ __all__ = [
     "POINTS",
     "S0_VARIANT_KEYS",
     "SPEC",
+    "StopAwareSma",
     "factory",
     "fake_run",
     "make_market",
@@ -61,15 +62,23 @@ POINTS: tuple[GridPoint, ...] = tuple(
 CANDIDATE = Candidate("T", POINTS)
 
 
+class StopAwareSma(SmaFilter):
+    """``SmaFilter`` that satisfies the ``StopOutAware`` protocol: it has no daily stop state, so it never
+    reports a stop-out (S1 needs the method from its members, D-092)."""
+
+    def stopped_out_on(self, window: BarWindow) -> bool:  # noqa: ARG002
+        return False
+
+
 def factory(key: str) -> Strategy:
     """``S0`` is a 30-day SMA filter; ``T-smaN`` is an N-day SMA filter."""
     if key == "S0":
-        return SmaFilter(30)
+        return StopAwareSma(30)
     if key.startswith("S0var-sma"):  # the stand-in has no vol-target knob: the vol variants are SMA 30 too
-        return SmaFilter(int(key.removeprefix("S0var-sma")))
+        return StopAwareSma(int(key.removeprefix("S0var-sma")))
     if key.startswith("S0var-vol"):
-        return SmaFilter(30)
-    return SmaFilter(int(key.removeprefix("T-sma")))
+        return StopAwareSma(30)
+    return StopAwareSma(int(key.removeprefix("T-sma")))
 
 
 @cache

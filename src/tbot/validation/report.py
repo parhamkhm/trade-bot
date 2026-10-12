@@ -23,7 +23,7 @@ from tbot.validation.policy import POLICY_SUMMARY
 from tbot.validation.runs import FillMode, SeriesRun
 from tbot.validation.walk_forward import WalkForwardSpec
 
-__all__ = ["LABEL", "render_report"]
+__all__ = ["LABEL", "SENSITIVITY_BLOCK", "render_report"]
 
 LABEL = "[P]"
 NA = "n/a"
@@ -99,8 +99,8 @@ def _header(spec: WalkForwardSpec, ev: Phase3Evaluation) -> list[str]:
     return [
         "# Phase 3 walk-forward evaluation (T6 steps H1-H5)",
         "",
-        f"> **PROVISIONAL.** Every number below carries the label `{LABEL}`: costs (fee 10 bps + slippage",
-        "> 5 bps per side),",
+        f"> **PROVISIONAL.** Every number below carries the label `{LABEL}`: costs (fee 10 bps per side plus",
+        "> the run's slippage model, the G0 median depth curve of D-091),",
         "> the 25 % rebalance band and the 6 h manual delay are provisional until the G2 re-pricing, so",
         "> none of",
         "> these results is final and none may be used for a go / no-go decision on its own.",
@@ -109,11 +109,8 @@ def _header(spec: WalkForwardSpec, ev: Phase3Evaluation) -> list[str]:
         f"{spec.first_test_start:%Y-%m-%d} to {spec.last_test_end:%Y-%m-%d} (exclusive). "
         "Training is anchored and expanding. The sealed holdout (from 2025-10-01) was not loaded.",
         f"Logged non-S0 trials used for the DSR: {ev.n_trials}.",
-        "Open SPEC readings (current behaviour, each one named switch in `validation.policy`): "
-        f"{POLICY_SUMMARY}.",
-        "Data notes: the 4h points' daily sigma-hat and ATR are computed from the completed UTC days "
-        "of the 4h bars; 10 4h bars are missing before 2018-09-15 (the data-quality report), "
-        "long before the first test day.",
+        f"Decided items (Parham, 2026-10-12): {POLICY_SUMMARY}.",
+        "S1 has no intraday stop of its own; it follows its members' daily stopped states (D-092).",
         "",
     ]
 
@@ -152,6 +149,33 @@ def _pooled_section(ev: Phase3Evaluation) -> list[str]:
     ]
 
 
+SENSITIVITY_BLOCK = "sensitivity, not gating (D-091)"
+
+
+def _sensitivity_section(ev: Phase3Evaluation) -> list[str]:
+    """D-091: adverse-p90 curve, pooled OOS Sharpe and maxDD per contender, both fill modes. Not gating."""
+    if not ev.sensitivity_benchmark and not any(s.sensitivity for s in _strategies(ev)):
+        return []
+    header = ["strategy", "Sharpe(365)", "maxDD"]
+    rows: list[list[str]] = []
+    for mode in (FillMode.MANUAL_DELAY, FillMode.NEXT_OPEN):
+        if mode in ev.sensitivity_benchmark:
+            run = ev.sensitivity_benchmark[mode]
+            rows.append([f"buy-and-hold ({mode.value})", _num(run.sharpe), _pct(run.max_drawdown)])
+        for s in _strategies(ev):
+            if mode in s.sensitivity:
+                run = s.sensitivity[mode]
+                rows.append([f"{s.name} ({mode.value})", _num(run.sharpe), _pct(run.max_drawdown)])
+    return [
+        f"## Slippage sensitivity, adverse p90 cost curve ({SENSITIVITY_BLOCK})",
+        "",
+        "The same fixed schedules re-run with the adverse-p90-cost depth curve. These rows never feed a "
+        "selection, a gate, the DSR, the PBO or X; the numbers above use the median curve.",
+        "",
+        *_table(header, rows),
+    ]
+
+
 def _gates_section(ev: Phase3Evaluation) -> list[str]:
     out = ["## Gates (G3, applied literally, manual-delay series)", ""]
     for s in _strategies(ev):
@@ -161,8 +185,10 @@ def _gates_section(ev: Phase3Evaluation) -> list[str]:
         extras: list[str] = []
         if s.pbo is not None:
             extras.append(
-                f"PBO {_num(s.pbo.pbo)} over {_cnt(s.pbo.n_combinations)} combinations, "
-                f"{_cnt(s.pbo.n_blocks)} blocks, {_cnt(s.pbo.dropped_leading_days)} leading days dropped"
+                f"PBO (lambda <= 0, the gating value, D-093) {_num(s.pbo.pbo)} over "
+                f"{_cnt(s.pbo.n_combinations)} combinations, "
+                f"{_cnt(s.pbo.n_blocks)} blocks, {_cnt(s.pbo.dropped_leading_days)} leading days dropped; "
+                f"share with lambda < 0, for information only: {_num(s.pbo.pbo_strict)}"
             )
         if s.dsr is not None:
             d = s.dsr
@@ -282,6 +308,7 @@ def render_report(ev: Phase3Evaluation, spec: WalkForwardSpec) -> str:
         *_header(spec, ev),
         *_benchmark_section(ev),
         *_pooled_section(ev),
+        *_sensitivity_section(ev),
         *_gates_section(ev),
         *_selection_section(ev),
         *_neighbour_section(ev),
