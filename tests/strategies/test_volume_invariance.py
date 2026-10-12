@@ -1,6 +1,6 @@
 """Behavioural D-040 guard (SPEC §7.2 J): no Phase 3 strategy's behaviour may depend on bar volume.
 
-Every registered Phase 3 strategy (S0 + the 17 grid points, ``tbot.strategies.phase3_registry``) runs
+Every registered Phase 3 strategy (S0 + the 14 grid points, ``tbot.strategies.phase3_registry``) runs
 through the real engine path three times on the same synthetic OHLC: with the original volume, with
 random volume, and with volume set to NaN. Targets, orders/fills and equity must be bit-identical, and the
 original run must be non-vacuous (at least 4 fills, with at least 2 entries and 2 exits).
@@ -32,7 +32,7 @@ from tests.backtest.helpers import make_config
 
 START = datetime(2018, 1, 1, tzinfo=UTC)  # the series must end before the sealed holdout (2025-10-01)
 DAYS = 2_000  # the last bar closes 2023-06-24, well before holdout_start
-BARS_PER_DAY = {Timeframe.D1: 1, Timeframe.H4: 6}
+BARS_PER_DAY = {Timeframe.D1: 1}  # Phase 3 is daily only (D-090)
 CYCLE_DAYS = 240  # alternating bull/bear phases so trend and mean-reversion rules all enter and exit
 MIN_FILLS, MIN_ENTRIES, MIN_EXITS = 4, 2, 2
 
@@ -165,7 +165,7 @@ def test_skip_rule_does_not_skip_an_existing_but_broken_entry() -> None:
         load(entry)
 
 
-D1, H4 = Timeframe.D1, Timeframe.H4
+D1 = Timeframe.D1
 
 SPEC_72C_GRID: list[tuple[str, str, Timeframe, dict[str, object]]] = [
     ("S0", "tbot.strategies.s0_sma100", D1, {}),
@@ -177,9 +177,6 @@ SPEC_72C_GRID: list[tuple[str, str, Timeframe, dict[str, object]]] = [
     ("C2-(60,180,360)", "tbot.strategies.tsmom", D1, {"horizons": (60, 180, 360)}),
     ("C3-1d-(8,16,32)", "tbot.strategies.ewmac", D1, {"fast_spans": (8, 16, 32)}),
     ("C3-1d-(16,32,64)", "tbot.strategies.ewmac", D1, {"fast_spans": (16, 32, 64)}),
-    ("C3-4h-(8,16,32)", "tbot.strategies.ewmac", H4, {"fast_spans": (8, 16, 32)}),
-    ("C3-4h-(16,32,64)", "tbot.strategies.ewmac", H4, {"fast_spans": (16, 32, 64)}),
-    ("C3-4h-(32,64,128)", "tbot.strategies.ewmac", H4, {"fast_spans": (32, 64, 128)}),
     ("C4-p10", "tbot.strategies.vol_breakout", D1, {"pct": 10}),
     ("C4-p20", "tbot.strategies.vol_breakout", D1, {"pct": 20}),
     ("C4-p30", "tbot.strategies.vol_breakout", D1, {"pct": 30}),
@@ -190,8 +187,8 @@ SPEC_72C_GRID: list[tuple[str, str, Timeframe, dict[str, object]]] = [
 
 
 def test_registry_matches_spec_grid() -> None:
-    """Every entry's (key, module, timeframe, params) equals a literal copy of SPEC §7.2 C (v3, D-087)."""
+    """Every entry's (key, module, timeframe, params) equals a literal copy of SPEC 7.2 C (D-087, D-090)."""
     actual = [(e.key, e.module, e.timeframe, dict(e.params)) for e in PHASE3_ENTRIES]
     assert actual == SPEC_72C_GRID
     assert all(e.factory == "make" for e in PHASE3_ENTRIES)
-    assert len(SPEC_72C_GRID) == 18  # S0 + 17 non-S0 trials
+    assert len(SPEC_72C_GRID) == 15  # S0 + 14 non-S0 trials (3 + 3 + 2 + 3 + 3, D-090)
