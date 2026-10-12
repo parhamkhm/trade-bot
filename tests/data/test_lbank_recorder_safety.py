@@ -42,7 +42,7 @@ def _trade(trade_id: str, time_ms: int) -> dict[str, Any]:
 
 
 def _poll(rec: LBankRecorder, tmp_path: Path, body: dict[str, Any], at_ms: int, monkeypatch: Any) -> None:
-    monkeypatch.setattr(lr, "_now_ms", lambda: at_ms)
+    rec._now_ms = lambda: at_ms  # the recorder's injected clock, moved to this poll's instant
     with respx.mock:
         respx.get(TRADES_URL).mock(return_value=httpx.Response(200, json=body))
         store = DayStore(tmp_path)
@@ -210,7 +210,7 @@ def test_no_cursor_when_nothing_was_ever_recorded(tmp_path: Path) -> None:
 def test_an_unreadable_cursor_never_stops_ingestion(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     (tmp_path / "lbank-2026-10-10.sqlite").write_bytes(b"this is not a database" * 50)
     rec = _recorder(tmp_path)
-    monkeypatch.setattr(lr, "_now_ms", lambda: T0)
+    rec._now_ms = lambda: T0
     monkeypatch.setattr(lr, "load_trade_cursor", _boom)
     with respx.mock:
         respx.get(TRADES_URL).mock(return_value=httpx.Response(200, json=TRADES))

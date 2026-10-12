@@ -12,7 +12,7 @@ concurrency:
 jobs:
   checks:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -142,3 +142,48 @@ jobs:
 
       - name: Tests (pytest)
         run: uv run pytest
+
+      - name: Install libfaketime (CI-only test tool, D-094)
+        run: sudo apt-get update && sudo apt-get install -y faketime
+
+      - name: Tests under a fake clock 1 (non-leap month end, then March; libfaketime, D-094)
+        env:
+          FAKE_START: "2031-02-28 23:59:00"
+          FAKETIME_DONT_FAKE_MONOTONIC: "1"
+          NO_FAKE_STAT: "1"
+        run: |
+          # Proves no test depends on today's date: the whole suite runs again with the wall clock
+          # shifted so that it starts at FAKE_START and keeps ticking (the run crosses midnight, a
+          # month end and a year end). A relative offset, not a frozen time, so every process the tests
+          # spawn shares one advancing fake clock. Monotonic clocks and file mtimes stay real. The venv
+          # was synced above, so `uv` itself never runs under the fake date.
+          offset=$(printf '%+d' $(( $(date -u -d "$FAKE_START" +%s) - $(date -u +%s) )))
+          echo "fake clock offset: ${offset} s -> starts at $FAKE_START UTC"
+          faketime -f "${offset}" .venv/bin/python -c "
+          import datetime, os, sys
+          want = os.environ['FAKE_START'][:10]
+          got = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+          sys.exit(0 if got == want else 'libfaketime is not active: ' + got + ' != ' + want)
+          "
+          faketime -f "${offset}" .venv/bin/python -m pytest -q -p no:cacheprovider
+
+      - name: Tests under a fake clock 2 (year end, then 2028 leap year; libfaketime, D-094)
+        env:
+          FAKE_START: "2027-12-31 23:58:00"
+          FAKETIME_DONT_FAKE_MONOTONIC: "1"
+          NO_FAKE_STAT: "1"
+        run: |
+          # Proves no test depends on today's date: the whole suite runs again with the wall clock
+          # shifted so that it starts at FAKE_START and keeps ticking (the run crosses midnight, a
+          # month end and a year end). A relative offset, not a frozen time, so every process the tests
+          # spawn shares one advancing fake clock. Monotonic clocks and file mtimes stay real. The venv
+          # was synced above, so `uv` itself never runs under the fake date.
+          offset=$(printf '%+d' $(( $(date -u -d "$FAKE_START" +%s) - $(date -u +%s) )))
+          echo "fake clock offset: ${offset} s -> starts at $FAKE_START UTC"
+          faketime -f "${offset}" .venv/bin/python -c "
+          import datetime, os, sys
+          want = os.environ['FAKE_START'][:10]
+          got = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+          sys.exit(0 if got == want else 'libfaketime is not active: ' + got + ' != ' + want)
+          "
+          faketime -f "${offset}" .venv/bin/python -m pytest -q -p no:cacheprovider

@@ -2369,7 +2369,7 @@ def _stderr(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
 
 
-def summarize_file(path: Path, out_dir: Path) -> int:
+def summarize_file(path: Path, out_dir: Path, *, now: Callable[[], datetime] = _utcnow) -> int:
     records = read_jsonl(path)
     prov = next((r for r in records if r.get("kind") == "provenance"), None)
     if prov is None:
@@ -2392,7 +2392,7 @@ def summarize_file(path: Path, out_dir: Path) -> int:
         finished=bool(end),
         stopped_on_ban={k: v for k, v in ban_record.items() if k != "kind"} if ban_record else None,
     )
-    paths = OutputPaths.for_run(out_dir, "lbank_probe_resummary", _stamp(datetime.now(UTC)))
+    paths = OutputPaths.for_run(out_dir, "lbank_probe_resummary", _stamp(now()))
     _publish(paths, summary, render_markdown(summary))
     print(f"verdict={summary['g0']['verdict']} summary={paths.summary} markdown={paths.markdown}")
     return 0
