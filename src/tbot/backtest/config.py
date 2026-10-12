@@ -31,8 +31,16 @@ class BacktestConfig:
     close it was sized at is a ``price_move`` (valid run, however large the move); one that was not even
     affordable there is a sizing bug, an ``anomaly``, and marks the run invalid.
 
-    ``slippage_model`` is the hook for the depth-at-size model of SPEC section 7 (calibrated in phase 3);
-    until one is supplied, the flat ``costs.slippage_bps`` placeholder applies.
+    ``slippage_model`` is the hook for the depth-at-size model of SPEC section 7 / D-067
+    (``tbot.execution.simulated.DepthCurveSlippage``; its points builder (SPEC D-091) is
+    ``tbot.backtest.slippage.curve_from_g0_summary``). It is opt-in: until one is supplied, the flat
+    ``costs.slippage_bps`` applies. The stub risk manager's sizing divisor still uses the flat
+    ``costs.slippage_bps`` as an estimate; the broker caps any BUY the real curve price makes unaffordable.
+
+    Protective stops (SPEC 7.1, D-050) are executed by the engine when ``enforce_stops`` is true (default):
+    the level is ``Strategy.stop_price(window_at_signal, P_ref)`` with ``P_ref`` the open of signal bar
+    ``t+1`` before slippage, fixed for the whole position, checked on every execution bar from the entry
+    fill on (1h bars in the delay model).
     """
 
     symbol: str
@@ -46,10 +54,16 @@ class BacktestConfig:
     exec_timeframe: Timeframe | None = None
     slippage_model: SlippageModel | None = field(default=None, compare=False)
     # StubRiskManager knobs (phase 2 stand-in only; the real RiskManager arrives in phase 4).
-    drift_tolerance: float = 0.02
+    # SPEC 7.1 S0 relative rebalance band: while in a position, a resize trades only if
+    # |w_target - w_now| >= band * max(w_target, w_now). 1.0 means "never resize while invested".
+    rebalance_band: float = 0.25
     # Default 0: the stub's sizing divisor already includes slippage and the taker fee, and the broker caps
     # a BUY at fill time to what cash affords at the real fill price in both fill modes.
     buy_buffer_bps: Decimal = Decimal(0)
+    # SPEC 7.1: execute the strategy's protective stop (Strategy.stop_price, D-050). Disable ONLY for
+    # runs that must be stopless by definition (the buy-and-hold benchmarks, SPEC 7.2 E) or for the
+    # stopless independent cross-check in tests/validation.
+    enforce_stops: bool = True
 
     def __post_init__(self) -> None:
         if self.filters.symbol != self.symbol:
@@ -78,8 +92,8 @@ class BacktestConfig:
                 f"fill_delay > 0 requires exec_timeframe = 1h (got {self.exec_timeframe}): coarser "
                 "execution bars would stretch the delay"
             )
-        if not 0.0 <= self.drift_tolerance < 1.0:
-            raise ValueError("drift_tolerance must be in [0, 1)")
+        if not 0.0 <= self.rebalance_band <= 1.0:
+            raise ValueError("rebalance_band must be in [0, 1]")
         if self.buy_buffer_bps < 0:
             raise ValueError("buy_buffer_bps must be >= 0")
 

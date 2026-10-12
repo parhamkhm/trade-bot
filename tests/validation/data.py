@@ -1,73 +1,24 @@
 """Data access for the G2 validation tests.
 
-Real data: Binance public klines from the local Parquet store, loaded through the normal sealed-holdout
-loader (``load_bars`` with ``allow_holdout=False``). On top of that every helper here asserts that no
-returned bar closes on or after ``CANONICAL_HOLDOUT_START`` and never passes ``allow_holdout``: this module
-cannot load the sealed holdout.
-
-The Parquet store is not committed. A worktree therefore looks for it in (1) the ``TBOT_VALIDATION_DATA``
-environment variable, (2) ``<repo>/data/parquet`` and (3) every ancestor directory of the repo (a git
-worktree lives under ``<main checkout>/.claude/worktrees/<name>``). Tests that need it skip cleanly when it
-is absent; the synthetic fallback below keeps the truncation tests meaningful either way.
+Real data: re-exported from ``tbot.validation.real_data`` (pre-holdout Binance klines from the local Parquet
+store; it cannot load the sealed holdout). Tests that need the store skip cleanly when it is absent; the
+synthetic fallback below keeps the truncation tests meaningful either way.
 """
 
 from __future__ import annotations
 
-import os
 import random
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from pathlib import Path
 
-from tbot.core.config import DataConfig
 from tbot.core.types import Bar, Timeframe
-from tbot.data.binance_loader import CANONICAL_HOLDOUT_START, load_bars
+from tbot.validation.real_data import find_parquet_root, real_bars
 from tests.sim_helpers import SYMBOL
 
 __all__ = ["find_parquet_root", "real_bars", "synthetic_bars", "synthetic_hourly_for_days"]
 
-_REPO = Path(__file__).resolve().parents[2]
 # synthetic series live well before the sealed holdout so that the engine's own seal checks never trigger
 SYNTH_START = datetime(2019, 1, 1, tzinfo=UTC)
-
-
-def find_parquet_root() -> Path | None:
-    candidates: list[Path] = []
-    env = os.environ.get("TBOT_VALIDATION_DATA")
-    if env:
-        candidates.append(Path(env))
-    for base in (_REPO, *_REPO.parents):
-        candidates.append(base / "data" / "parquet")
-    for path in candidates:
-        if (path / "klines" / "source=binance").is_dir():
-            return path
-    return None
-
-
-def real_bars(
-    symbol: str,
-    timeframe: Timeframe,
-    start: datetime,
-    end: datetime,
-) -> list[Bar]:
-    """Pre-holdout Binance bars with ``start <= bar.ts < end``. Raises ``FileNotFoundError`` if no store."""
-    if end > CANONICAL_HOLDOUT_START:
-        raise ValueError(f"validation tests must not read past the holdout start (end={end})")
-    root = find_parquet_root()
-    if root is None:
-        raise FileNotFoundError("no Parquet store found (set TBOT_VALIDATION_DATA)")
-    bars = load_bars(
-        symbol,
-        timeframe,
-        start=start,
-        end=end,
-        config=DataConfig(parquet_root=root),
-        caller="tests.validation.data",
-        reason="G2 validation (pre-holdout only)",
-    )
-    bars = [b for b in bars if start <= b.ts < end]
-    assert all(b.ts < CANONICAL_HOLDOUT_START for b in bars)
-    return bars
 
 
 def synthetic_bars(

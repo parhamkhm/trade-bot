@@ -21,7 +21,9 @@ from tbot.core.types import (
 from tbot.execution.simulated import (
     BrokerError,
     FeeSchedule,
+    FillRecord,
     FlatSlippage,
+    OrderRejection,
     SimulatedBroker,
     SlippageContext,
     UnknownOrderError,
@@ -173,9 +175,7 @@ CREATED = T_START + timedelta(days=1)  # close of daily bar 0, the created_ts us
 
 def exec_bar(hours_after_created: int, open_: str) -> Bar:
     """1h execution bar whose OPEN is ``hours_after_created`` after ``CREATED``."""
-    return make_bar(
-        0, open_, open_, tf=Timeframe.H1, start=CREATED + timedelta(hours=hours_after_created)
-    )
+    return make_bar(0, open_, open_, tf=Timeframe.H1, start=CREATED + timedelta(hours=hours_after_created))
 
 
 # D-051 (as revised 2026-10-11): a BUY is sized at fill time from the real fill price and the available
@@ -657,3 +657,115 @@ def test_cost_objects_from_config_and_validation() -> None:
             quote_asset="BTC",
             initial_cash=Dec(1),
         )
+
+
+# ---------------------------------------------------------------------------------------------
+# protective stops (SPEC 7.1): SimulatedBroker.stop_out
+# ---------------------------------------------------------------------------------------------
+
+
+def long_broker() -> SimulatedBroker:
+    """10 BTC bought at the open of bar 1: price 110.06, notional 1100.6, fee 3.8521, cash 8895.5479."""
+    b = broker()
+    b.submit(req("buy", Side.BUY, "10"))
+    b.advance(make_bar(0, "100", "105"))
+    b.advance(make_bar(1, "110", "120"))
+    assert b.balances() == {"USDT": Dec("8895.5479"), "BTC": Dec("10")}
+    return b
+
+
+def test_stop_out_sells_everything_at_the_stop_when_the_open_is_above_it() -> None:
+    b = long_broker()
+    bar = make_bar(2, "100", "92", low="90")
+    b.advance(bar)
+    rec = b.stop_out(bar, Dec("95"))
+    assert rec is not None and not hasattr(rec, "reason") and rec.stop_fill is True  # a FillRecord
+    # reference min(open 100, stop 95) = 95; -5 bps -> 94.9525 -> floor to tick 94.95
+    assert (rec.fill.side, rec.fill.price, rec.fill.quantity) == (Side.SELL, Dec("94.95"), Dec("10"))
+    assert rec.fill.ts == bar.open_ts and rec.fill.client_order_id == "stop-000001"
+    assert rec.reference_price == Dec("95") and rec.slippage_cost == Dec("0.05") * 10
+    assert rec.fill.fee == Dec("949.5") * Dec("0.0035") == Dec("3.32325")
+    assert b.balances() == {"USDT": Dec("8895.5479") + Dec("949.5") - Dec("3.32325"), "BTC": Dec("0")}
+    st = b.get_order("stop-000001")
+    assert st.state is OrderState.FILLED and st.avg_fill_price == Dec("94.95")
+
+
+def test_stop_out_on_a_gap_down_fills_at_the_open() -> None:
+    b = long_broker()
+    bar = make_bar(2, "90", "88", low="85")
+    b.advance(bar)
+    rec = b.stop_out(bar, Dec("95"))
+    assert isinstance(rec, FillRecord)
+    # reference min(90, 95) = 90; -5 bps -> 89.955 -> floor to tick 89.95; fee 899.5 * 35 bps = 3.14825
+    assert rec.reference_price == Dec("90") and rec.fill.price == Dec("89.95")
+    assert rec.fill.fee == Dec("3.14825")
+    assert b.balances()["USDT"] == Dec("8895.5479") + Dec("899.5") - Dec("3.14825")
+
+
+def test_stop_out_boundary_low_equal_to_the_stop_is_a_touch() -> None:
+    b = long_broker()
+    bar = make_bar(2, "100", "98", low="95")
+    b.advance(bar)
+    assert b.stop_out(bar, Dec("94.99")) is None  # low 95 > 94.99
+    assert b.balances()["BTC"] == Dec("10")
+    assert b.stop_out(bar, Dec("95")) is not None  # low == stop
+
+
+def test_stop_out_without_a_position_or_after_a_full_exit_is_none() -> None:
+    b = broker()
+    bar0 = make_bar(0, "100", "100", low="1")
+    b.advance(bar0)
+    assert b.stop_out(bar0, Dec("95")) is None  # never held anything
+    c = long_broker()
+    c.submit(req("sell", Side.SELL, "10", created_i=1))
+    bar2 = make_bar(2, "100", "98", low="90")
+    c.advance(bar2)  # the strategy's SELL fills at this open first
+    assert c.stop_out(bar2, Dec("95")) is None
+
+
+def test_stop_out_must_follow_advance_of_the_same_bar_and_validates_the_level() -> None:
+    b = long_broker()
+    bar = make_bar(2, "100", "98", low="90")
+    with pytest.raises(BrokerError, match="advance"):
+        b.stop_out(bar, Dec("95"))
+    b.advance(bar)
+    for bad in (Dec(0), Dec(-1), Dec("NaN"), Dec("Infinity")):
+        with pytest.raises(ValueError, match="stop"):
+            b.stop_out(bar, bad)
+    assert b.balances()["BTC"] == Dec("10")  # nothing happened
+
+
+def test_stop_exit_below_min_notional_is_rejected_and_the_position_is_kept() -> None:
+    flt = SymbolFilters(
+        symbol=SYMBOL,
+        tick_size=Dec("0.01"),
+        step_size=Dec("0.00001"),
+        min_qty=Dec("0.00001"),
+        min_notional=Dec("5000"),
+    )
+    b = broker(filters=flt)
+    b.submit(req("buy", Side.BUY, "100"))
+    b.advance(make_bar(0, "100", "100"))
+    b.advance(make_bar(1, "100", "100"))  # the all-in BUY is capped by cash to a bit under 100
+    held = b.balances()["BTC"]
+    assert Dec("99") < held < Dec("100")
+    bar = make_bar(2, "10", "9", low="8")
+    b.advance(bar)
+    out = b.stop_out(bar, Dec("50"))
+    assert isinstance(out, OrderRejection) and "MIN_NOTIONAL" in out.reason
+    assert b.balances()["BTC"] == held
+    assert b.get_order(out.client_order_id).state is OrderState.REJECTED
+
+
+def test_stop_fills_do_not_collide_with_strategy_order_ids_and_are_numbered() -> None:
+    b = long_broker()
+    bar2 = make_bar(2, "100", "92", low="90")
+    b.advance(bar2)
+    first = b.stop_out(bar2, Dec("95"))
+    b.submit(req("again", Side.BUY, "5", created_i=2))
+    b.advance(make_bar(3, "100", "100"))
+    bar4 = make_bar(4, "100", "80", low="70")
+    b.advance(bar4)
+    second = b.stop_out(bar4, Dec("90"))
+    assert isinstance(first, FillRecord) and isinstance(second, FillRecord)
+    assert (first.fill.client_order_id, second.fill.client_order_id) == ("stop-000001", "stop-000002")

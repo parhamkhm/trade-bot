@@ -18,7 +18,7 @@ Feeds must be re-iterable (``BacktestFeed`` is), because each benchmark replays 
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from tbot.backtest.config import BacktestConfig
 from tbot.backtest.engine import effective_warmup_bars, run_backtest
@@ -63,14 +63,23 @@ def run_benchmarks(
     unsealed the holdout for the strategy does not die with ``HoldoutLockError`` in the benchmarks (which
     would force a second unsealing). The feeds given here must already be unsealed by the caller."""
     warmup = effective_warmup_bars(strategy, regime)
+    # SPEC 7.2 E: plain buy-and-hold (weight 1) is held continuously, entry charged once, never stopped and
+    # never rebalanced. BuyAndHold still reports a (far) stop to satisfy D-050, so stops are switched off,
+    # and a band of 1.0 means "never resize while invested". The vol-matched benchmark holds a constant
+    # weight < 1 and keeps S0's rebalance rule (the configured band, default 25 %), but is not stopped either.
+    stopless = replace(config, enforce_stops=False)
     bh = run_backtest(
-        feed, BuyAndHold(warmup_bars=warmup), config, exec_feed=exec_feed, allow_holdout=allow_holdout
+        feed,
+        BuyAndHold(warmup_bars=warmup),
+        replace(stopless, rebalance_band=1.0),
+        exec_feed=exec_feed,
+        allow_holdout=allow_holdout,
     )
     weight, capped = vol_match_weight(compute_metrics(strategy_result).vol, compute_metrics(bh).vol)
     vm = run_backtest(
         feed,
         BuyAndHold(weight=weight, warmup_bars=warmup),
-        config,
+        stopless,
         exec_feed=exec_feed,
         allow_holdout=allow_holdout,
     )

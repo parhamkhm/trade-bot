@@ -11,14 +11,37 @@ from tbot.execution.simulated import FillRecord, OrderRejection, ResizeRecord
 from tbot.portfolio.ledger import TradeRecord
 from tbot.portfolio.portfolio import EquityPoint
 
-__all__ = ["BacktestResult", "DecisionRecord"]
+__all__ = ["BacktestResult", "DecisionRecord", "StopEvent"]
 
 # DecisionRecord.outcome values
 ORDER = "ORDER"  # the RiskManager approved an order and the broker accepted it
-NO_ACTION = "NO_ACTION"  # approved with no order (target already met / within tolerance)
+NO_ACTION = "NO_ACTION"  # approved with no order (target already met / within the rebalance band)
 REFUSED = "REFUSED"  # the RiskManager refused (reason in detail)
 SUBMIT_REJECTED = "SUBMIT_REJECTED"  # the broker refused the submission
 SKIPPED_PENDING = "SKIPPED_PENDING_ORDER"  # an earlier order was still unfilled: no new decision stacked
+AWAITING_REARM = "AWAITING_REARM"  # stopped out, strategy target still > 0: no order until it passes 0
+
+# StopEvent.kind values
+STOP_ARMED = "STOP_ARMED"  # the stop level of a new position was computed (at P_ref) and accepted
+STOP_FILL = "STOP_FILL"  # the engine sold the position at the stop
+STOP_REJECTED = "STOP_REJECTED"  # a stop exit was rejected by the broker (below min_notional)
+ENTRY_REFUSED = "ENTRY_REFUSED_INVALID_STOP"  # D-050: no valid stop at P_ref, pending entry cancelled
+CANCELLED_BY_STOP = "ORDER_CANCELLED_BY_STOP"  # a pending order cancelled when the stop sold the position
+STOP_LEVEL_LATER_WINDOW = "STOP_LEVEL_FROM_LATER_WINDOW"  # entry worked only after an earlier attempt failed
+P_REF_LATE = "P_REF_FROM_LATE_BAR"  # first execution bar was not the open at the signal close (missing bar)
+
+
+@dataclass(frozen=True, slots=True)
+class StopEvent:
+    """One protective-stop event. Stop bookkeeping lives here, NOT in ``DecisionRecord``: a decision is
+    written once at the signal close, while stop events happen on later execution bars (and must never
+    mutate an earlier record, or a longer run would disagree with a truncated one about the past)."""
+
+    ts: datetime  # open time of the execution bar the event happened on
+    kind: str
+    client_order_id: str | None = None  # the entry order (ARMED / REFUSED) or the stop exit order id
+    level: Decimal | None = None  # the stop level
+    detail: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +72,35 @@ class BacktestResult:
     fees_paid: Decimal
     slippage_cost: Decimal
     traded_notional: Decimal
+    stop_events: tuple[StopEvent, ...] = ()
+
+    @property
+    def stop_fills(self) -> tuple[FillRecord, ...]:
+        """Fills that were protective-stop exits (also present in ``fills``)."""
+        return tuple(f for f in self.fills if f.stop_fill)
+
+    @property
+    def entries_refused_invalid_stop(self) -> int:
+        """Entries cancelled because the strategy gave no valid stop at P_ref (D-050)."""
+        return sum(1 for e in self.stop_events if e.kind == ENTRY_REFUSED)
+
+    @property
+    def orders_cancelled_by_engine(self) -> int:
+        """Approved orders the engine cancelled before they could fill (refused entry, or pending when a
+        stop sold the position). They are neither fills nor ``unfilled_order_ids``."""
+        return sum(1 for e in self.stop_events if e.kind in (ENTRY_REFUSED, CANCELLED_BY_STOP))
+
+    @property
+    def stop_levels_from_later_window(self) -> int:
+        """Positions opened only after an earlier entry attempt failed (D-050 refusal, risk refusal or a
+        rejected order) while the strategy kept wanting to be long: the stop level was computed from a later
+        window than the strategy's own entry, so its own stop state can differ from the engine's."""
+        return sum(1 for e in self.stop_events if e.kind == STOP_LEVEL_LATER_WINDOW)
+
+    @property
+    def p_ref_from_late_bar(self) -> int:
+        """Entries whose P_ref was the open of a bar later than the signal close (a missing execution bar)."""
+        return sum(1 for e in self.stop_events if e.kind == P_REF_LATE)
 
     @property
     def initial_cash(self) -> Decimal:
