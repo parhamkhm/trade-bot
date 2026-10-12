@@ -62,7 +62,8 @@ Fees and slippage come from ``FeeSchedule`` / ``SlippageModel`` objects built fr
 ``SlippageModel`` is the hook for the depth-curve model of SPEC section 7 (G3): :class:`DepthCurveSlippage`.
 The context handed to the model carries the account equity just before the fill, marked at the fill's
 reference price (the open; a stop exit: ``min(open, stop)``), which only the optional equity normaliser of
-the depth curve uses. A model returning ``>= 10_000`` bps (a price at or below zero) raises :class:`BrokerError`.
+the depth curve uses. A model returning ``>= 10_000`` bps (a price at or below zero) raises
+:class:`BrokerError`.
 """
 
 from __future__ import annotations
