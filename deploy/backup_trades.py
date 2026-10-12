@@ -67,7 +67,7 @@ import re
 import sqlite3
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -478,11 +478,16 @@ def _print_json(stream: IO[str], payload: dict[str, object]) -> None:
     print(json.dumps(payload, sort_keys=True), file=stream)
 
 
-def run(argv: Sequence[str] | None = None) -> int:
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)  # noqa: UP017 -- needs 3.10+, see module docstring
+
+
+def run(argv: Sequence[str] | None = None, *, clock: Callable[[], datetime] = _utc_now) -> int:
+    """CLI body. ``clock`` is the only place the wall clock enters; tests pass a fixed one."""
     args = parse_args(argv)
 
     try:
-        result = perform_backup(args.source, args.dest_dir)
+        result = perform_backup(args.source, args.dest_dir, now=clock())
     except IntegrityCheckError as exc:
         _print_json(sys.stderr, {"status": "error", "stage": "integrity_check", "error": str(exc)})
         return 2
@@ -491,7 +496,7 @@ def run(argv: Sequence[str] | None = None) -> int:
         return 1
 
     try:
-        deleted = rotate_backups(args.dest_dir, keep_days=args.keep_days)
+        deleted = rotate_backups(args.dest_dir, keep_days=args.keep_days, now=clock())
     except OSError as exc:
         # The new backup is already verified and on disk; a rotation failure must not mask
         # that success -- log it as a warning and still report overall success (exit 0).
@@ -513,8 +518,8 @@ def run(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    return run(argv)
+def main(argv: Sequence[str] | None = None, *, clock: Callable[[], datetime] = _utc_now) -> int:
+    return run(argv, clock=clock)
 
 
 if __name__ == "__main__":

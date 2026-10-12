@@ -79,6 +79,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -300,8 +301,18 @@ def _read_payload(path: Path) -> object:
         raise _PayloadReadError(f"heartbeat file {path!r} is not valid JSON: {exc}") from exc
 
 
-def main(argv: list[str] | None = None) -> int:  # noqa: ARG001 - argv kept for test symmetry
-    """CLI entry point. Exit 0 = healthy, 1 = unhealthy. Never raises."""
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def main(
+    argv: list[str] | None = None,  # noqa: ARG001 - argv kept for test symmetry
+    *,
+    clock: Callable[[], datetime] = _utc_now,
+) -> int:
+    """CLI entry point. Exit 0 = healthy, 1 = unhealthy. Never raises.
+
+    ``clock`` is the only place the wall clock enters; tests pass a fixed one."""
     path = Path(os.environ.get("TBOT_HEARTBEAT_FILE", "/app/data/tabdeal/heartbeat.json"))
     try:
         max_age_seconds = float(os.environ.get("TBOT_HEARTBEAT_MAX_AGE_SECONDS", "180"))
@@ -342,7 +353,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: ARG001 - argv kept for 
 
     healthy, reason = evaluate_heartbeat(
         payload,
-        now=datetime.now(UTC),
+        now=clock(),
         max_age_seconds=max_age_seconds,
         max_consecutive_errors=max_consecutive_errors,
         max_trade_staleness_seconds=max_trade_staleness_seconds,
