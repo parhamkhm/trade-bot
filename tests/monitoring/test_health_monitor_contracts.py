@@ -183,7 +183,7 @@ def test_contract_real_in_progress_write_within_the_grace_period_is_quiet(tmp_pa
 def test_contract_real_tabdeal_heartbeat_is_understood(tmp_path: Path) -> None:
     target = hm.DEFAULT_TARGETS[0]
     heartbeat_path = tmp_path / target.heartbeat_rel
-    now = datetime.now(UTC)
+    now = datetime(2026, 10, 12, 4, 0, tzinfo=UTC)
     write_heartbeat(
         heartbeat_path,
         HeartbeatState(last_poll_ts=now, last_trade_id=42, n_trades_total=100, consecutive_errors=0),
@@ -208,10 +208,11 @@ def test_contract_real_lbank_heartbeat_is_understood(tmp_path: Path) -> None:
     target = hm.DEFAULT_TARGETS[1]
     data_dir = tmp_path / "lbank"
     data_dir.mkdir(parents=True)  # normally done by LBankRecorder.start(), which we don't run here
-    recorder = LBankRecorder(RecorderConfig(data_dir=data_dir))
-    recorder.write_heartbeat()  # fresh: written_ms is "now" by the real wall clock
+    now = datetime(2026, 10, 12, 4, 0, tzinfo=UTC)
+    recorder = LBankRecorder(RecorderConfig(data_dir=data_dir), now_ms=lambda: int(now.timestamp() * 1000))
+    recorder.write_heartbeat()  # fresh: written_ms is "now" by the injected clock
     settings = make_settings(tmp_path)
-    probes = fixed_probes(datetime.now(UTC), tmp_path)
+    probes = fixed_probes(now, tmp_path)
     assert hm.check_heartbeat(target, settings, probes) == []
 
 
