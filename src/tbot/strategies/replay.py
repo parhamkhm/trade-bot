@@ -32,12 +32,8 @@ Initialisation is lazy: ``__init__`` only stores the common parameters and ``_re
 subclass hook ``_reset_signal``) runs at the first use. A subclass may therefore set its own attributes before
 or after ``super().__init__()``; they must only be in place before the first ``state`` / ``on_bar`` call.
 
-Non-daily timeframes (needed by C3-4h). SPEC 7.2 C3 sizes and stops with the DAILY ``sigma_hat`` and ATR20
-even when signals run on 4h bars. This class has no 4h support yet and the sizing / stop code here reads
-the window's own bars, so a 4h strategy must first build a daily-bars source: the completed UTC days
-aggregated from the window's bars, e.g. with ``tbot.indicators.complete_utc_days`` (an incomplete current
-day is excluded, so the daily series only changes at 00:00 UTC), and compute ``sigma_hat`` / ATR20 on that,
-never on the 4h bars.
+Daily bars only. Phase 3 has no intraday-signal strategy (SPEC D-090 removed the C3 4h points), so this
+class sizes and stops on the window's own daily bars.
 """
 
 from __future__ import annotations
