@@ -80,7 +80,7 @@ def test_cost_of_a_10000_usdt_order_under_each_statistic() -> None:
     """Hand formula on the first segment: bps = 10 * 10000 / N1 + half spread (HS = 0.000602086...)."""
     hs = Dec("0.0006020866518873564")
     median = curve_from_g0_summary(G0_SUMMARY)
-    p10 = curve_from_g0_summary(G0_SUMMARY, statistic="adverse_p90_cost")
+    adverse = curve_from_g0_summary(G0_SUMMARY, statistic="adverse_p90_cost")
     hs95 = Dec("2.406402802530396E-05") * 100 / 2
     # median: buy 100000 / 791337.7167... = 0.12636 bps, sell 100000 / 1507954.9258... = 0.06632 bps
     assert (
@@ -96,15 +96,15 @@ def test_cost_of_a_10000_usdt_order_under_each_statistic() -> None:
     # adverse p90 cost (p10 sizes): buy 100000 / 292989.4011... = 0.34131 bps, sell 100000 / 880697.2835...
     # = 0.11354 bps, plus half the p95 spread
     assert (
-        p10.slippage_bps(_ctx(Side.BUY, "10000"))
+        adverse.slippage_bps(_ctx(Side.BUY, "10000"))
         == Dec(100_000) / Dec("292989.4011110195692658545460") + hs95
     )
     assert (
-        p10.slippage_bps(_ctx(Side.SELL, "10000"))
+        adverse.slippage_bps(_ctx(Side.SELL, "10000"))
         == Dec(100_000) / Dec("880697.2835246913241879442317") + hs95
     )
-    assert Dec("0.3425") < p10.slippage_bps(_ctx(Side.BUY, "10000")) < Dec("0.3426")
-    assert Dec("0.1147") < p10.slippage_bps(_ctx(Side.SELL, "10000")) < Dec("0.1148")
+    assert Dec("0.3425") < adverse.slippage_bps(_ctx(Side.BUY, "10000")) < Dec("0.3426")
+    assert Dec("0.1147") < adverse.slippage_bps(_ctx(Side.SELL, "10000")) < Dec("0.1148")
 
 
 def test_builder_does_not_read_the_depth_section(tmp_path: Path) -> None:
