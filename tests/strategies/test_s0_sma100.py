@@ -332,3 +332,44 @@ def test_no_lookahead_on_real_binance_btcusdt_1d_before_the_holdout() -> None:
     assert {FLAT, LONG} <= seen
     # first tradable close is #151, i.e. 2018-06-01 00:00 UTC
     assert bars[150].ts == datetime(2018, 6, 1, tzinfo=UTC)
+
+
+# ---- stopped_out_on (the S1 blend's stop-out tag, SPEC D-092) ----------------------------------------------
+
+
+def stop_flags(strategy: ReplayStrategy, bars: Sequence[Bar], first: int = 151) -> list[bool]:
+    return [strategy.stopped_out_on(window(bars, n)) for n in range(first, len(bars) + 1)]
+
+
+def test_stopped_out_on_is_true_only_on_the_stop_out_bar() -> None:
+    bars = baseline(
+        ("101.5", "102", "101.0", "102"),  # stopped on the entry bar, close above the SMA
+        ("102", "103.5", "102", "103"),  # still STOPPED, but no new stop-out
+        ("103", "103", "98", "99"),  # STOPPED -> FLAT by the close: no stop-out either
+    )
+    assert stop_flags(S0Sma100(), bars) == [False, True, False, False]
+
+
+def test_stopped_out_on_includes_a_same_bar_release_to_flat() -> None:
+    bars = baseline(("101.5", "101.6", "99", "99.5"), ("99.5", "105", "99.5", "105"))
+    s0 = S0Sma100()
+    assert stop_flags(s0, bars, 152) == [True, False]
+    assert s0.state(window(bars, 152)) is FLAT  # the flag is the only trace of that stop-out
+
+
+def test_stopped_out_on_is_false_for_an_ordinary_exit() -> None:
+    wide = [bar(i, "100", "105", "95", "100") for i in range(150)] + [bar(150, "100", "105", "95", "101")]
+    flat = [*wide, bar(151, "101.5", "102", "99", "99")]
+    assert stop_flags(S0Sma100(), flat) == [False, False]
+
+
+def test_stopped_out_on_is_causal_and_equals_a_fresh_replay_at_every_bar() -> None:
+    bars = wicky_bars(420, seed=5)
+    incremental = S0Sma100()
+    seen = False
+    for n in range(151, len(bars) + 1):
+        w = window(bars, n)
+        flag = incremental.stopped_out_on(w)
+        assert flag == S0Sma100().stopped_out_on(w)  # a fresh replay of bars 0..n only gives the same flag
+        seen = seen or flag
+    assert seen, "the wicky series must contain at least one stop-out"

@@ -126,6 +126,7 @@ class ReplayStrategy(ABC):
         self._state = PositionState.FLAT
         self._stop: Decimal | None = None
         self._pending_atr: float | None = None
+        self._stopped_this_bar = False
         self._reset_signal()
 
     def _check_anchor(self, window: BarWindow) -> None:
@@ -172,12 +173,14 @@ class ReplayStrategy(ABC):
         )
 
     def _step(self, i: int, bar: Bar) -> None:
+        self._stopped_this_bar = False
         if self._state is PositionState.LONG:
             if self._pending_atr is not None:
                 self._stop = stop_level(bar.open, self._pending_atr)
                 self._pending_atr = None
             if self._stop is not None and bar.low <= self._stop:
                 self._state = PositionState.STOPPED
+                self._stopped_this_bar = True
         signal = self._signal_at(i)
         if self._state is not PositionState.FLAT:
             if not signal:
@@ -212,6 +215,15 @@ class ReplayStrategy(ABC):
         """The fixed stop of the open position (None when flat or before the entry bar has been seen)."""
         self._sync(window)
         return self._stop if self._state is PositionState.LONG else None
+
+    def stopped_out_on(self, window: BarWindow) -> bool:
+        """True iff the daily stop was hit on the LAST bar of ``window`` (LONG -> STOPPED on that bar).
+
+        Also True when the same bar's close releases STOPPED to FLAT. Uses only bars up to the last one. S1
+        (the blend) needs it to let a member's stop-out reduction bypass the rebalance band (SPEC D-092).
+        """
+        self._sync(window)
+        return self._stopped_this_bar
 
     def trace(self, window: BarWindow) -> list[TracePoint]:
         """One full replay of ``window`` from its first bar, recording the decision after every bar.
