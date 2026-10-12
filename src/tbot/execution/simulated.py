@@ -60,8 +60,9 @@ is handed each execution bar as it becomes available:
 
 Fees and slippage come from ``FeeSchedule`` / ``SlippageModel`` objects built from configuration.
 ``SlippageModel`` is the hook for the depth-curve model of SPEC section 7 (G3): :class:`DepthCurveSlippage`.
-The context handed to the model carries the account equity at the bar's open (cash + position), which only
-the optional equity normaliser of the depth curve uses.
+The context handed to the model carries the account equity just before the fill, marked at the fill's
+reference price (the open; a stop exit: ``min(open, stop)``), which only the optional equity normaliser of
+the depth curve uses. A model returning ``>= 10_000`` bps (a price at or below zero) raises :class:`BrokerError`.
 """
 
 from __future__ import annotations
@@ -151,7 +152,7 @@ class SlippageContext:
     quantity: Decimal
     reference_price: Decimal  # the price the slippage is added to (the open; a stop exit: min(open, stop))
     ts: datetime  # fill time (open time of the execution bar)
-    # Account equity (cash + position marked at the bar's open) just before this fill, in the quote asset.
+    # Account equity (cash + position marked at ``reference_price``) just before this fill, quote asset.
     # ``None`` when the caller cannot supply it; only models with an equity normaliser need it.
     equity: Decimal | None = None
 
@@ -622,13 +623,20 @@ class SimulatedBroker:
         """Adverse-slipped, tick-rounded price; ``reference`` defaults to the bar's open (a stop exit
         passes ``min(open, stop)``)."""
         ref = bar.open if reference is None else reference
-        equity = self._cash + self._qty * bar.open  # marked at the bar's open, before this fill
+        # Equity just before this fill, marked at the SAME price the notional uses (the open; a stop exit:
+        # min(open, stop)), never at the close.
+        equity = self._cash + self._qty * ref
         ctx = SlippageContext(
             side=side, quantity=quantity, reference_price=ref, ts=bar.open_ts, equity=equity
         )
         bps = self._slippage.slippage_bps(ctx)
         if bps < 0:
             raise BrokerError(f"slippage model returned negative bps ({bps}); slippage is always adverse")
+        if bps >= _BPS:
+            raise BrokerError(
+                f"slippage model returned {bps} bps (>= {_BPS}): the order would cost the whole price or "
+                "more; it is larger than the model's curve can price"
+            )
         tick = self._filters.tick_size
         if side is Side.BUY:
             raw = ref * (1 + bps / _BPS)

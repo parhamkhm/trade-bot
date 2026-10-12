@@ -12,7 +12,8 @@ import pytest
 from tbot.backtest.config import BacktestConfig
 from tbot.backtest.engine import run_backtest
 from tbot.backtest.feed import BacktestFeed
-from tbot.backtest.slippage import curve_from_g0_summary
+from tbot.backtest.slippage import DEFAULT_EQUITY_NORMALISER, curve_from_g0_summary, stressed
+from tbot.core.config import CostConfig
 from tbot.core.types import Side
 from tbot.execution.simulated import DepthCurveSlippage, FlatSlippage, SlippageContext
 from tests.backtest.helpers import Scripted, make_config
@@ -40,7 +41,7 @@ def test_builder_reads_the_real_g0_summary() -> None:
         (Dec("2299814.294177067930772980798"), Dec(50)),
     )
     assert m.half_spread_bps == Dec("0.0006020866518873564")
-    assert m.equity_normaliser is None
+    assert m.equity_normaliser == Dec(10_000)  # SPEC 7 G3: equity fixed at 10,000 USDT
 
 
 def test_builder_p10_statistic_is_the_conservative_sensitivity() -> None:
@@ -65,7 +66,9 @@ def test_builder_p10_statistic_is_the_conservative_sensitivity() -> None:
 
 
 def _ctx(side: Side, notional: str) -> SlippageContext:
-    return SlippageContext(side=side, quantity=Dec(notional) / 100, reference_price=Dec(100), ts=T0)
+    return SlippageContext(
+        side=side, quantity=Dec(notional) / 100, reference_price=Dec(100), ts=T0, equity=Dec(10_000)
+    )
 
 
 def test_cost_of_a_10000_usdt_order_under_each_statistic() -> None:
@@ -125,8 +128,24 @@ def test_builder_uses_the_vs_touch_reference_not_vs_mid(tmp_path: Path) -> None:
     assert curve_from_g0_summary(changed) == curve_from_g0_summary(G0_SUMMARY)
 
 
+def test_builder_defaults_to_the_10000_usdt_equity_normaliser_and_it_is_overridable() -> None:
+    assert Dec(10_000) == DEFAULT_EQUITY_NORMALISER
+    assert curve_from_g0_summary(G0_SUMMARY).equity_normaliser == Dec(10_000)
+    assert curve_from_g0_summary(G0_SUMMARY, equity_normaliser=Dec(50_000)).equity_normaliser == Dec(50_000)
+    raw = curve_from_g0_summary(G0_SUMMARY, equity_normaliser=None)
+    assert raw.equity_normaliser is None
+    # behaviour: at equity 20 000 a 10 000 USDT order is looked up as 5 000 (default) or as 10 000 (None)
+    at = SlippageContext(
+        side=Side.BUY, quantity=Dec(100), reference_price=Dec(100), ts=T0, equity=Dec(20_000)
+    )
+    default = curve_from_g0_summary(G0_SUMMARY)
+    half = Dec("0.0006020866518873564")
+    assert default.slippage_bps(at) == Dec(5000) * 10 / Dec("791337.7167268150914253939475") + half
+    assert raw.slippage_bps(at) == Dec(10000) * 10 / Dec("791337.7167268150914253939475") + half
+
+
 def test_builder_options_and_stress_scaling() -> None:
-    m = curve_from_g0_summary(G0_SUMMARY, equity_normaliser=Dec(10_000))
+    m = curve_from_g0_summary(G0_SUMMARY)
     assert m.equity_normaliser == Dec(10_000)
     twice = m.scaled(Dec(2))
     assert twice.half_spread_bps == Dec("0.0012041733037747128")
@@ -167,3 +186,46 @@ def test_engine_with_a_depth_curve_equivalent_to_flat_reproduces_the_flat_run() 
     ]
     assert [p.equity for p in res.equity] == [p.equity for p in base.equity]
     assert res.slippage_cost == base.slippage_cost == Dec("132.4298955")
+
+
+# ---------------------------------------------------------------------------------------------
+# stressed(): the x2 cost stress in one place
+# ---------------------------------------------------------------------------------------------
+
+COSTS = CostConfig(taker_fee_bps=Dec(10), maker_fee_bps=Dec(8), slippage_bps=Dec(5))
+
+
+def test_stressed_with_a_curve_doubles_fees_and_scales_the_curve() -> None:
+    curve = curve_from_g0_summary(G0_SUMMARY)
+    costs, model = stressed(COSTS, curve)
+    assert (costs.taker_fee_bps, costs.maker_fee_bps) == (Dec(20), Dec(16))
+    assert costs.slippage_bps == Dec(10)  # the sizing-estimate stays consistent with the stress
+    assert isinstance(model, DepthCurveSlippage)
+    assert model == curve.scaled(Dec(2))
+    assert model.half_spread_bps == curve.half_spread_bps * 2
+    assert model.buy_points[1] == (curve.buy_points[1][0], Dec(20))
+    assert model.equity_normaliser == Dec(10_000)
+    assert COSTS.taker_fee_bps == Dec(10)  # inputs are not mutated
+    # the broker really prices twice the cost: same order, twice the bps
+    c = SlippageContext(side=Side.BUY, quantity=Dec(100), reference_price=Dec(100), ts=T0, equity=Dec(10_000))
+    assert abs(model.slippage_bps(c) - curve.slippage_bps(c) * 2) < Dec("1e-20")
+
+
+def test_stressed_without_a_curve_doubles_the_flat_bps() -> None:
+    costs, model = stressed(COSTS, None)
+    assert model is None  # the engine then uses FlatSlippage.from_config(costs) = the doubled 10 bps
+    assert (costs.taker_fee_bps, costs.maker_fee_bps, costs.slippage_bps) == (Dec(20), Dec(16), Dec(10))
+    assert FlatSlippage.from_config(costs).bps == Dec(10)
+    _, flat = stressed(COSTS, FlatSlippage(bps=Dec(7)), factor=3)
+    assert flat == FlatSlippage(bps=Dec(21))
+
+
+def test_stressed_rejects_unknown_models_and_bad_factors() -> None:
+    class Other:
+        def slippage_bps(self, ctx: SlippageContext) -> Dec:  # noqa: ARG002
+            return Dec(0)
+
+    with pytest.raises(TypeError, match="Other"):
+        stressed(COSTS, Other())
+    with pytest.raises(ValueError, match="factor"):
+        stressed(COSTS, None, factor=-1)
