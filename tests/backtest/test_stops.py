@@ -427,6 +427,8 @@ def test_report_counts_stop_fills_and_says_so_in_markdown() -> None:
         "stop_fills": 1,
         "entries_refused_invalid_stop": 0,
         "orders_cancelled_by_engine": 0,
+        "stop_levels_from_later_window": 0,
+        "p_ref_from_late_bar": 0,
     }
     assert report["stub_risk_manager"]["rebalance_band"] == 0.25
     assert not is_run_invalid(report)  # a stop exit is neither a rejection nor a vanished order

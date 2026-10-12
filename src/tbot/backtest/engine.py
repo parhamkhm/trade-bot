@@ -26,9 +26,12 @@ Protective stops (SPEC section 7.1, D-050), on by default (``BacktestConfig.enfo
   ``min(open, stop)`` less slippage (``SimulatedBroker.stop_out``), fees and slippage included. In the
   next-open model the entry bar itself is tested too; in the delay model the stop is only live from the
   delayed entry fill (a touch before it is invisible to the engine), and is checked on the 1h bars;
-* pending orders are cancelled when a stop fires, and the position then stays flat until the strategy's
-  own target (before the regime multiplier) reaches 0 and later rises above 0 again (re-arm rule). A
-  strategy that reaches target 0 itself while still invested exits like any other target-0 exit;
+* pending orders are cancelled when a stop fires. The position then stays flat until the strategy's own
+  target (before the regime multiplier) reaches 0 and later rises above 0 again (re-arm rule), but only if
+  that target was still > 0 at the last decision before the stop (SPEC 7.1: "stopped out while the state is
+  still LONG"). A strategy that already said 0 (its SELL not yet filled when the stop fired) is simply flat,
+  and its next fresh entry is not blocked. A stop exit rejected by the broker (below min_notional) keeps the
+  stop armed and is retried on later bars;
 * the band of the risk layer never applies to a stop: the stop does not go through the risk manager.
 """
 
@@ -48,10 +51,12 @@ from tbot.backtest.result import (
     ENTRY_REFUSED,
     NO_ACTION,
     ORDER,
+    P_REF_LATE,
     REFUSED,
     SKIPPED_PENDING,
     STOP_ARMED,
     STOP_FILL,
+    STOP_LEVEL_LATER_WINDOW,
     STOP_REJECTED,
     SUBMIT_REJECTED,
     BacktestResult,
@@ -219,6 +224,10 @@ class _Run:
         self.entry: _PendingEntry | None = None  # a flat -> long BUY whose stop is not yet live
         self.stop: Decimal | None = None  # live stop level of the open position (fixed for its life)
         self.stopped_out = False  # engine stopped the position; flat until the strategy target passes 0
+        self.last_raw_target: float | None = None  # strategy target (pre-regime) at the last decision
+        # an entry attempt failed (D-050 refusal, risk refusal, rejected order) while the strategy wanted to
+        # be long: the next successful entry gets a stop level from a LATER signal window
+        self.entry_failed = False
 
     # -- step 1: execution -------------------------------------------------------------------
 
@@ -246,15 +255,25 @@ class _Run:
         if entry is None or entry.level is not None or exec_bar.open_ts < entry.created_ts:
             return
         p_ref = exec_bar.open
+        if exec_bar.open_ts > entry.created_ts:  # a missing execution bar: P_ref is not the open at t+1
+            late = exec_bar.open_ts - entry.created_ts
+            opens = exec_bar.open_ts.isoformat()
+            detail = f"first execution bar opens {opens}, {late} after the signal close"
+            self._event(exec_bar.open_ts, P_REF_LATE, entry.client_order_id, None, detail)
         level = self.strategy.stop_price(entry.window, p_ref)
         if not is_valid_stop(level, p_ref):
             self.broker.cancel(entry.client_order_id)
             self.entry = None
+            self.entry_failed = True
             detail = f"stop_price returned {level!r}, not a finite positive Decimal below P_ref {p_ref}"
             self._event(exec_bar.open_ts, ENTRY_REFUSED, entry.client_order_id, None, detail)
             return
         entry.level = level
         self._event(exec_bar.open_ts, STOP_ARMED, entry.client_order_id, level, f"P_ref {p_ref}")
+        if self.entry_failed:
+            self.entry_failed = False
+            detail = "an earlier entry attempt failed; this level comes from the window of a later signal"
+            self._event(exec_bar.open_ts, STOP_LEVEL_LATER_WINDOW, entry.client_order_id, level, detail)
 
     def _activate_stop(self, report: ExecutionReport) -> None:
         """The entry filled -> its level is live from this bar on; it was rejected -> forget it."""
@@ -266,6 +285,7 @@ class _Run:
             self.entry = None
         elif any(r.client_order_id == entry.client_order_id for r in report.rejections):
             self.entry = None
+            self.entry_failed = True
 
     def _check_stop(self, exec_bar: Bar) -> None:
         """Test the live stop against this execution bar (entry bar included) and sell if it was touched."""
@@ -277,14 +297,19 @@ class _Run:
         outcome = self.broker.stop_out(exec_bar, self.stop)
         if outcome is None:
             return
-        level, self.stop = self.stop, None
+        level = self.stop
         if isinstance(outcome, OrderRejection):
+            # the position is untouched and the stop stays armed: it is tried again on the next bar it is hit
             self.rejections.append(outcome)
             self._event(exec_bar.open_ts, STOP_REJECTED, outcome.client_order_id, level, outcome.reason)
             return
+        self.stop = None
         self.portfolio.apply_fill(outcome.fill)
         self.fills.append(outcome)
-        self.stopped_out = True
+        # SPEC 7.1: the re-arm wait applies only to a position stopped out "while the state is still LONG",
+        # i.e. the strategy's last raw target was > 0. If it had already said 0 (its SELL was pending), the
+        # engine stop merely beat that exit and the book is simply flat: the next fresh entry is not blocked.
+        self.stopped_out = self.last_raw_target is not None and self.last_raw_target > 0
         fill = outcome.fill
         detail = (
             f"sold {fill.quantity} at {fill.price}; reference min(open {exec_bar.open}, stop {level}) "
@@ -318,6 +343,9 @@ class _Run:
         raw = self.strategy.on_bar(window)
         if raw.ts != bar.ts:
             raise EngineError(f"strategy returned an intent stamped {raw.ts}, expected bar close {bar.ts}")
+        self.last_raw_target = raw.target_weight
+        if raw.target_weight <= 0:
+            self.entry_failed = False  # the strategy let go: its next entry is a fresh one
         intent = raw
         if self.regime is not None:
             state = self.regime.update(window)
@@ -341,6 +369,8 @@ class _Run:
         decision = self.risk.evaluate(intent, view, market)
         if not isinstance(decision, Approved):
             self._log(intent, REFUSED, f"{decision.reason.value}: {decision.detail}")
+            if self.config.enforce_stops and view.base_qty <= _ZERO and intent.target_weight > 0:
+                self.entry_failed = True  # a flat book wanted in and the risk layer said no (min notional...)
         elif decision.order is None:
             self._log(intent, NO_ACTION, decision.note)
         else:
@@ -350,8 +380,12 @@ class _Run:
             ack = self.broker.submit(decision.order, sizing_price=bar.close, sizing_cash=view.cash_quote)
             outcome = ORDER if ack.accepted else SUBMIT_REJECTED
             self._log(intent, outcome, ack.message or decision.note, decision.order.client_order_id)
-            if ack.accepted and self._opens_position(decision.order, view.base_qty):
-                self.entry = _PendingEntry(decision.order.client_order_id, decision.order.created_ts, window)
+            if self._opens_position(decision.order, view.base_qty):
+                if ack.accepted:
+                    order = decision.order
+                    self.entry = _PendingEntry(order.client_order_id, order.created_ts, window)
+                else:
+                    self.entry_failed = True
 
     def _opens_position(self, order: OrderRequest, base_qty: Decimal) -> bool:
         """A BUY from a flat book: the only order that gets a (new) stop level."""
