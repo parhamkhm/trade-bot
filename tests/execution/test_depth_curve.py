@@ -15,6 +15,7 @@ import pytest
 
 from tbot.core.types import Side, SymbolFilters
 from tbot.execution.simulated import (
+    BrokerError,
     DepthCurveSlippage,
     FeeSchedule,
     SimulatedBroker,
@@ -213,13 +214,91 @@ class _Spy:
 
 
 def test_broker_hands_the_model_the_equity_marked_at_the_bar_open() -> None:
+    """Bar 2 opens at 200 and CLOSES at 260: equity marked at the open is 500 + 5 * 200 = 1500 (at the close
+    it would be 1800)."""
     spy = _Spy()
     b = _broker(spy, cash="1000")
     b.submit(req("buy", Side.BUY, "5"))
     b.advance(make_bar(1, "100", "100"))  # cash 1000 -> 500, 5 BTC
     b.submit(req("sell", Side.SELL, "5", created_i=1))
-    b.advance(make_bar(2, "200", "200"))
-    assert [c.equity for c in spy.contexts] == [Dec(1000), Dec(500) + Dec(5) * Dec(200)]  # 1000 then 1500
+    b.advance(make_bar(2, "200", "260"))
+    assert [c.equity for c in spy.contexts] == [Dec(1000), Dec(1500)]
+    assert spy.contexts[1].reference_price == Dec(200)
+
+
+def _long_five_btc(spy: _Spy) -> SimulatedBroker:
+    b = _broker(spy, cash="1000")
+    b.submit(req("buy", Side.BUY, "5"))
+    b.advance(make_bar(1, "100", "100"))  # cash 500, 5 BTC
+    spy.contexts.clear()
+    return b
+
+
+def test_stop_exit_context_uses_the_stop_as_reference_notional_and_equity() -> None:
+    """Open 200 > stop 150 >= low 140: the exit is priced from the stop, so the notional is 5 * 150 = 750 and
+    equity is marked at that same 150: 500 + 5 * 150 = 1250 (not 500 + 5 * 200 = 1500 at the open)."""
+    spy = _Spy()
+    b = _long_five_btc(spy)
+    bar = make_bar(2, "200", "190", low="140")
+    b.advance(bar)
+    assert b.stop_out(bar, Dec(150)) is not None
+    (c,) = spy.contexts
+    assert c.side is Side.SELL and c.quantity == Dec(5)
+    assert c.reference_price == Dec(150)
+    assert c.quantity * c.reference_price == Dec(750)
+    assert c.equity == Dec(1250)
+
+
+def test_stop_exit_on_a_gap_down_marks_equity_at_the_open() -> None:
+    """Open 120 < stop 150: reference min(open, stop) = 120, equity 500 + 5 * 120 = 1100."""
+    spy = _Spy()
+    b = _long_five_btc(spy)
+    bar = make_bar(2, "120", "110", low="100")
+    b.advance(bar)
+    assert b.stop_out(bar, Dec(150)) is not None
+    (c,) = spy.contexts
+    assert c.reference_price == Dec(120) and c.equity == Dec(1100)
+
+
+def test_stop_exit_under_the_depth_curve_is_priced_at_the_stop_notional_and_stop_equity() -> None:
+    """End to end with a real curve + normaliser: lookup notional = 750 * 10000 / 1250 = 6000 on the curve
+    (0,0)-(10000,100) = 60 bps (equity at the open would give 750 * 10000 / 1500 = 5000 -> 50 bps).
+    Price = 150 * (1 - 0.006) = 149.10000."""
+    curve = ((Dec(0), Dec(0)), (Dec(10_000), Dec(100)))
+    free = ((Dec(0), Dec(0)), (Dec(10_000), Dec(0)))  # the entry costs nothing: cash 500 and 5 BTC exactly
+    m = model(buy_points=free, sell_points=curve, half_spread_bps=Dec(0), equity_normaliser=Dec(10_000))
+    b = _broker(m, cash="1000")
+    b.submit(req("buy", Side.BUY, "5"))
+    b.advance(make_bar(1, "100", "100"))
+    bar = make_bar(2, "200", "190", low="140")
+    b.advance(bar)
+    rec = b.stop_out(bar, Dec(150))
+    assert rec is not None and not hasattr(rec, "reason")
+    assert rec.reference_price == Dec(150) and rec.fill.price == Dec("149.10000")
+
+
+def test_a_curve_cost_of_10000_bps_or_more_raises_instead_of_a_zero_or_negative_price() -> None:
+    """500 notional on (0,0)-(500,10000) costs exactly 10 000 bps (price 0); beyond it the price would go
+    negative. Both are a BrokerError, for a BUY and for a SELL."""
+    wall = ((Dec(0), Dec(0)), (Dec(500), Dec(10_000)))
+    m = model(buy_points=wall, sell_points=wall, half_spread_bps=Dec(0))
+    b = _broker(m, cash="1000")
+    b.submit(req("buy", Side.BUY, "5"))
+    with pytest.raises(BrokerError, match="10000"):
+        b.advance(make_bar(1, "100", "100"))  # exactly 10 000 bps
+    b2 = _broker(m, cash="1000")
+    b2.submit(req("buy", Side.BUY, "6"))
+    with pytest.raises(BrokerError, match="10000"):
+        b2.advance(make_bar(1, "100", "100"))  # 12 000 bps
+    # a stop exit that the curve cannot price is refused the same way
+    cheap = ((Dec(0), Dec(0)), (Dec(100_000), Dec(1)))
+    b3 = _broker(model(buy_points=cheap, sell_points=wall, half_spread_bps=Dec(0)), cash="1000")
+    b3.submit(req("buy", Side.BUY, "5"))
+    b3.advance(make_bar(1, "100", "100"))
+    bar = make_bar(2, "100", "90", low="80")
+    b3.advance(bar)
+    with pytest.raises(BrokerError, match="10000"):
+        b3.stop_out(bar, Dec(100))  # 500 notional on the sell wall
 
 
 def test_equity_normaliser_through_the_broker() -> None:
