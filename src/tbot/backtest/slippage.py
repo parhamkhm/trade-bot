@@ -90,12 +90,15 @@ def curve_from_g0_summary(
 
     ``statistic`` (SPEC D-091):
 
-    * ``"median"`` (default; the run): the per-notional MEDIAN of cost, the SPEC section 7 G3 statistic. Each
-      sample's cost rises monotonically with notional, so the median fillable size at 10 (50) bps is exactly
-      the notional at which the median cost is 10 (50) bps. Reads ``quote_median`` and the median spread.
+    * ``"median"`` (default; the run): the per-notional MEDIAN of cost, the SPEC section 7 G3 statistic.
+      Each sample's cost (VWAP walking the book) rises monotonically with notional, so the median fillable
+      size at 10 (50) bps is the notional at which the median cost is 10 (50) bps, up to the gap between the
+      two middle samples (the probe's median of an even count is their mean). Reads ``quote_median`` and
+      the median spread.
     * ``"adverse_p90_cost"`` (sensitivity, reported only, never gating): the per-notional p90 of COST, the
-      thin-book tail. By the same argument its points are the p10 of the fillable SIZE (``quote_p10``); the
-      half spread uses the p95 spread (no p90 is stored; p95 is the more adverse).
+      thin-book tail. By the same argument (exactly: the probe's p10 is nearest-rank) its points are the
+      p10 of the fillable SIZE (``quote_p10``); the half spread uses the p95 spread (no p90 is stored; p95
+      is the more adverse).
 
     A BUY consumes the ASK side of the book, a SELL the BID side, so ``buy_points`` come from ``max_fill[..]
     ["buy"]`` and ``sell_points`` from ``["sell"]``. ``half_spread_bps`` = median spread / 2 in bps (the
