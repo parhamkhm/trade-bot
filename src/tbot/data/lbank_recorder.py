@@ -501,16 +501,24 @@ class RecorderConfig:
 class LBankRecorder:
     """Runs one thread per stream plus a heartbeat thread until ``stop()`` is called."""
 
-    def __init__(self, config: RecorderConfig, *, transport: httpx.BaseTransport | None = None) -> None:
+    def __init__(
+        self,
+        config: RecorderConfig,
+        *,
+        transport: httpx.BaseTransport | None = None,
+        now_ms: Callable[[], int] | None = None,
+    ) -> None:
         self._cfg = config
         self._transport = transport
+        # The only place the wall clock enters (recv timestamps, heartbeat, kline window); tests inject one.
+        self._now_ms: Callable[[], int] = now_ms or _now_ms
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self.status: dict[str, StreamStatus] = {}
         self._prev_trade_max_ms: int | None = None
         self._cursor_loaded = False
         self._persisted_cursor: int | None = None
-        self._started_ms = _now_ms()
+        self._started_ms = self._now_ms()
         self._threads: list[threading.Thread] = []
 
     # -- lifecycle --
@@ -570,7 +578,7 @@ class LBankRecorder:
     ) -> None:
         """One attempt of one stream; never raises (errors are counted, logged and stored)."""
         status = self.status[name]
-        status.last_attempt_ms = _now_ms()
+        status.last_attempt_ms = self._now_ms()
         try:
             rows = job(client, store)
         except Exception as exc:
@@ -581,13 +589,13 @@ class LBankRecorder:
             self._store_error(store, name, status.last_error)
             return
         with self._lock:
-            status.last_ok_ms = _now_ms()
+            status.last_ok_ms = self._now_ms()
             status.consecutive_errors = 0
             status.rows_total += rows
 
     def _store_error(self, store: DayStore, name: str, message: str) -> None:
         try:
-            recv = _now_ms()
+            recv = self._now_ms()
             store.write(recv, [("INSERT INTO errors VALUES (?, ?, ?)", [(recv, name, message)])])
         except Exception:
             logger.exception("lbank_recorder.error_log_failed", stream=name)
@@ -596,7 +604,7 @@ class LBankRecorder:
         started = time.monotonic()
         response = client.get(url, params=dict(params))
         response.raise_for_status()
-        recv = _now_ms()
+        recv = self._now_ms()
         return _loads(response.content), recv, int((time.monotonic() - started) * 1000)
 
     # -- jobs --
@@ -713,7 +721,7 @@ class LBankRecorder:
     def _make_kline_job(self, interval: str) -> Callable[[httpx.Client, DayStore], int]:
         def job(client: httpx.Client, store: DayStore) -> int:
             bars = self._cfg.kline_lookback_bars[interval]
-            start = int(time.time()) - bars * _KLINE_SECONDS[interval]
+            start = self._now_ms() // 1000 - bars * _KLINE_SECONDS[interval]
             payload, recv, _ = self._get(
                 client,
                 f"{SPOT_BASE_URL}/v2/kline.do",
@@ -778,7 +786,7 @@ class LBankRecorder:
                 }
                 for name, s in self.status.items()
             }
-        return {"written_ms": _now_ms(), "started_ms": self._started_ms, "streams": streams}
+        return {"written_ms": self._now_ms(), "started_ms": self._started_ms, "streams": streams}
 
     def write_heartbeat(self) -> None:
         path = self._cfg.data_dir / "heartbeat.json"
