@@ -49,7 +49,6 @@ from tbot.validation.robustness import (
 )
 from tbot.validation.runs import (
     NORMAL_COSTS,
-    STRESS_COSTS,
     CostSpec,
     FillMode,
     Market,
@@ -76,6 +75,7 @@ __all__ = [
     "beats_in_periods",
     "choose_x",
     "evaluate",
+    "s1_is_contender",
 ]
 
 S0_POINT = GridPoint("S0", "S0", Timeframe.D1, {}, True, 0)
@@ -91,11 +91,15 @@ class EvalInputs:
     candidates: Sequence[Candidate]
     first_tradable: Mapping[str, datetime]
     logged_non_s0_trials: int
-    eth: Market | None = None
-    indices: Mapping[str, Market] = field(default_factory=dict)
-    s0_variant_keys: Sequence[str] = ()  # section 7.1 robustness variants, if registered
+    eth: Market  # required: a missing input is never scored as a failed gate (the pre-flight refuses first)
+    s0_variant_keys: Sequence[str]  # the six section-7.1 variants (S0_VARIANTS keys); NOT trials
+    indices: Mapping[str, Market] = field(default_factory=dict)  # informational only; empty = "not run"
     costs: CostSpec = NORMAL_COSTS
-    stress_costs: CostSpec = STRESS_COSTS
+    stress_costs: CostSpec | None = None  # default: ``costs.stressed()`` (x2 fees and slippage, curve scaled)
+
+    @property
+    def stress(self) -> CostSpec:
+        return self.stress_costs if self.stress_costs is not None else self.costs.stressed()
 
 
 @dataclass(frozen=True)
@@ -141,15 +145,27 @@ class Phase3Evaluation:
     n_trials: int
 
 
+def _period_score(sharpe: float | None) -> float:
+    """A period Sharpe for the "beats S0 in at least half the periods" rule: undefined or negative -> 0."""
+    return 0.0 if sharpe is None or sharpe < 0.0 else sharpe
+
+
 def beats_in_periods(candidate: SeriesRun, s0: SeriesRun, spec: WalkForwardSpec) -> int:
-    """Number of test periods in which the candidate's per-period Sharpe exceeds S0's (undefined = lowest)."""
+    """Number of test periods in which the candidate's annualised Sharpe is strictly above S0's.
+
+    An undefined (flat, or too short) or negative period Sharpe is scored 0 on BOTH sides, so a candidate
+    that loses money cannot "beat" a flat S0 and two flat sides tie (a tie is not a win).
+    """
     wins = 0
     for p in spec.periods:
         c = annualised_sharpe(candidate.returns_between(p.start, p.end), candidate.periods_per_year)
-        s = annualised_sharpe(s0.returns_between(p.start, p.end), s0.periods_per_year)
-        if c is not None and (s is None or c > s):
+        r = annualised_sharpe(s0.returns_between(p.start, p.end), s0.periods_per_year)
+        if _period_score(c) > _period_score(r):
             wins += 1
     return wins
+
+
+_NO_CANDIDATE_NOTE = "no candidate qualifies: the better of S0/S1 among those passing the gates"
 
 
 def choose_x(
@@ -157,27 +173,36 @@ def choose_x(
     s0: tuple[bool, float | None],
     s1: tuple[bool, float | None] | None,
 ) -> tuple[str | None, str]:
-    """H5. ``qualified`` maps qualifying candidates to their pooled Sharpe; s0/s1 are (passes G3, Sharpe)."""
-    ranked = [(v, k) for k, v in qualified.items() if v is not None]
-    if ranked:
-        best = max(ranked)
-        return best[1], "highest pooled OOS Sharpe among the qualifying candidates"
-    fallback = [
-        (sh, name) for name, (ok, sh) in (("S0", s0), ("S1", s1 or (False, None))) if ok and sh is not None
-    ]
-    if fallback:
-        best = max(fallback)
-        return best[1], "no candidate qualifies: the better of S0/S1 among those passing the gates"
+    """H5. ``qualified`` maps qualifying candidates (registry order) to their pooled Sharpe; s0/s1 are
+    (passes G3, Sharpe). ``s1`` is None when S1 is not a contender (see ``s1_is_contender``).
+
+    Ties are never broken on a name: among candidates the first in registry order wins an exact tie, and S1
+    must be strictly above S0 to be chosen over it.
+    """
+    best_name: str | None = None
+    best: float | None = None
+    for name, sharpe in qualified.items():
+        if sharpe is not None and (best is None or sharpe > best):
+            best_name, best = name, sharpe
+    if best_name is not None:
+        return best_name, "highest pooled OOS Sharpe among the qualifying candidates"
+    s0_ok = s0[0] and s0[1] is not None
+    s1_ok = s1 is not None and s1[0] and s1[1] is not None
+    if s0_ok and s1_ok:
+        assert s1 is not None and s0[1] is not None and s1[1] is not None
+        pick = "S1" if s1[1] > s0[1] else "S0"
+        return pick, _NO_CANDIDATE_NOTE
+    if s0_ok or s1_ok:
+        return ("S0" if s0_ok else "S1"), _NO_CANDIDATE_NOTE
     return None, "no candidate qualifies and neither S0 nor S1 passes the gates: X = none, nothing goes live"
 
 
-def _not_evaluated(name: str, why: str) -> GateResult:
-    return GateResult(name, False, None, None, "required", f"not evaluated: {why}")
+def s1_is_contender(members: Sequence[str]) -> bool:
+    """S1 competes only if it blends at least two strategies: an S1 of S0 alone IS S0 (SPEC 7.2 H)."""
+    return len(members) >= 2
 
 
 def _eth_gate(eth: Mapping[FillMode, SeriesRun]) -> GateResult:
-    if FillMode.MANUAL_DELAY not in eth:
-        return _not_evaluated("ETH/USDT Sharpe", "no ETH/USDT market supplied")
     return eth_gate(eth[FillMode.MANUAL_DELAY].sharpe)
 
 
@@ -190,6 +215,8 @@ def _core_gates(
 
 def evaluate(inp: EvalInputs) -> Phase3Evaluation:
     """Run H1-H5 end to end for the given inputs (this is the expensive entry point)."""
+    if not inp.s0_variant_keys:
+        raise ValueError("the six S0 robustness variants must be supplied (the pre-flight refuses otherwise)")
     spec, btc, factory = inp.spec, inp.btc, inp.factory
     points = [p for c in inp.candidates for p in c.points]
     timeframes = {p.key: p.timeframe for p in [S0_POINT, *points]}
@@ -243,7 +270,10 @@ def evaluate(inp: EvalInputs) -> Phase3Evaluation:
             qualified[e.name] = sh
 
     # -- H5
-    x, reason = choose_x(qualified, (s0.passes, s0.sharpe), (s1.passes, s1.sharpe) if s1 else None)
+    contender = s1 if s1 is not None and s1_is_contender(s1.members) else None
+    x, reason = choose_x(
+        qualified, (s0.passes, s0.sharpe), (contender.passes, contender.sharpe) if contender else None
+    )
     return Phase3Evaluation(
         benchmark=bh,
         s0=s0,
@@ -271,7 +301,7 @@ def _evaluate_s0(
 ) -> StrategyEval:
     spec, btc, factory = inp.spec, inp.btc, inp.factory
     pooled = {m: fixed_pooled(btc, S0_POINT, factory, spec, m, inp.costs) for m in MODES}
-    stress = fixed_pooled(btc, S0_POINT, factory, spec, FillMode.MANUAL_DELAY, inp.stress_costs)
+    stress = fixed_pooled(btc, S0_POINT, factory, spec, FillMode.MANUAL_DELAY, inp.stress)
     schedule = _s0_schedule(spec)
     eth = _reuse_all(inp, inp.eth, schedule, timeframes, "S0")
     indices = _index_runs(inp, schedule, timeframes, "S0")
@@ -294,8 +324,6 @@ def _evaluate_s0(
 
 
 def _s0_variants(inp: EvalInputs, run: SeriesRun) -> GateResult:
-    if not inp.s0_variant_keys:
-        return _not_evaluated("S0 robustness variants", "the six section-7.1 variants are not registered")
     sharpes: dict[str, float | None] = {}
     for key in inp.s0_variant_keys:
         point = GridPoint(key, "S0", Timeframe.D1, {}, False, 0)
@@ -307,13 +335,11 @@ def _s0_variants(inp: EvalInputs, run: SeriesRun) -> GateResult:
 
 def _reuse_all(
     inp: EvalInputs,
-    market: Market | None,
+    market: Market,
     schedule: Sequence[tuple[datetime, str | None]],
     timeframes: Mapping[str, Timeframe],
     name: str,
 ) -> dict[FillMode, SeriesRun]:
-    if market is None:
-        return {}
     return {
         m: pooled_run(market, schedule, inp.factory, timeframes, inp.spec, m, inp.costs, strategy_id=name)
         for m in MODES
@@ -360,12 +386,8 @@ def _evaluate_candidate(
     )
     dsr = candidate_dsr(run.returns, trial_sharpes, inp.logged_non_s0_trials)
     nb = neighbour_test(cand, walk.final_selection, trial_runs)
-    eth = (
-        {m: reuse_run(inp.eth, walk, cand, factory, spec, m, inp.costs) for m in MODES}
-        if inp.eth is not None
-        else {}
-    )
-    stress = reuse_run(btc, walk, cand, factory, spec, FillMode.MANUAL_DELAY, inp.stress_costs)
+    eth = {m: reuse_run(inp.eth, walk, cand, factory, spec, m, inp.costs) for m in MODES}
+    stress = reuse_run(btc, walk, cand, factory, spec, FillMode.MANUAL_DELAY, inp.stress)
     indices = _index_runs(inp, walk.schedule, timeframes, cand.name)
     dd, sh = _core_gates(walk.pooled, bh)
     gates = (dd, sh, pbo_gate(pbo.pbo), dsr_gate(dsr.dsr if dsr else None), nb.gate, _eth_gate(eth))
@@ -409,8 +431,8 @@ def _evaluate_s1(
     timeframes: Mapping[str, Timeframe],
 ) -> StrategyEval:
     pooled = {m: _blend(inp, members, m, timeframes, inp.btc) for m in MODES}
-    stress = _blend(inp, members, FillMode.MANUAL_DELAY, timeframes, inp.btc, inp.stress_costs)
-    eth = {m: _blend(inp, members, m, timeframes, inp.eth) for m in MODES} if inp.eth is not None else {}
+    stress = _blend(inp, members, FillMode.MANUAL_DELAY, timeframes, inp.btc, inp.stress)
+    eth = {m: _blend(inp, members, m, timeframes, inp.eth) for m in MODES}
     run = pooled[FillMode.MANUAL_DELAY]
     dd, sh = _core_gates(pooled, bh)
     dsr = candidate_dsr(run.returns, trial_sharpes, inp.logged_non_s0_trials)

@@ -166,7 +166,7 @@ def test_reuse_keeps_the_btc_schedule_and_does_not_reselect(btc_result: Candidat
 def test_stress_run_costs_more_than_the_normal_run(btc_result: CandidateResult) -> None:
     market = make_market()
     normal = reuse_run(market, btc_result, CANDIDATE, factory, SPEC, FillMode.MANUAL_DELAY, NORMAL_COSTS)
-    stressed = stress_run(market, btc_result, CANDIDATE, factory, SPEC)
+    stressed = stress_run(market, btc_result, CANDIDATE, factory, SPEC, STRESS_COSTS)
     assert stressed.n_fills == normal.n_fills  # same schedule, same trades ...
     assert stressed.fees_paid + stressed.slippage_cost > normal.fees_paid + normal.slippage_cost  # ... dearer
     assert STRESS_COSTS.fee_bps == 2 * NORMAL_COSTS.fee_bps

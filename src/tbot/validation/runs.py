@@ -15,12 +15,25 @@ child is called with the **full causal history from the data start**, rebuilt fr
 timestamp, so a child that replays from the anchor (SPEC 7.1) sees exactly what it would see in a run that
 started at the anchor, and the harness never has to ``slice`` a window by index in the engine's frame.
 
-Because the composite is flat before the first test period and the feed starts one daily close earlier, the
-entry into the first position is charged like any other trade, and a parameter change at a boundary is traded
-through the engine's normal rebalance rule (the 25 % band, SPEC 7.2 C) -- that is the SPEC's "charged as a
-trade". A 4h point's decisions run on a 4h feed; a daily point on a 4h feed is consulted only at the 00:00
-closes, and between them the composite holds its last target (``GatingRiskManager`` turns off-schedule bars
-into no-ops).
+Anchor replay (SPEC 7.1: "folds never restart the strategy; they only slice the replayed series"): the
+engine runs from the data start with the FIRST period's choice applied from the anchor (flat if that choice
+is ``None``), and the pooled series, its fills and its costs are those from the baseline close of the first
+test day on. A position entered before the first test day, and its stop, are carried into it exactly as in a
+fixed anchored run, so a candidate that holds one point throughout reproduces ``run_fixed`` bar for bar. A
+parameter change at a later boundary is traded through the engine's normal rebalance rule (the 25 % band,
+SPEC 7.2 C), which is the SPEC's "charged as a trade". A 4h point's decisions run on a 4h feed; a daily point
+on a 4h feed is consulted only at the 00:00 closes, and between them the composite holds its last target
+(``GatingRiskManager`` turns off-schedule bars into no-ops).
+
+Data notes for 4h points (SPEC 7.1 states the daily sigma-hat and ATR rules in daily terms)
+===========================================================================================
+A 4h child's daily volatility and ATR20 are computed from the COMPLETED UTC days of the 4h bars (six bars per
+day); a partial day never enters. The reference implementation is ``complete_utc_days`` in
+``src/tbot/indicators/daily_bars.py`` of the strategy branch (PR #27); the harness does not import it, the
+children do. The 4h series has 10 bars missing before 2018-09-15 (data-quality report); the first test day is
+2020-01-01, and the only effect is on the warm-up of the 4h points, which is inside the training window.
+The open SPEC readings (a 4h pending order under the delay, the S1 stop source, the PBO logit convention) are
+single switches in ``validation.policy``.
 """
 
 from __future__ import annotations
@@ -55,7 +68,14 @@ from tbot.core.types import (
     TargetIntent,
     Timeframe,
 )
+from tbot.execution.simulated import SlippageContext, SlippageModel
 from tbot.strategies.buy_and_hold import BuyAndHold
+from tbot.validation.policy import (
+    PENDING_ORDER_UNDER_DELAY,
+    S1_STOP_SOURCE,
+    PendingPolicy,
+    StopSource,
+)
 from tbot.validation.stats import annualised_sharpe, max_drawdown_of_returns
 
 __all__ = [
@@ -67,6 +87,7 @@ __all__ = [
     "FillMode",
     "GatingRiskManager",
     "Market",
+    "ScaledSlippage",
     "SeriesRun",
     "StrategyFactory",
     "default_filters",
@@ -88,12 +109,33 @@ class FillMode(StrEnum):
 
 
 @dataclass(frozen=True)
+class ScaledSlippage:
+    """A slippage model with every fill's impact multiplied by ``factor`` (the x2 stress of a curve)."""
+
+    inner: SlippageModel
+    factor: Decimal
+
+    def slippage_bps(self, ctx: SlippageContext) -> Decimal:
+        return self.inner.slippage_bps(ctx) * self.factor
+
+
+@dataclass(frozen=True)
 class CostSpec:
-    """Fee and slippage per side in bps (SPEC 7.2 F). Every Phase 3 number built from these is PROVISIONAL."""
+    """Fee and slippage per side (SPEC 7.2 F). Every Phase 3 number built from these is PROVISIONAL.
+
+    ``slippage_model`` is the depth-curve model from configuration (SPEC section 7); when it is None the flat
+    ``slippage_bps`` placeholder applies and ``is_flat_slippage`` is true. The pre-flight refuses a real run
+    with flat slippage.
+    """
 
     fee_bps: Decimal
     slippage_bps: Decimal
     label: str
+    slippage_model: SlippageModel | None = None
+
+    @property
+    def is_flat_slippage(self) -> bool:
+        return self.slippage_model is None
 
     def to_cost_config(self) -> CostConfig:
         return CostConfig(
@@ -103,9 +145,22 @@ class CostSpec:
             slippage_provisional=True,
         )
 
+    def with_model(self, model: SlippageModel, label: str) -> CostSpec:
+        return dataclasses.replace(self, slippage_model=model, label=label)
+
+    def stressed(self, factor: int = 2) -> CostSpec:
+        """Fees and slippage times ``factor`` (SPEC 7.2 E x2 stress); a curve is scaled, not replaced."""
+        model = None if self.slippage_model is None else ScaledSlippage(self.slippage_model, Decimal(factor))
+        return CostSpec(
+            self.fee_bps * factor,
+            self.slippage_bps * factor,
+            f"x{factor} stress of: {self.label}",
+            model,
+        )
+
 
 NORMAL_COSTS = CostSpec(Decimal(10), Decimal(5), "10 bps fee + 5 bps slippage (PROVISIONAL flat slippage)")
-STRESS_COSTS = CostSpec(Decimal(20), Decimal(10), "x2 stress: 20 bps fee + 10 bps slippage (PROVISIONAL)")
+STRESS_COSTS = NORMAL_COSTS.stressed()  # 20 bps fee + 10 bps flat slippage (PROVISIONAL)
 
 
 def default_filters(symbol: str) -> SymbolFilters:
@@ -166,6 +221,11 @@ class Market:
     @property
     def last_close(self) -> datetime:
         return self._ts[Timeframe.D1][-1]
+
+    @property
+    def anchor(self) -> datetime:
+        """The earliest bar close of any series: where an anchored replay starts (SPEC 7.1)."""
+        return min(ts[0] for ts in self._ts.values() if ts)
 
     def feed(self, tf: Timeframe, lo: datetime | None = None, hi: datetime | None = None) -> BacktestFeed:
         """Bars with ``lo <= ts <= hi`` (cached; the feed is re-iterable)."""
@@ -237,13 +297,20 @@ def make_config(
     costs: CostSpec,
     *,
     benchmark: bool = False,
+    pending_policy: PendingPolicy = PENDING_ORDER_UNDER_DELAY,
 ) -> BacktestConfig:
+    """The engine configuration of one run. ``pending_policy`` is reading 6 (see ``validation.policy``)."""
     delayed = fill_mode is FillMode.MANUAL_DELAY
+    if pending_policy != "skip":
+        raise NotImplementedError(
+            f"pending-order policy {pending_policy!r} needs an engine change; only 'skip' is implemented"
+        )
     cfg = BacktestConfig(
         symbol=market.symbol,
         timeframe=timeframe,
         filters=market.filters,
         costs=costs.to_cost_config(),
+        slippage_model=costs.slippage_model,
         base_asset=market.base_asset,
         fill_delay=_DELAY if delayed else timedelta(0),
         exec_timeframe=Timeframe.H1 if delayed else None,
@@ -338,17 +405,42 @@ def _is_daily_close(ts: datetime) -> bool:
     return ts.hour == 0 and ts.minute == 0 and ts.second == 0
 
 
-def series_from_result(result: BacktestResult, *, periods_per_year: float, daily_only: bool) -> SeriesRun:
+def series_from_result(
+    result: BacktestResult,
+    *,
+    periods_per_year: float,
+    daily_only: bool,
+    since: datetime | None = None,
+) -> SeriesRun:
+    """The daily equity series of ``result``; with ``since`` only the part from that close on.
+
+    ``since`` slices an anchored replay: the equity points with ``ts >= since`` (``ts[0]`` is the baseline of
+    the first return) and the cost bookkeeping of the fills and stop events at or after ``since`` (a fill at
+    exactly ``since`` is the first return's). Without ``since`` the totals are the engine's own.
+    """
     points = [p for p in result.equity if not daily_only or _is_daily_close(p.ts)]
+    if since is None:
+        return SeriesRun(
+            ts=tuple(p.ts for p in points),
+            equity=tuple(float(p.equity) for p in points),
+            periods_per_year=periods_per_year,
+            n_fills=len(result.fills),
+            fees_paid=float(result.fees_paid),
+            slippage_cost=float(result.slippage_cost),
+            traded_notional=float(result.traded_notional),
+            n_stop_events=len(getattr(result, "stop_events", ())),
+        )
+    points = [p for p in points if p.ts >= since]
+    fills = [f for f in result.fills if f.fill.ts >= since]
     return SeriesRun(
         ts=tuple(p.ts for p in points),
         equity=tuple(float(p.equity) for p in points),
         periods_per_year=periods_per_year,
-        n_fills=len(result.fills),
-        fees_paid=float(result.fees_paid),
-        slippage_cost=float(result.slippage_cost),
-        traded_notional=float(result.traded_notional),
-        n_stop_events=len(getattr(result, "stop_events", ())),
+        n_fills=len(fills),
+        fees_paid=float(sum((f.fill.fee for f in fills), Decimal(0))),
+        slippage_cost=float(sum((f.slippage_cost for f in fills), Decimal(0))),
+        traded_notional=float(sum((f.fill.notional for f in fills), Decimal(0))),
+        n_stop_events=sum(1 for e in getattr(result, "stop_events", ()) if e.ts >= since),
     )
 
 
@@ -445,19 +537,27 @@ class CompositeStrategy:
 
 
 class BlendStrategy:
-    """Equal-weight mean of member strategies' targets (S1); the stop of the first member is used.
+    """Equal-weight mean of member strategies' targets (S1).
 
-    All Phase 3 strategies share the same stop rule (``P_ref - 3 x ATR20``, SPEC 7.2 C), so which member
-    supplies it does not matter for the pre-registered members.
+    The stop comes from ``stop_source`` (reading 7, ``validation.policy.S1_STOP_SOURCE``; current: the first
+    member that has a scheduled point). All Phase 3 strategies use the same rule (``P_ref - 3 x ATR20``,
+    SPEC 7.2 C), so the sources agree whenever the members' ATR parameters agree; that is not checked.
     """
 
     warmup_bars = 1
 
-    def __init__(self, strategy_id: str, members: Sequence[CompositeStrategy]) -> None:
+    def __init__(
+        self,
+        strategy_id: str,
+        members: Sequence[CompositeStrategy],
+        *,
+        stop_source: StopSource = S1_STOP_SOURCE,
+    ) -> None:
         if not members:
             raise ValueError("a blend needs at least one member")
         self.id = strategy_id
         self._members = list(members)
+        self._stop_source = stop_source
 
     def is_decision_bar(self, ts: datetime) -> bool:
         return any(m.is_decision_bar(ts) for m in self._members)
@@ -467,10 +567,13 @@ class BlendStrategy:
         return TargetIntent(self.id, window.as_of, sum(weights) / len(weights), f"mean of {len(weights)}")
 
     def stop_price(self, window: BarWindow, entry_price: Decimal) -> Decimal:
-        for member in self._members:
-            if member.key_at(window.as_of) is not None:
-                return member.stop_price(window, entry_price)
-        raise ValueError("stop requested while no member has a scheduled point")
+        scheduled = [m for m in self._members if m.key_at(window.as_of) is not None]
+        if not scheduled:
+            raise ValueError("stop requested while no member has a scheduled point")
+        if self._stop_source == "first_scheduled_member":
+            return scheduled[0].stop_price(window, entry_price)
+        stops = [m.stop_price(window, entry_price) for m in scheduled]
+        return max(stops) if self._stop_source == "tightest_member" else min(stops)
 
 
 # -- runners -----------------------------------------------------------------------------------
@@ -513,17 +616,29 @@ def run_composite(
     baseline: datetime,
     end: datetime,
     benchmark: bool = False,
+    from_anchor: bool = True,
 ) -> SeriesRun:
-    """A pooled run on ``[baseline, end]``: ``baseline`` is the daily close before the first test close."""
+    """A pooled run reported on ``[baseline, end]`` (``baseline``: the daily close before the first test).
+
+    ``from_anchor`` (default) replays the engine from the data start, as SPEC 7.1 requires ("folds never
+    restart the strategy; they only slice the replayed series"): the position, the stop and the re-arm state
+    entering the first test day are those of a run that started at the anchor, and only the series from
+    ``baseline`` on is returned. ``from_anchor=False`` starts the engine at ``baseline`` instead (the
+    buy-and-hold benchmark, which by definition is entered on the first test day).
+    """
     cfg = make_config(market, feed_timeframe, fill_mode, costs, benchmark=benchmark)
-    exec_feed = _exec_feed(market, baseline, end) if fill_mode is FillMode.MANUAL_DELAY else None
+    feed_lo = None if from_anchor else baseline
+    exec_lo = market.series(feed_timeframe)[0].ts if from_anchor else baseline
+    exec_feed = _exec_feed(market, exec_lo, end) if fill_mode is FillMode.MANUAL_DELAY else None
     risk: RiskManager | None = None
     if feed_timeframe is not Timeframe.D1:
         risk = GatingRiskManager(make_stub_risk(cfg), strategy.is_decision_bar)
     result = run_backtest(
-        market.feed(feed_timeframe, baseline, end), strategy, cfg, risk=risk, exec_feed=exec_feed
+        market.feed(feed_timeframe, feed_lo, end), strategy, cfg, risk=risk, exec_feed=exec_feed
     )
-    return series_from_result(result, periods_per_year=market.periods_per_year, daily_only=True)
+    return series_from_result(
+        result, periods_per_year=market.periods_per_year, daily_only=True, since=baseline
+    )
 
 
 def run_buy_and_hold(
@@ -554,5 +669,13 @@ def run_buy_and_hold(
         feed_timeframe=Timeframe.D1,
     )
     return run_composite(
-        market, composite, Timeframe.D1, fill_mode, costs, baseline=baseline, end=end, benchmark=True
+        market,
+        composite,
+        Timeframe.D1,
+        fill_mode,
+        costs,
+        baseline=baseline,
+        end=end,
+        benchmark=True,
+        from_anchor=False,
     )

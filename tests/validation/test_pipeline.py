@@ -19,6 +19,7 @@ from tbot.validation.pipeline import (
     beats_in_periods,
     choose_x,
     evaluate,
+    s1_is_contender,
 )
 from tbot.validation.report import LABEL, render_report
 from tbot.validation.runs import FillMode
@@ -26,6 +27,7 @@ from tests.validation.wf_fixtures import (
     CANDIDATE,
     FIRST_TRADABLE,
     POINTS,
+    S0_VARIANT_KEYS,
     SPEC,
     factory,
     fake_run,
@@ -45,6 +47,7 @@ def evaluation() -> Phase3Evaluation:
         first_tradable=FIRST_TRADABLE,
         logged_non_s0_trials=len(POINTS),
         eth=make_market(seed=13, symbol="ETHUSDT"),
+        s0_variant_keys=S0_VARIANT_KEYS,
     )
     return evaluate(inp)
 
@@ -87,15 +90,80 @@ def test_beats_in_periods_counts_periods_with_a_higher_sharpe() -> None:
     assert beats_in_periods(better, better, SPEC) == 0  # equal is not a win
 
 
+def test_choose_x_first_in_registry_order_wins_an_exact_tie_whatever_the_names() -> None:
+    assert choose_x({"C9": 1.0, "C1": 1.0}, (True, 0.5), None)[0] == "C9"
+    assert choose_x({"C1": 1.0, "C9": 1.0}, (True, 0.5), None)[0] == "C1"
+    assert choose_x({"C1": None, "C2": 0.3}, (True, 0.5), None)[0] == "C2"  # undefined Sharpe never wins
+
+
+def test_choose_x_s1_must_be_strictly_above_s0_to_replace_it() -> None:
+    assert choose_x({}, (True, 0.9), (True, 0.9))[0] == "S0"
+    assert choose_x({}, (True, 0.9), (True, 0.9000001))[0] == "S1"
+    assert choose_x({}, (False, 0.9), (True, 0.1))[0] == "S1"
+
+
+def test_a_single_member_s1_is_not_a_contender() -> None:
+    assert not s1_is_contender([])
+    assert not s1_is_contender(["S0"])  # an S1 of S0 alone IS S0
+    assert not s1_is_contender(["C3-(10,28,50)"])
+    assert s1_is_contender(["S0", "C3-(10,28,50)"])
+
+
+def test_beats_in_periods_scores_an_undefined_or_negative_sharpe_as_zero() -> None:
+    from tests.validation.test_walk_forward import _closes
+
+    closes = _closes(400)
+    n = len(closes) - 1
+    noise = [0.01 * ((i % 2) - 0.5) for i in range(n)]
+    flat = fake_run(closes, [0.0] * n)
+    losing = fake_run(closes, [-0.002 + x for x in noise])
+    winning = fake_run(closes, [0.003 + x for x in noise])
+    assert flat.sharpe is None
+    assert beats_in_periods(losing, flat, SPEC) == 0  # losing money does not "beat" a flat S0
+    assert beats_in_periods(flat, losing, SPEC) == 0  # both sides score 0: a tie, not a win
+    assert beats_in_periods(flat, flat, SPEC) == 0  # two undefined sides tie, and a tie is not a win
+    assert beats_in_periods(winning, flat, SPEC) >= 1
+    assert beats_in_periods(losing, losing, SPEC) == 0
+
+
+def test_evaluate_refuses_to_run_without_the_s0_variants() -> None:
+    inp = EvalInputs(
+        btc=make_market(),
+        spec=SPEC,
+        factory=factory,
+        candidates=[CANDIDATE],
+        first_tradable=FIRST_TRADABLE,
+        logged_non_s0_trials=len(POINTS),
+        eth=make_market(seed=13, symbol="ETHUSDT"),
+        s0_variant_keys=[],
+    )
+    with pytest.raises(ValueError, match="S0 robustness variants"):
+        evaluate(inp)
+
+
+def test_eval_inputs_require_eth_so_a_missing_input_cannot_become_a_failed_gate() -> None:
+    kwargs = {
+        "btc": make_market(),
+        "spec": SPEC,
+        "factory": factory,
+        "candidates": [CANDIDATE],
+        "first_tradable": FIRST_TRADABLE,
+        "logged_non_s0_trials": len(POINTS),
+        "s0_variant_keys": S0_VARIANT_KEYS,
+    }
+    with pytest.raises(TypeError, match="eth"):
+        EvalInputs(**kwargs)  # type: ignore[arg-type]
+
+
 # -- end to end ---------------------------------------------------------------------------------------
 
 
 def test_every_strategy_has_its_gates(evaluation: Phase3Evaluation) -> None:
     names = {g.name for g in evaluation.s0.gates}
     assert {"maxDD vs B&H", "Sharpe vs B&H", "DSR", "ETH/USDT Sharpe", "x2 cost stress"} <= names
-    # the section-7.1 variants are not registered here: the gate exists and fails with a reason
+    # the six variants are evaluated (never "not evaluated"): the gate carries one Sharpe per variant
     variants = next(g for g in evaluation.s0.gates if g.name == "S0 robustness variants")
-    assert not variants.passed and "not evaluated" in variants.note
+    assert "not evaluated" not in variants.note
     cand = evaluation.candidates[0]
     assert {g.name for g in cand.gates} == {
         "maxDD vs B&H",

@@ -62,6 +62,7 @@ __all__ = [
     "CandidateResult",
     "Selection",
     "WalkForwardSpec",
+    "anchor_schedule",
     "benchmark_runs",
     "blend_run",
     "build_schedule",
@@ -241,6 +242,17 @@ def _end(market: Market, spec: WalkForwardSpec) -> datetime:
     return closes[bisect_left(closes, spec.last_test_end) - 1]
 
 
+def anchor_schedule(
+    market: Market, schedule: Sequence[tuple[datetime, str | None]]
+) -> list[tuple[datetime, str | None]]:
+    """The schedule with its first choice applied from the data start (SPEC 7.1 anchor replay)."""
+    if not schedule:
+        raise ValueError("an empty schedule cannot be anchored")
+    first_start, first_key = schedule[0]
+    anchor = min(market.anchor, first_start)
+    return [(anchor, first_key), *schedule[1:]]
+
+
 def pooled_run(
     market: Market,
     schedule: Sequence[tuple[datetime, str | None]],
@@ -252,7 +264,12 @@ def pooled_run(
     *,
     strategy_id: str = "walk_forward",
 ) -> SeriesRun:
-    """The pooled out-of-sample series of a schedule over ``[first test close, last test close]``."""
+    """The pooled out-of-sample series of a schedule over ``[first test close, last test close]``.
+
+    The engine is replayed from the data start with the first period's choice applied from there; only the
+    series from the first test day on is returned (``anchor_schedule``, ``run_composite``).
+    """
+    schedule = anchor_schedule(market, schedule)
     feed_tf = _feed_timeframe([k for _, k in schedule], timeframes)
     composite = CompositeStrategy(
         strategy_id=strategy_id,
@@ -285,6 +302,7 @@ def blend_run(
     strategy_id: str = "S1",
 ) -> SeriesRun:
     """Equal-weight blend of several members' schedules (S1), pooled over the test days."""
+    member_schedules = [anchor_schedule(market, sched) for sched in member_schedules]
     keys = [k for sched in member_schedules for _, k in sched]
     feed_tf = _feed_timeframe(keys, timeframes)
     members = [

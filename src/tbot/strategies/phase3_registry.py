@@ -15,7 +15,7 @@ from types import MappingProxyType
 
 from tbot.core.types import Strategy, Timeframe
 
-__all__ = ["PHASE3_ENTRIES", "Phase3Entry", "load"]
+__all__ = ["PHASE3_ENTRIES", "S0_VARIANTS", "Phase3Entry", "load"]
 
 
 @dataclass(frozen=True)
@@ -25,6 +25,7 @@ class Phase3Entry:
     factory: str
     timeframe: Timeframe
     params: Mapping[str, object] = field(default_factory=lambda: MappingProxyType({}))
+    counts_as_trial: bool = True  # False for the S0 sensitivity variants (SPEC 7.1: checks, not trials)
 
 
 def _entry(key: str, module: str, tf: Timeframe, **params: object) -> Phase3Entry:
@@ -52,6 +53,27 @@ PHASE3_ENTRIES: tuple[Phase3Entry, ...] = (
     _entry("C5-x5", "tbot.strategies.pullback_mr", _D1, rsi_entry=5),
     _entry("C5-x10", "tbot.strategies.pullback_mr", _D1, rsi_entry=10),
     _entry("C5-x15", "tbot.strategies.pullback_mr", _D1, rsi_entry=15),
+)
+
+
+# The six one-at-a-time S0 robustness variants of SPEC 7.1 / D-063: SMA 50/75/150/200 at vol target 0.30 and
+# vol target 0.20/0.40 at SMA 100. They are sensitivity runs, NOT trials: they are not in PHASE3_ENTRIES, they
+# are never logged as trials in research/EXPERIMENTS.md and never counted in N for the DSR. The ``S0var-`` key
+# prefix says so; ``counts_as_trial`` is False for each.
+_S0 = "tbot.strategies.s0_sma100"
+
+
+def _variant(key: str, **params: object) -> Phase3Entry:
+    return Phase3Entry(key, _S0, "make", _D1, MappingProxyType(dict(params)), counts_as_trial=False)
+
+
+S0_VARIANTS: tuple[Phase3Entry, ...] = (
+    _variant("S0var-sma50", sma_n=50, vol_target=0.30),
+    _variant("S0var-sma75", sma_n=75, vol_target=0.30),
+    _variant("S0var-sma150", sma_n=150, vol_target=0.30),
+    _variant("S0var-sma200", sma_n=200, vol_target=0.30),
+    _variant("S0var-vol20", sma_n=100, vol_target=0.20),
+    _variant("S0var-vol40", sma_n=100, vol_target=0.40),
 )
 
 

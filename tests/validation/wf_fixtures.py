@@ -25,6 +25,7 @@ __all__ = [
     "FIRST_TRADABLE",
     "N_BARS",
     "POINTS",
+    "S0_VARIANT_KEYS",
     "SPEC",
     "factory",
     "fake_run",
@@ -45,6 +46,15 @@ SPEC = WalkForwardSpec(
     final_train_end=datetime(2020, 10, 1, tzinfo=UTC),
 )
 
+S0_VARIANT_KEYS: tuple[str, ...] = (
+    "S0var-sma15",
+    "S0var-sma25",
+    "S0var-sma40",
+    "S0var-sma60",
+    "S0var-vol20",
+    "S0var-vol40",
+)
+
 POINTS: tuple[GridPoint, ...] = tuple(
     GridPoint(f"T-sma{n}", "T", D1, {"n": n}, n == 20, i) for i, n in enumerate((10, 20, 40))
 )
@@ -54,6 +64,10 @@ CANDIDATE = Candidate("T", POINTS)
 def factory(key: str) -> Strategy:
     """``S0`` is a 30-day SMA filter; ``T-smaN`` is an N-day SMA filter."""
     if key == "S0":
+        return SmaFilter(30)
+    if key.startswith("S0var-sma"):  # the stand-in has no vol-target knob: the vol variants are SMA 30 too
+        return SmaFilter(int(key.removeprefix("S0var-sma")))
+    if key.startswith("S0var-vol"):
         return SmaFilter(30)
     return SmaFilter(int(key.removeprefix("T-sma")))
 
