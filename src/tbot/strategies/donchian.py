@@ -18,10 +18,11 @@ the same bars (D-057).
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import datetime
 
 from tbot.core.types import BarWindow, Timeframe
 from tbot.indicators import donchian_mid, donchian_upper
-from tbot.strategies.s0_sma100 import DEFAULT_VOL_TARGET, SIGMA_WINDOW, ReplayStrategy
+from tbot.strategies.replay import DEFAULT_VOL_TARGET, HISTORY_START, SIGMA_WINDOW, ReplayStrategy
 
 __all__ = ["DonchianEnsemble", "make"]
 
@@ -31,7 +32,10 @@ CHANNELS_REQUIRED = 2
 
 class DonchianEnsemble(ReplayStrategy):
     def __init__(
-        self, lookbacks: Sequence[int] = DEFAULT_LOOKBACKS, vol_target: float = DEFAULT_VOL_TARGET
+        self,
+        lookbacks: Sequence[int] = DEFAULT_LOOKBACKS,
+        vol_target: float = DEFAULT_VOL_TARGET,
+        anchor: datetime | None = None,
     ) -> None:
         ns = tuple(int(n) for n in lookbacks)
         if len(ns) != 3 or any(n < 1 for n in ns):
@@ -40,7 +44,7 @@ class DonchianEnsemble(ReplayStrategy):
         # sigma_hat needs 151 closes; a channel needs n prior bars plus the current one -> n + 1 closes
         self.warmup_bars = max(SIGMA_WINDOW + 1, max(ns) + 1)
         self.id = "donchian_" + "_".join(str(n) for n in ns) + "_1d"
-        super().__init__(vol_target)
+        super().__init__(vol_target, anchor)
 
     def _reset_signal(self) -> None:
         self._long = [False] * len(self.lookbacks)
@@ -65,8 +69,10 @@ class DonchianEnsemble(ReplayStrategy):
         return sum(self._long) >= CHANNELS_REQUIRED
 
 
-def make(*, timeframe: Timeframe, **params: object) -> DonchianEnsemble:
-    """Factory used by ``phase3_registry`` (C1 runs on D1 only)."""
+def make(
+    *, timeframe: Timeframe, anchor: datetime | None = HISTORY_START, **params: object
+) -> DonchianEnsemble:
+    """Factory used by ``phase3_registry`` (C1 runs on D1 only; replay anchor, default 2018-01-01)."""
     if timeframe is not Timeframe.D1:
         raise ValueError(f"C1 runs on 1d bars only, got {timeframe}")
     lookbacks = params.pop("lookbacks", DEFAULT_LOOKBACKS)
@@ -75,4 +81,4 @@ def make(*, timeframe: Timeframe, **params: object) -> DonchianEnsemble:
         raise TypeError(f"unexpected C1 parameters: {sorted(params)}")
     if not isinstance(lookbacks, Sequence) or not isinstance(vol_target, float | int):
         raise TypeError("lookbacks must be a sequence and vol_target a number")
-    return DonchianEnsemble(lookbacks=lookbacks, vol_target=float(vol_target))
+    return DonchianEnsemble(lookbacks=lookbacks, vol_target=float(vol_target), anchor=anchor)
