@@ -16,7 +16,10 @@ never a failed gate:
 * every registered strategy module (grid points and S0 variants) imports and builds;
 * BTCUSDT AND ETHUSDT bars (1d, 4h, 1h) are in the local Parquet store;
 * a depth-curve slippage model is supplied (``--slippage-model module:factory``, built from configuration
-  and returning an object with ``slippage_bps(ctx)``). Flat slippage is refused unless
+  and returning an object with ``slippage_bps(ctx)``; for example a factory that calls
+  ``tbot.backtest.slippage.curve_from_g0_summary`` -- that construction is PROPOSED pending Parham, so it is
+  never a default here). The x2 stress goes through ``tbot.backtest.slippage.stressed`` (costs AND model).
+  Flat slippage is refused unless
   ``--allow-flat-slippage-for-tests`` is given; that flag exists for the unit tests and is never used in the
   real run.
 

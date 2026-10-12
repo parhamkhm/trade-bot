@@ -8,6 +8,7 @@ from decimal import Decimal
 import pytest
 
 from tbot.core.types import Timeframe
+from tbot.execution.simulated import DepthCurveSlippage
 from tbot.validation.grid import HOLDOUT_START
 from tbot.validation.robustness import (
     index_schedule,
@@ -171,3 +172,22 @@ def test_stress_run_costs_more_than_the_normal_run(btc_result: CandidateResult) 
     assert stressed.fees_paid + stressed.slippage_cost > normal.fees_paid + normal.slippage_cost  # ... dearer
     assert STRESS_COSTS.fee_bps == 2 * NORMAL_COSTS.fee_bps
     assert STRESS_COSTS.slippage_bps == 2 * NORMAL_COSTS.slippage_bps
+
+
+def test_stress_run_with_a_depth_curve_scales_the_curve_in_the_engine(btc_result: CandidateResult) -> None:
+    """Both the doubled costs and the scaled curve reach the engine: same schedule, strictly dearer."""
+    pts = ((Decimal(0), Decimal(0)), (Decimal(1_000), Decimal(10)), (Decimal(5_000), Decimal(50)))
+    curve = DepthCurveSlippage(pts, pts, Decimal(1), Decimal(10_000))
+    normal_costs = NORMAL_COSTS.with_model(curve, "curve")
+    market = make_market()
+    normal = reuse_run(market, btc_result, CANDIDATE, factory, SPEC, FillMode.MANUAL_DELAY, normal_costs)
+    stressed = stress_run(market, btc_result, CANDIDATE, factory, SPEC, normal_costs.stressed())
+    assert stressed.n_fills == normal.n_fills
+    assert normal.slippage_cost > 0 and stressed.traded_notional > 0
+    # per unit traded: the dearer run has its own equity path, so absolute totals are not comparable
+    n_rate = normal.slippage_cost / normal.traded_notional
+    s_rate = stressed.slippage_cost / stressed.traded_notional
+    assert s_rate > 1.5 * n_rate  # the curve itself is scaled, not only the flat stub
+    assert stressed.fees_paid / stressed.traded_notional == pytest.approx(
+        2 * normal.fees_paid / normal.traded_notional
+    )
