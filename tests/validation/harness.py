@@ -48,7 +48,11 @@ def make_cfg(
     buffer_bps: Decimal = Decimal(0),
     initial_cash: Decimal = Decimal(10_000),
     filters: SymbolFilters | None = None,
+    enforce_stops: bool = False,
 ) -> BacktestConfig:
+    """G2 validation config. ``enforce_stops`` defaults to False HERE (not in the engine): the independent
+    reference simulator and the vectorbt cross-check have no stop model, so the stopless engine path is
+    what they can be compared with. The stop path has its own hand-computed tests in tests/backtest."""
     return BacktestConfig(
         symbol=SYMBOL,
         timeframe=timeframe,
@@ -58,6 +62,7 @@ def make_cfg(
         buy_buffer_bps=buffer_bps,
         fill_delay=timedelta(hours=delay_hours) if delay_hours else timedelta(0),
         exec_timeframe=Timeframe.H1 if delay_hours else None,
+        enforce_stops=enforce_stops,
     )
 
 
