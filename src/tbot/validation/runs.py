@@ -21,19 +21,20 @@ is ``None``), and the pooled series, its fills and its costs are those from the 
 test day on. A position entered before the first test day, and its stop, are carried into it exactly as in a
 fixed anchored run, so a candidate that holds one point throughout reproduces ``run_fixed`` bar for bar. A
 parameter change at a later boundary is traded through the engine's normal rebalance rule (the 25 % band,
-SPEC 7.2 C), which is the SPEC's "charged as a trade". A 4h point's decisions run on a 4h feed; a daily point
-on a 4h feed is consulted only at the 00:00 closes, and between them the composite holds its last target
-(``GatingRiskManager`` turns off-schedule bars into no-ops).
+SPEC 7.2 C), which is the SPEC's "charged as a trade". Phase 3 is daily only (D-090): every run uses the 1d
+signal feed, and the 1h execution feed under the manual-delay fill model.
 
-Data notes for 4h points (SPEC 7.1 states the daily sigma-hat and ATR rules in daily terms)
-===========================================================================================
-A 4h child's daily volatility and ATR20 are computed from the COMPLETED UTC days of the 4h bars (six bars per
-day); a partial day never enters. The reference implementation is ``complete_utc_days`` in
-``src/tbot/indicators/daily_bars.py`` of the strategy branch (PR #27); the harness does not import it, the
-children do. The 4h series has 10 bars missing before 2018-09-15 (data-quality report); the first test day is
-2020-01-01, and the only effect is on the warm-up of the 4h points, which is inside the training window.
-The open SPEC readings (a 4h pending order under the delay, the S1 stop source, the PBO logit convention) are
-single switches in ``validation.policy``.
+S1 and the protective stop (D-092)
+==================================
+S1 has no intraday stop of its own; it follows its members' daily stopped states. It is run with
+``enforce_stops=False`` (the engine never asks it for a stop and produces no stop events). A member that is
+stopped out by its daily rule contributes weight 0 through its own target, and the reduction of S1's target
+that this causes must not be blocked by the band. Netting rule: at a close where ANY member enters STOPPED,
+S1 trades to its full new target (including the other members' moves at that close), ignoring the 25 % band.
+``BlendStrategy`` tags the intent on that close and ``StopOutExemptRiskManager`` sends a tagged intent
+through a band-0 manager. Every other change of S1's target, a member's ordinary signal exit included, keeps
+S0's rebalance rule on the netted position (25 % band; entries from 0 and exits to 0 always trade). Members
+must implement :class:`StopOutAware`.
 """
 
 from __future__ import annotations
@@ -47,7 +48,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from itertools import pairwise
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from tbot.backtest.config import BacktestConfig
 from tbot.backtest.engine import run_backtest
@@ -57,7 +58,6 @@ from tbot.backtest.risk_stub import StubRiskManager
 from tbot.backtest.slippage import stressed as engine_stressed
 from tbot.core.config import CostConfig
 from tbot.core.types import (
-    Approved,
     Bar,
     BarWindow,
     MarketState,
@@ -71,12 +71,6 @@ from tbot.core.types import (
 )
 from tbot.execution.simulated import FlatSlippage, SlippageModel
 from tbot.strategies.buy_and_hold import BuyAndHold
-from tbot.validation.policy import (
-    PENDING_ORDER_UNDER_DELAY,
-    S1_STOP_SOURCE,
-    PendingPolicy,
-    StopSource,
-)
 from tbot.validation.stats import annualised_sharpe, max_drawdown_of_returns
 
 __all__ = [
@@ -86,11 +80,13 @@ __all__ = [
     "CompositeStrategy",
     "CostSpec",
     "FillMode",
-    "GatingRiskManager",
     "Market",
     "SeriesRun",
+    "StopOutAware",
+    "StopOutExemptRiskManager",
     "StrategyFactory",
     "default_filters",
+    "engine_composite",
     "engine_supports_stops_and_band",
     "run_buy_and_hold",
     "run_composite",
@@ -292,14 +288,10 @@ def make_config(
     costs: CostSpec,
     *,
     benchmark: bool = False,
-    pending_policy: PendingPolicy = PENDING_ORDER_UNDER_DELAY,
+    enforce_stops: bool = True,
 ) -> BacktestConfig:
-    """The engine configuration of one run. ``pending_policy`` is reading 6 (see ``validation.policy``)."""
+    """The engine configuration of one run. ``enforce_stops=False`` is S1 only (D-092)."""
     delayed = fill_mode is FillMode.MANUAL_DELAY
-    if pending_policy != "skip":
-        raise NotImplementedError(
-            f"pending-order policy {pending_policy!r} needs an engine change; only 'skip' is implemented"
-        )
     cfg = BacktestConfig(
         symbol=market.symbol,
         timeframe=timeframe,
@@ -310,13 +302,21 @@ def make_config(
         fill_delay=_DELAY if delayed else timedelta(0),
         exec_timeframe=Timeframe.H1 if delayed else None,
     )
+    if "enforce_stops" in _config_fields():
+        cfg = dataclasses.replace(cfg, enforce_stops=enforce_stops)
     if benchmark:
         cfg = dataclasses.replace(cfg, **_benchmark_overrides())
     return cfg
 
 
-def make_stub_risk(cfg: BacktestConfig) -> StubRiskManager:
-    """The engine's default ``StubRiskManager`` for ``cfg`` (built the way the engine builds it)."""
+def make_stub_risk(
+    cfg: BacktestConfig, *, rebalance_band: float | None = None, id_prefix: str | None = None
+) -> StubRiskManager:
+    """The engine's default ``StubRiskManager`` for ``cfg`` (built the way the engine builds it).
+
+    ``rebalance_band`` overrides the config's band (0.0 always trades a non-zero gap) and ``id_prefix`` the
+    client-order-id prefix, which two managers sharing one engine run must make distinct.
+    """
     params = inspect.signature(StubRiskManager.__init__).parameters
     kwargs: dict[str, Any] = {
         "taker_fee_bps": cfg.costs.taker_fee_bps,
@@ -324,9 +324,13 @@ def make_stub_risk(cfg: BacktestConfig) -> StubRiskManager:
         "buy_buffer_bps": cfg.buy_buffer_bps,
     }
     if "rebalance_band" in params:
-        kwargs["rebalance_band"] = getattr(cfg, "rebalance_band", 0.25)
+        kwargs["rebalance_band"] = (
+            rebalance_band if rebalance_band is not None else getattr(cfg, "rebalance_band", 0.25)
+        )
     elif "drift_tolerance" in params:
         kwargs["drift_tolerance"] = getattr(cfg, "drift_tolerance", 0.02)
+    if id_prefix is not None and "id_prefix" in params:
+        kwargs["id_prefix"] = id_prefix
     return StubRiskManager(**kwargs)
 
 
@@ -442,24 +446,24 @@ def series_from_result(
 # -- composite strategy ------------------------------------------------------------------------
 
 
-class GatingRiskManager:
-    """Wraps a risk manager; at bars where ``is_decision_bar(ts)`` is false it approves a no-op."""
+@runtime_checkable
+class StopOutAware(Protocol):
+    """A strategy that can say whether its own daily protective stop was hit on the last bar of a window.
 
-    def __init__(self, inner: RiskManager, is_decision_bar: Callable[[datetime], bool]) -> None:
-        self._inner = inner
-        self._gate = is_decision_bar
+    ``stopped_out_on(window)`` is True iff, at the close of ``window``'s last bar, the strategy went from LONG
+    to STOPPED by its daily rule on THAT bar (the bar's low reached the stop). It must use only bars up to and
+    including the last one (the same causality as ``on_bar``) and must also report a stop-out that is released
+    to FLAT on the same bar. The S1 blend needs it from its members (D-092).
+    """
 
-    def evaluate(self, intent: TargetIntent, portfolio: PortfolioView, market: MarketState) -> RiskDecision:
-        if not self._gate(intent.ts):
-            return Approved(intent, None, "off-schedule bar: the held target is unchanged")
-        return self._inner.evaluate(intent, portfolio, market)
+    def stopped_out_on(self, window: BarWindow) -> bool: ...
 
 
 class CompositeStrategy:
     """Follows a schedule of ``(start, key | None)``: flat before the first start and while the key is None.
 
-    A child whose timeframe is coarser than the feed is consulted only at the closes of its own timeframe
-    (daily child on a 4h feed: the 00:00 closes) and the last target is held in between.
+    Every bar of the daily feed is a decision bar. The scheduled child is asked with the full daily history
+    up to the bar's close (``Market.window_to``).
     """
 
     warmup_bars = 1
@@ -471,8 +475,6 @@ class CompositeStrategy:
         market: Market,
         schedule: Sequence[tuple[datetime, str | None]],
         factory: StrategyFactory,
-        timeframes: Mapping[str, Timeframe],
-        feed_timeframe: Timeframe,
     ) -> None:
         if not schedule or any(b[0] <= a[0] for a, b in pairwise(schedule)):
             raise ValueError("schedule must be non-empty with strictly increasing starts")
@@ -481,24 +483,12 @@ class CompositeStrategy:
         self._starts = [s for s, _ in schedule]
         self._keys = [k for _, k in schedule]
         self._factory = factory
-        self._tf = dict(timeframes)
-        self._feed_tf = feed_timeframe
         self._children: dict[str, Strategy] = {}
-        self._held = 0.0
-        for key in {k for k in self._keys if k is not None}:
-            if self._tf[key].delta < feed_timeframe.delta:
-                raise ValueError(f"{key} is finer than the feed timeframe {feed_timeframe}")
 
     # -- schedule helpers --
     def key_at(self, ts: datetime) -> str | None:
         i = bisect_right(self._starts, ts) - 1
         return None if i < 0 else self._keys[i]
-
-    def is_decision_bar(self, ts: datetime) -> bool:
-        key = self.key_at(ts)
-        if key is None:
-            return True
-        return self._tf[key] is self._feed_tf or _is_daily_close(ts)
 
     def _child(self, key: str) -> Strategy:
         if key not in self._children:
@@ -510,65 +500,95 @@ class CompositeStrategy:
         ts = window.as_of
         key = self.key_at(ts)
         if key is None:
-            self._held = 0.0
             return TargetIntent(self.id, ts, 0.0, "flat: no scheduled point")
-        if self.is_decision_bar(ts):
-            child_window = self._market.window_to(self._tf[key], ts)
-            child = self._child(key)
-            if child_window is None or len(child_window) < child.warmup_bars:
-                self._held = 0.0
-            else:
-                self._held = child.on_bar(child_window).target_weight
-        return TargetIntent(self.id, ts, self._held, f"{key}")
+        child_window = self._market.window_to(Timeframe.D1, ts)
+        child = self._child(key)
+        if child_window is None or len(child_window) < child.warmup_bars:
+            weight = 0.0
+        else:
+            weight = child.on_bar(child_window).target_weight
+        return TargetIntent(self.id, ts, weight, f"{key}")
+
+    def stopped_out(self, window: BarWindow) -> bool:
+        """True iff the scheduled child was stopped out by its daily rule on the last bar of ``window``."""
+        ts = window.as_of
+        key = self.key_at(ts)
+        if key is None:
+            return False
+        child = self._child(key)
+        if not isinstance(child, StopOutAware):
+            raise TypeError(f"{key}: the strategy has no stopped_out_on(window); S1 needs it (D-092)")
+        child_window = self._market.window_to(Timeframe.D1, ts)
+        if child_window is None:
+            return False
+        return child.stopped_out_on(child_window)
 
     def stop_price(self, window: BarWindow, entry_price: Decimal) -> Decimal:
         key = self.key_at(window.as_of)
         if key is None:
             raise ValueError("stop requested while no point is scheduled")
-        child_window = self._market.window_to(self._tf[key], window.as_of)
+        child_window = self._market.window_to(Timeframe.D1, window.as_of)
         if child_window is None:
-            raise ValueError(f"no {self._tf[key]} history at {window.as_of}")
+            raise ValueError(f"no daily history at {window.as_of}")
         return self._child(key).stop_price(child_window, entry_price)
 
 
 class BlendStrategy:
-    """Equal-weight mean of member strategies' targets (S1).
+    """Equal-weight mean of member strategies' targets (S1), with no protective stop of its own (D-092).
 
-    The stop comes from ``stop_source`` (reading 7, ``validation.policy.S1_STOP_SOURCE``; current: the first
-    member that has a scheduled point). All Phase 3 strategies use the same rule (``P_ref - 3 x ATR20``,
-    SPEC 7.2 C), so the sources agree whenever the members' ATR parameters agree; that is not checked.
+    S1 follows each member's daily state through the member's target weight: a member that is STOPPED
+    contributes 0. On the bar a member is stopped out by its daily rule, the blend records the fact
+    (``stop_out_at``) for the :class:`StopOutExemptRiskManager`. The tag at close ``t`` is computed from the
+    members' windows up to ``t`` only.
     """
 
     warmup_bars = 1
 
-    def __init__(
-        self,
-        strategy_id: str,
-        members: Sequence[CompositeStrategy],
-        *,
-        stop_source: StopSource = S1_STOP_SOURCE,
-    ) -> None:
+    def __init__(self, strategy_id: str, members: Sequence[CompositeStrategy]) -> None:
         if not members:
             raise ValueError("a blend needs at least one member")
         self.id = strategy_id
         self._members = list(members)
-        self._stop_source = stop_source
-
-    def is_decision_bar(self, ts: datetime) -> bool:
-        return any(m.is_decision_bar(ts) for m in self._members)
+        self._tag: tuple[datetime, bool] | None = None
 
     def on_bar(self, window: BarWindow) -> TargetIntent:
+        ts = window.as_of
         weights = [m.on_bar(window).target_weight for m in self._members]
-        return TargetIntent(self.id, window.as_of, sum(weights) / len(weights), f"mean of {len(weights)}")
+        stopped = any(m.stopped_out(window) for m in self._members)
+        self._tag = (ts, stopped)
+        reason = f"mean of {len(weights)}" + ("; a member was stopped out" if stopped else "")
+        return TargetIntent(self.id, ts, sum(weights) / len(weights), reason)
+
+    def stop_out_at(self, ts: datetime) -> bool:
+        """True iff the intent just produced for close ``ts`` was tagged: a member stopped out on that bar."""
+        return self._tag is not None and self._tag[0] == ts and self._tag[1]
 
     def stop_price(self, window: BarWindow, entry_price: Decimal) -> Decimal:
-        scheduled = [m for m in self._members if m.key_at(window.as_of) is not None]
-        if not scheduled:
-            raise ValueError("stop requested while no member has a scheduled point")
-        if self._stop_source == "first_scheduled_member":
-            return scheduled[0].stop_price(window, entry_price)
-        stops = [m.stop_price(window, entry_price) for m in scheduled]
-        return max(stops) if self._stop_source == "tightest_member" else min(stops)
+        raise NotImplementedError(
+            "S1 has no intraday stop of its own; it follows its members' daily stopped states (D-092)"
+        )
+
+
+class StopOutExemptRiskManager:
+    """Trades S1 to its full new target at a close where any member entered STOPPED (D-092 netting rule).
+
+    ``banded`` is the engine's normal manager (25 % band); ``unbanded`` the same manager with band 0 and a
+    different order-id prefix. An intent goes to ``unbanded`` iff ``is_stop_out(intent.ts)``, whatever its
+    direction (other members' moves at that close are netted into the same trade). Every other intent,
+    including a member's ordinary signal exit, takes the normal banded path.
+    """
+
+    def __init__(
+        self, banded: RiskManager, unbanded: RiskManager, is_stop_out: Callable[[datetime], bool]
+    ) -> None:
+        self._banded = banded
+        self._unbanded = unbanded
+        self._is_stop_out = is_stop_out
+
+    def evaluate(self, intent: TargetIntent, portfolio: PortfolioView, market: MarketState) -> RiskDecision:
+        if self._is_stop_out(intent.ts):
+            return self._unbanded.evaluate(intent, portfolio, market)
+        return self._banded.evaluate(intent, portfolio, market)
 
 
 # -- runners -----------------------------------------------------------------------------------
@@ -591,7 +611,7 @@ def run_fixed(
 ) -> SeriesRun:
     """One fixed-parameter run over the full history (from the first bar to the last daily close).
 
-    A 4h point runs on its own 4h feed; the daily equity series is read at the 00:00 closes.
+    The daily equity series is read at the 00:00 closes.
     """
     last = end or market.last_close
     first = market.series(timeframe)[0].ts
@@ -601,10 +621,46 @@ def run_fixed(
     return series_from_result(result, periods_per_year=market.periods_per_year, daily_only=True)
 
 
+def engine_composite(
+    market: Market,
+    strategy: CompositeStrategy | BlendStrategy,
+    fill_mode: FillMode,
+    costs: CostSpec,
+    *,
+    baseline: datetime,
+    end: datetime,
+    benchmark: bool = False,
+    from_anchor: bool = True,
+) -> BacktestResult:
+    """The engine run behind :func:`run_composite`, returned whole (decisions, fills, stop events).
+
+    ``from_anchor`` (default) replays the engine from the data start, as SPEC 7.1 requires ("folds never
+    restart the strategy; they only slice the replayed series"): the position, the stop and the re-arm state
+    entering the first test day are those of a run that started at the anchor. ``from_anchor=False`` starts
+    the engine at ``baseline`` instead (the buy-and-hold benchmark, which by definition is entered on the
+    first test day).
+
+    A :class:`BlendStrategy` (S1) runs with ``enforce_stops=False`` and the stop-out exemption (D-092).
+    """
+    is_blend = isinstance(strategy, BlendStrategy)
+    cfg = make_config(market, Timeframe.D1, fill_mode, costs, benchmark=benchmark, enforce_stops=not is_blend)
+    feed_lo = None if from_anchor else baseline
+    exec_lo = market.series(Timeframe.D1)[0].ts if from_anchor else baseline
+    exec_feed = _exec_feed(market, exec_lo, end) if fill_mode is FillMode.MANUAL_DELAY else None
+    risk: RiskManager | None = None
+    if isinstance(strategy, BlendStrategy):
+        risk = StopOutExemptRiskManager(
+            make_stub_risk(cfg),
+            make_stub_risk(cfg, rebalance_band=0.0, id_prefix="so"),
+            strategy.stop_out_at,
+        )
+    feed = market.feed(Timeframe.D1, feed_lo, end)
+    return run_backtest(feed, strategy, cfg, risk=risk, exec_feed=exec_feed)
+
+
 def run_composite(
     market: Market,
     strategy: CompositeStrategy | BlendStrategy,
-    feed_timeframe: Timeframe,
     fill_mode: FillMode,
     costs: CostSpec,
     *,
@@ -615,21 +671,18 @@ def run_composite(
 ) -> SeriesRun:
     """A pooled run reported on ``[baseline, end]`` (``baseline``: the daily close before the first test).
 
-    ``from_anchor`` (default) replays the engine from the data start, as SPEC 7.1 requires ("folds never
-    restart the strategy; they only slice the replayed series"): the position, the stop and the re-arm state
-    entering the first test day are those of a run that started at the anchor, and only the series from
-    ``baseline`` on is returned. ``from_anchor=False`` starts the engine at ``baseline`` instead (the
-    buy-and-hold benchmark, which by definition is entered on the first test day).
+    See :func:`engine_composite` for ``from_anchor`` and the S1 handling; only the series from ``baseline`` on
+    is returned.
     """
-    cfg = make_config(market, feed_timeframe, fill_mode, costs, benchmark=benchmark)
-    feed_lo = None if from_anchor else baseline
-    exec_lo = market.series(feed_timeframe)[0].ts if from_anchor else baseline
-    exec_feed = _exec_feed(market, exec_lo, end) if fill_mode is FillMode.MANUAL_DELAY else None
-    risk: RiskManager | None = None
-    if feed_timeframe is not Timeframe.D1:
-        risk = GatingRiskManager(make_stub_risk(cfg), strategy.is_decision_bar)
-    result = run_backtest(
-        market.feed(feed_timeframe, feed_lo, end), strategy, cfg, risk=risk, exec_feed=exec_feed
+    result = engine_composite(
+        market,
+        strategy,
+        fill_mode,
+        costs,
+        baseline=baseline,
+        end=end,
+        benchmark=benchmark,
+        from_anchor=from_anchor,
     )
     return series_from_result(
         result, periods_per_year=market.periods_per_year, daily_only=True, since=baseline
@@ -660,13 +713,10 @@ def run_buy_and_hold(
         market=market,
         schedule=[(first_test_close, "BH")],
         factory=lambda _key: bh,
-        timeframes={"BH": Timeframe.D1},
-        feed_timeframe=Timeframe.D1,
     )
     return run_composite(
         market,
         composite,
-        Timeframe.D1,
         fill_mode,
         costs,
         baseline=baseline,

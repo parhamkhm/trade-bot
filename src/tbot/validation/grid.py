@@ -1,7 +1,7 @@
 """The pre-registered Phase 3 grid and walk-forward calendar (docs/SPEC.md section 7.2 B, C and E).
 
 Nothing here is a tunable: the 12 test periods, the training anchor, the 365-day eligibility minimum, the
-base point of every family and the +-1-step neighbour map are the SPEC's numbers. The 17 grid points come from
+base point of every family and the +-1-step neighbour map are the SPEC's numbers. The 14 grid points come from
 ``tbot.strategies.phase3_registry`` (the single source the strategy tests also iterate over), so a change to
 the grid cannot slip past the harness.
 
@@ -98,7 +98,7 @@ SPEC_PERIODS: tuple[Period, ...] = make_periods(_spec_starts(), HOLDOUT_START)
 
 @dataclass(frozen=True)
 class GridPoint:
-    """One of the 17 pre-registered trials (SPEC 7.2 C)."""
+    """One of the 14 pre-registered trials (SPEC 7.2 C, D-090)."""
 
     key: str
     family: str
@@ -141,17 +141,17 @@ def build_grid(entries: Sequence[Phase3Entry] = PHASE3_ENTRIES) -> dict[str, tup
 
 
 def grid_points() -> dict[str, GridPoint]:
-    """All 17 points by key."""
+    """All 14 points by key."""
     return {p.key: p for points in build_grid().values() for p in points}
 
 
 def neighbours(point: GridPoint, family_points: Sequence[GridPoint]) -> tuple[GridPoint, ...]:
     """The +-1-step neighbours of ``point`` (SPEC 7.2 E).
 
-    The step is the adjacent scale (C1, C2, C3 speed), the adjacent p (C4) or the adjacent x (C5). For C3 the
-    timeframe is not a neighbour axis, so the walk stays inside the point's own timeframe: the 1d base
-    (16, 32, 64) has the single neighbour (8, 16, 32) after D-087. A point at the edge of its grid has one.
+    The step is the adjacent scale (C1, C2, C3 speed), the adjacent p (C4) or the adjacent x (C5). The C3 base
+    (16, 32, 64) has the single neighbour (8, 16, 32) after D-087 and D-090. A point at the edge of its grid
+    has one neighbour.
     """
-    line = [p for p in family_points if p.family == point.family and p.timeframe is point.timeframe]
+    line = [p for p in family_points if p.family == point.family]
     i = [p.key for p in line].index(point.key)
     return tuple(line[j] for j in (i - 1, i + 1) if 0 <= j < len(line))

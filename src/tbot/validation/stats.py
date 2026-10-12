@@ -18,6 +18,8 @@ Conventions, fixed here so every report uses one definition:
 * ``DSR = PSR(SR*)``, a probability in [0, 1]; "DSR > 0 at the 95 % level" means ``DSR >= 0.95``.
 * ``MinTRL = 1 + [1 - gamma3 SR_hat + (gamma4 - 1)/4 SR_hat^2] (Z_alpha / (SR_hat - SR*))^2`` observations.
 * PBO by combinatorially symmetric cross-validation (CSCV), Bailey, Borwein, Lopez de Prado & Zhu (2014).
+  D-093: lambda <= 0 counts as overfit and is THE gating value (``PboResult.pbo``); the share with
+  lambda < 0 is computed beside it for information (``PboResult.pbo_strict``).
 
 References are in ``tests/validation/test_stats_reference.py``, which pins every function to a published
 worked example or an independent implementation.
@@ -35,7 +37,6 @@ import numpy as np
 from numpy.typing import NDArray
 
 from tbot.backtest.metrics import sharpe_ratio
-from tbot.validation.policy import PBO_ZERO_LOGIT_IS_OVERFIT
 
 __all__ = [
     "EULER_MASCHERONI",
@@ -262,13 +263,14 @@ def min_trl(
 
 @dataclass(frozen=True, slots=True)
 class PboResult:
-    pbo: float  # P(logit <= 0)
+    pbo: float  # P(logit <= 0): the GATING value (D-093)
     n_combinations: int
     n_blocks: int
     block_len: int
     dropped_leading_days: int  # earliest rows dropped so the blocks are exactly equal
     n_strategies: int
     logits: tuple[float, ...]  # one per combination, in itertools.combinations order
+    pbo_strict: float  # P(logit < 0): reported for information only (D-093), never gating
 
 
 def _combo_sharpes(
@@ -291,9 +293,7 @@ def _combo_sharpes(
     return out
 
 
-def pbo_cscv(
-    matrix: FloatArray, *, n_blocks: int = 16, zero_logit_is_overfit: bool = PBO_ZERO_LOGIT_IS_OVERFIT
-) -> PboResult:
+def pbo_cscv(matrix: FloatArray, *, n_blocks: int = 16) -> PboResult:
     """Probability of Backtest Overfitting by CSCV on a ``(T, N)`` daily return matrix.
 
     ``matrix[:, j]`` is trial ``j``'s daily returns, all on the SAME days. The rows are cut into
@@ -302,9 +302,10 @@ def pbo_cscv(
     in-sample set (the rest is out-of-sample): the in-sample best trial (highest Sharpe; the first index on a
     tie) is ranked among all trials out of sample (average rank on ties, 1 = worst),
     ``omega = rank / (N + 1)``
-    and ``logit = ln(omega / (1 - omega))``. ``PBO`` is the share of combinations with ``logit <= 0``
-    (the in-sample winner is at or below the out-of-sample median); with ``zero_logit_is_overfit=False`` the
-    share with ``logit < 0``. The default is ``validation.policy.PBO_ZERO_LOGIT_IS_OVERFIT`` (open reading).
+    and ``logit = ln(omega / (1 - omega))``. ``PBO`` (``PboResult.pbo``, the gating value, D-093) is the share
+    of combinations with ``logit <= 0`` (the in-sample winner is at or below the out-of-sample median).
+    ``PboResult.pbo_strict`` is the share with ``logit < 0``, reported next to it for information. They differ
+    only on combinations whose winner sits exactly at the median rank (``omega = 1/2``).
     """
     if n_blocks < 2 or n_blocks % 2:
         raise ValueError("n_blocks must be an even number >= 2")
@@ -335,5 +336,6 @@ def pbo_cscv(
     rank = below + (equal + 1) / 2.0  # average 1-based rank of the tied group
     omega = rank / (n + 1.0)
     logits = [float(x) for x in np.log(omega / (1.0 - omega))]
-    pbo = sum(1 for x in logits if (x <= 0.0 if zero_logit_is_overfit else x < 0.0)) / len(logits)
-    return PboResult(pbo, len(logits), n_blocks, block_len, dropped, n, tuple(logits))
+    pbo = sum(1 for x in logits if x <= 0.0) / len(logits)
+    strict = sum(1 for x in logits if x < 0.0) / len(logits)
+    return PboResult(pbo, len(logits), n_blocks, block_len, dropped, n, tuple(logits), strict)

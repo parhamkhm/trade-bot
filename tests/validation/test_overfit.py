@@ -79,7 +79,7 @@ def test_candidate_dsr_refuses_a_trial_count_that_differs_from_the_log() -> None
     sharpes = {"a": 0.05, "b": 0.02, "c": 0.01}
     assert candidate_dsr(series, sharpes, 3) is not None
     with pytest.raises(ValueError, match="trials are logged"):
-        candidate_dsr(series, sharpes, 17)
+        candidate_dsr(series, sharpes, 14)
 
 
 def test_candidate_dsr_is_none_for_a_flat_series_and_uses_n() -> None:

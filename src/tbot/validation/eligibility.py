@@ -5,16 +5,14 @@
   151-close sigma-hat and uses S0's ATR20 for the stop.
 * A point is **eligible** for a period iff it has at least 365 tradable daily closes inside the period's
   training window, i.e. at least 365 daily closes with ``first_tradable <= ts < period.start``.
-* The required window is counted in closes of the point's own timeframe. For the 4h points the count is of 4h
-  bars actually present in the data (10 are missing before 2018-09-15), which is why C3 4h (32, 64, 128) is
-  first tradable at 2018-09-15 16:00 and not 2018-09-12 04:00.
+* Phase 3 is daily only (D-090): every window is counted in daily closes actually present in the data.
 
 The window sizes below are the SPEC's text, written once:
 
 ====  =====================================================================================
 C1    ``n_max + 1`` closes (channel highs/lows over ``t-n..t-1`` plus the current close)
 C2    ``h_max + 1`` closes (the log return over ``h`` days needs ``close_{t-h}``)
-C3    ``K = 3 * 4 * f_max`` bars of the point's timeframe (finite EWMA truncated at 3k bars)
+C3    ``K = 3 * 4 * f_max`` daily closes (finite EWMA of the slow span 4f truncated at 3k bars)
 C4    385 closes (20 returns for ``rv_t`` plus 364 earlier ``rv`` values for the percentile)
 C5    200 closes (SMA200)
 ====  =====================================================================================
@@ -46,7 +44,7 @@ _C5_CLOSES = 200
 
 
 def required_closes(family: str, params: Mapping[str, object]) -> int:
-    """Number of own-timeframe closes a point needs before it can trade (SPEC 7.2 B/C)."""
+    """Number of daily closes a point needs before it can trade (SPEC 7.2 B/C)."""
     if family == "C1":
         return max(_ints(params["lookbacks"])) + 1
     if family == "C2":
@@ -71,8 +69,8 @@ def first_tradable_close(
 ) -> datetime:
     """The first tradable close of ``point`` computed from the bars actually present.
 
-    ``bars_by_timeframe`` must hold the point's own timeframe, starting at the data start (the first close is
-    close number 1). Raises if the series is too short for the window.
+    ``bars_by_timeframe`` must hold the point's own (daily) timeframe, starting at the data start (the first
+    close is close number 1). Raises if the series is too short for the window.
     """
     bars = bars_by_timeframe[point.timeframe]
     need = required_closes(point.family, point.params)

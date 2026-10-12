@@ -1,7 +1,7 @@
-"""The trial log: how many trials ``research/EXPERIMENTS.md`` holds, and whether the 17 grid points are in it.
+"""The trial log: how many trials ``research/EXPERIMENTS.md`` holds, and whether the 14 grid points are in it.
 
 SPEC 7.2 D: every configuration that ever produced a backtest number counts toward the DSR trial count, and
-"all 17 grid points are logged in ``research/EXPERIMENTS.md`` before the first run". This module reads the
+"all 14 grid points are logged in ``research/EXPERIMENTS.md`` before the first run". This module reads the
 **trial table** (the table whose header row starts with ``#``; one trial per data row) so the run scripts can
 refuse to start otherwise, and so N in the DSR is the logged number and not a constant typed in code. Any
 other table in the file (a results table, a disclosure table) is ignored.

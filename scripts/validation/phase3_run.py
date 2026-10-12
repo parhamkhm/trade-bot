@@ -2,26 +2,28 @@
 
 Run from the repository root::
 
-    uv run python -m scripts.validation.phase3_run --preflight-only --slippage-model pkg.module:factory
-    uv run python -m scripts.validation.phase3_run --slippage-model pkg.module:factory \
+    uv run python -m scripts.validation.phase3_run --preflight-only --g0-summary path/to/g0.summary.json
+    uv run python -m scripts.validation.phase3_run --g0-summary path/to/g0.summary.json \
         --out research/reports/phase3-walkforward.md [--stooq SPX=path/to/spx_d.csv ...]
 
 The script REFUSES to start (exit code 2) until the pre-flight passes. A missing input is a reason to refuse,
 never a failed gate:
 
-* ``research/EXPERIMENTS.md`` holds exactly 17 non-S0 trial rows (S0, the S0 variants and ``S0-...`` rows are
-  not counted), the 17 grid points are named in them and S0 is registered;
+* ``research/EXPERIMENTS.md`` holds exactly 14 non-S0 trial rows (S0, the S0 variants and ``S0-...`` rows are
+  not counted), the 14 grid points are named in them (D-090: C1 3, C2 3, C3 2, C4 3, C5 3) and S0 is
+  registered;
 * the six SPEC 7.1 S0 variants are registered in ``S0_VARIANTS`` (sensitivity runs, not trials);
 * the engine has the SPEC 7.1 stop/band mechanics and is at or after commit ``8d99335``;
-* every registered strategy module (grid points and S0 variants) imports and builds;
-* BTCUSDT AND ETHUSDT bars (1d, 4h, 1h) are in the local Parquet store;
-* a depth-curve slippage model is supplied (``--slippage-model module:factory``, built from configuration
-  and returning an object with ``slippage_bps(ctx)``; for example a factory that calls
-  ``tbot.backtest.slippage.curve_from_g0_summary`` -- that construction is PROPOSED pending Parham, so it is
-  never a default here). The x2 stress goes through ``tbot.backtest.slippage.stressed`` (costs AND model).
-  Flat slippage is refused unless
-  ``--allow-flat-slippage-for-tests`` is given; that flag exists for the unit tests and is never used in the
-  real run.
+* every registered strategy module (grid points and S0 variants) imports and builds, and every grid
+  strategy implements ``stopped_out_on(window)`` (S1 follows its members' stop-outs, D-092);
+* BTCUSDT AND ETHUSDT bars (1d and 1h) are in the local Parquet store (Phase 3 is daily-only, D-090);
+* a depth-curve slippage model is supplied. D-091: ``--g0-summary PATH`` builds the run's curve with
+  ``tbot.backtest.slippage.curve_from_g0_summary(..., statistic="median")`` and, from the same summary, the
+  ``"adverse_p90_cost"`` curve used ONLY for the reported sensitivity block (never gating). ``--slippage-model
+  module:factory`` supplies the run curve by hand instead (an object with ``slippage_bps(ctx)``), optionally
+  with ``--sensitivity-slippage-model``. The x2 stress goes through ``tbot.backtest.slippage.stressed``
+  (costs AND model). Flat slippage is refused unless ``--allow-flat-slippage-for-tests`` is given; that flag
+  exists for the unit tests and is never used in the real run.
 
 Stooq indices are informational: an absent or unreadable file is reported "not run" and never fails a gate.
 
@@ -42,6 +44,7 @@ from collections.abc import Sequence
 from datetime import timedelta
 from pathlib import Path
 
+from tbot.backtest.slippage import curve_from_g0_summary
 from tbot.core.types import Timeframe
 from tbot.strategies.phase3_registry import PHASE3_ENTRIES, S0_VARIANTS, load
 from tbot.validation.eligibility import first_tradable_close
@@ -49,7 +52,7 @@ from tbot.validation.grid import HISTORY_START, HOLDOUT_START, TRAIN_START, grid
 from tbot.validation.pipeline import EvalInputs, evaluate
 from tbot.validation.preflight import preflight
 from tbot.validation.real_data import find_parquet_root, real_bars
-from tbot.validation.report import render_report
+from tbot.validation.report import SENSITIVITY_BLOCK, render_report
 from tbot.validation.robustness import parse_stooq_csv
 from tbot.validation.run_record import RunRecord, append_run_record, git_head, sha256_of
 from tbot.validation.runs import NORMAL_COSTS, CostSpec, Market
@@ -60,7 +63,7 @@ REPO = Path(__file__).resolve().parents[2]
 EXPERIMENTS = REPO / "research" / "EXPERIMENTS.md"
 REPORTS = REPO / "research" / "reports"
 RUN_LOG = REPORTS / "phase3-run-log.jsonl"
-TIMEFRAMES = (Timeframe.D1, Timeframe.H4, Timeframe.H1)
+TIMEFRAMES = (Timeframe.D1, Timeframe.H1)  # D-090: 1d signals, 1h execution
 SYMBOLS = (("BTCUSDT", "BTC"), ("ETHUSDT", "ETH"))
 INDEX_PERIODS_PER_YEAR = 252.0
 _PROBE_SPAN = timedelta(days=30)
@@ -86,6 +89,16 @@ def _missing_series() -> list[str]:
             if not head or not tail:
                 missing.append(f"{sym}/{tf.value}")
     return missing
+
+
+def _g0_costs(path: Path) -> tuple[CostSpec, CostSpec]:
+    """D-091: (run costs on the MEDIAN curve, sensitivity costs on the ADVERSE-P90 curve) of one summary."""
+    median = curve_from_g0_summary(path, statistic="median")
+    adverse = curve_from_g0_summary(path, statistic="adverse_p90_cost")
+    return (
+        NORMAL_COSTS.with_model(median, f"10 bps fee + G0 median depth curve ({path.name})"),
+        NORMAL_COSTS.with_model(adverse, f"10 bps fee + G0 adverse-p90-cost depth curve ({path.name})"),
+    )
 
 
 def _slippage_cost(spec: str | None) -> CostSpec:
@@ -153,7 +166,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--preflight-only", action="store_true", help="run the guards and stop")
     ap.add_argument("--out", type=Path, default=REPORTS / "phase3-walkforward.md")
+    ap.add_argument(
+        "--g0-summary",
+        type=Path,
+        metavar="JSON",
+        help="G0 probe summary: median curve for the run, adverse-p90-cost curve for the sensitivity (D-091)",
+    )
     ap.add_argument("--slippage-model", metavar="MODULE:FACTORY", help="depth-curve slippage model (config)")
+    ap.add_argument(
+        "--sensitivity-slippage-model",
+        metavar="MODULE:FACTORY",
+        help="slippage model for the reported-only sensitivity block (D-091); default: from --g0-summary",
+    )
     ap.add_argument(
         "--allow-flat-slippage-for-tests",
         action="store_true",
@@ -162,7 +186,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--stooq", action="append", default=[], metavar="NAME=CSV", help="index CSV (repeatable)")
     args = ap.parse_args(argv)
 
-    costs = _slippage_cost(args.slippage_model)
+    if args.g0_summary is not None and args.slippage_model:
+        raise SystemExit("--g0-summary and --slippage-model are alternatives; give one")
+    sensitivity: CostSpec | None = None
+    if args.g0_summary is not None:
+        try:
+            costs, sensitivity = _g0_costs(args.g0_summary)
+        except (OSError, ValueError) as exc:
+            raise SystemExit(f"--g0-summary {args.g0_summary}: {exc}") from exc
+    else:
+        costs = _slippage_cost(args.slippage_model)
+    if args.sensitivity_slippage_model:
+        sensitivity = _slippage_cost(args.sensitivity_slippage_model)
     allow_flat: bool = args.allow_flat_slippage_for_tests
     log, problems = _read_log()
     if log is not None:
@@ -171,6 +206,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 log,
                 load,
                 costs=costs,
+                sensitivity_costs=sensitivity,
                 allow_flat_slippage=allow_flat,
                 missing_series=_missing_series(),
             )
@@ -189,7 +225,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         _record("preflight-ok", costs, allow_flat, log)
         return 0
     try:
-        text = _evaluate_and_render(args.stooq, costs, log)
+        text = _evaluate_and_render(args.stooq, costs, sensitivity, log)
     except Exception as exc:
         _record("error", costs, allow_flat, log, [f"{type(exc).__name__}: {exc}"])
         raise
@@ -200,10 +236,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
-def _evaluate_and_render(stooq: Sequence[str], costs: CostSpec, log: TrialLog) -> str:
+def _evaluate_and_render(
+    stooq: Sequence[str], costs: CostSpec, sensitivity: CostSpec | None, log: TrialLog
+) -> str:
     btc = _load_market("BTCUSDT", "BTC")
     eth = _load_market("ETHUSDT", "ETH")
-    bars = {tf: btc.series(tf) for tf in (Timeframe.D1, Timeframe.H4)}
+    bars = {Timeframe.D1: btc.series(Timeframe.D1)}
     points = grid_points()
     first = {key: first_tradable_close(point, bars) for key, point in points.items()}
     first["S0"] = TRAIN_START
@@ -220,8 +258,12 @@ def _evaluate_and_render(stooq: Sequence[str], costs: CostSpec, log: TrialLog) -
         s0_variant_keys=[v.key for v in S0_VARIANTS],
         indices={m.symbol: m for m in indices},
         costs=costs,
+        sensitivity_costs=sensitivity,
     )
-    return render_report(evaluate(inputs), inputs.spec)
+    text = render_report(evaluate(inputs), inputs.spec)
+    if sensitivity is not None and SENSITIVITY_BLOCK not in text:
+        raise RuntimeError(f"the report lacks the required block {SENSITIVITY_BLOCK!r} (D-091)")
+    return text
 
 
 if __name__ == "__main__":

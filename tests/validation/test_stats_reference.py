@@ -310,6 +310,7 @@ def test_pbo_matches_independent_brute_force(t: int, n: int, blocks: int) -> Non
     ref_pbo, ref_logits = _brute_force_pbo(matrix, blocks)
     assert res.n_combinations == math.comb(blocks, blocks // 2) == len(ref_logits)
     assert res.pbo == ref_pbo
+    assert res.pbo_strict == sum(1 for x in ref_logits if x < 0) / len(ref_logits)  # D-093, for information
     assert np.allclose(res.logits, ref_logits, rtol=0.0, atol=1e-12)
     assert res.dropped_leading_days == t - (t // blocks) * blocks
     assert res.n_strategies == n
@@ -336,6 +337,7 @@ def test_pbo_is_one_when_the_in_sample_winner_is_always_the_out_of_sample_loser(
     assert abs(r0.mean()) < 1e-15
     res = stats.pbo_cscv(np.column_stack([r0, -r0]))
     assert res.pbo == 1.0
+    assert res.pbo_strict == 1.0  # N = 2 without ties: lambda is never exactly 0, the conventions agree
 
 
 def test_pbo_is_zero_when_one_trial_dominates_in_every_block() -> None:
@@ -360,7 +362,29 @@ def test_pbo_ties_use_the_average_rank() -> None:
     col = np.random.default_rng(8).normal(0.0, 0.02, 320)
     res = stats.pbo_cscv(np.column_stack([col, col, col]), n_blocks=8)
     assert res.pbo == 1.0
+    assert res.pbo_strict == 0.0  # D-093: every logit is exactly 0, so < 0 counts none of them
     assert all(abs(x) < 1e-12 for x in res.logits)
+
+
+def test_pbo_two_trials_both_conventions_agree_because_lambda_is_never_zero() -> None:
+    """D-093, N = 2 without ties: the winner's rank is 1 or 2, omega is 1/3 or 2/3, lambda = -+ln 2."""
+    matrix = np.random.default_rng(11).normal(0.0, 0.02, (160, 2))
+    res = stats.pbo_cscv(matrix, n_blocks=8)
+    assert all(abs(abs(x) - math.log(2.0)) < 1e-12 for x in res.logits)
+    assert res.pbo == res.pbo_strict
+    assert 0.0 < res.pbo < 1.0
+
+
+def test_pbo_three_trials_the_conventions_differ_exactly_by_the_zero_lambda_share() -> None:
+    """D-093, N = 3: a winner at the median rank has omega = 1/2, lambda = 0. The gating PBO (<= 0) counts it,
+    the informational strict share (< 0) does not."""
+    matrix = np.random.default_rng(1).normal(0.0, 0.02, (160, 3))
+    res = stats.pbo_cscv(matrix, n_blocks=8)
+    zero = sum(1 for x in res.logits if x == 0.0)
+    assert zero > 0
+    assert res.pbo > res.pbo_strict
+    assert res.pbo - res.pbo_strict == pytest.approx(zero / len(res.logits))
+    assert res.pbo == sum(1 for x in res.logits if x <= 0.0) / len(res.logits)  # the gating value is <= 0
 
 
 def test_pbo_input_validation() -> None:
@@ -373,3 +397,32 @@ def test_pbo_input_validation() -> None:
         stats.pbo_cscv(np.zeros((20, 3)))
     with pytest.raises(ValueError, match="finite"):
         stats.pbo_cscv(np.full((64, 3), np.nan))
+
+
+def test_pbo_rank_convention_is_pinned_omega_equals_rank_over_n_plus_one() -> None:
+    """D-093 convention: omega = r / (N + 1), r = the in-sample winner's out-of-sample rank (1 = worst,
+    N = best, ties at the average rank), lambda = ln(omega / (1 - omega)). Pinned on three constructed
+    cases whose logits are known in closed form, so a change of convention (rank from 0, rank / N,
+    1 = best) fails."""
+    # (1) N = 6, trial 5 dominates in every block: it wins in sample and is best (r = N) out of sample.
+    shared = np.random.default_rng(4).normal(0.0, 0.01, 640)
+    best = stats.pbo_cscv(np.column_stack([shared + 0.002 * j for j in range(6)]))
+    n = 6
+    assert all(abs(x - math.log(n)) < 1e-12 for x in best.logits)  # omega = N / (N + 1)
+
+    # (2) N = 2, the in-sample winner is always the out-of-sample loser (r = 1): omega = 1 / (N + 1).
+    n_blocks, length = 16, 20
+    block_means = np.array([2.0**b for b in range(n_blocks)])
+    block_means -= block_means.mean()
+    base = np.random.default_rng(2).normal(0.0, 1.0, (n_blocks, length))
+    base -= base.mean(axis=1, keepdims=True)
+    r0 = (base + block_means[:, None]).reshape(-1) * 1e-4
+    worst = stats.pbo_cscv(np.column_stack([r0, -r0]))
+    assert all(abs(x + math.log(2)) < 1e-12 for x in worst.logits)  # omega = 1 / 3
+
+    # (3) N = 4: three identical columns (the first wins in sample) and one strictly worse column. The tied
+    # group occupies ranks 2, 3, 4 out of sample: average rank 3, omega = 3 / 5, lambda = ln(3 / 2).
+    col = np.random.default_rng(8).normal(0.0, 0.02, 320)
+    tied = stats.pbo_cscv(np.column_stack([col, col, col, col - 0.05]), n_blocks=8)
+    assert all(abs(x - math.log(3.0 / 2.0)) < 1e-12 for x in tied.logits)
+    assert tied.pbo == 0.0

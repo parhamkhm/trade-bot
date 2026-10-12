@@ -107,7 +107,7 @@ def test_a_c_row_starting_with_s_is_not_s0() -> None:
 def test_the_repository_log_registers_s0() -> None:
     """Reads the real log (read-only): S0 must be registered. Skips if the file is absent.
 
-    SPEC 7.2 D asks for the 17 grid points to be logged before the first run; the run script refuses to start
+    SPEC 7.2 D asks for the 14 grid points to be logged before the first run; the run script refuses to start
     until they are, so this test deliberately does not assert the grid rows.
     """
     path = Path(__file__).resolve().parents[2] / "research" / "EXPERIMENTS.md"

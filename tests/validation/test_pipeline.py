@@ -22,7 +22,7 @@ from tbot.validation.pipeline import (
     s1_is_contender,
 )
 from tbot.validation.report import LABEL, render_report
-from tbot.validation.runs import FillMode
+from tbot.validation.runs import STRESS_COSTS, FillMode
 from tests.validation.wf_fixtures import (
     CANDIDATE,
     FIRST_TRADABLE,
@@ -37,9 +37,8 @@ from tests.validation.wf_fixtures import (
 MD, NO = FillMode.MANUAL_DELAY, FillMode.NEXT_OPEN
 
 
-@pytest.fixture(scope="module")
-def evaluation() -> Phase3Evaluation:
-    inp = EvalInputs(
+def _inputs(**extra: object) -> EvalInputs:
+    return EvalInputs(
         btc=make_market(),
         spec=SPEC,
         factory=factory,
@@ -48,8 +47,13 @@ def evaluation() -> Phase3Evaluation:
         logged_non_s0_trials=len(POINTS),
         eth=make_market(seed=13, symbol="ETHUSDT"),
         s0_variant_keys=S0_VARIANT_KEYS,
+        **extra,  # type: ignore[arg-type]
     )
-    return evaluate(inp)
+
+
+@pytest.fixture(scope="module")
+def evaluation() -> Phase3Evaluation:
+    return evaluate(_inputs())
 
 
 # -- pure rules ---------------------------------------------------------------------------------------
@@ -285,3 +289,65 @@ def test_report_period_choices_match_the_schedule(evaluation: Phase3Evaluation) 
     assert walk is not None
     for start, key in walk.schedule:
         assert f"| {start:%Y-%m-%d} | {key or 'flat'} |" in text
+
+
+# -- D-091: the slippage sensitivity is reported, never gating ----------------------------------------
+
+
+@pytest.fixture(scope="module")
+def sensitive() -> Phase3Evaluation:
+    """The same inputs plus a (deliberately different) sensitivity cost model."""
+    return evaluate(_inputs(sensitivity_costs=STRESS_COSTS))
+
+
+def test_without_sensitivity_costs_nothing_is_attached_and_no_block_is_printed(
+    evaluation: Phase3Evaluation,
+) -> None:
+    assert not evaluation.sensitivity_benchmark
+    assert all(not s.sensitivity for s in (evaluation.s0, *evaluation.candidates))
+    assert "## Slippage sensitivity" not in render_report(evaluation, SPEC)
+
+
+def test_sensitivity_is_populated_in_both_fill_modes_for_every_contender(sensitive: Phase3Evaluation) -> None:
+    assert set(sensitive.sensitivity_benchmark) == {MD, NO}
+    for s in (sensitive.s0, *sensitive.candidates):
+        assert set(s.sensitivity) == {MD, NO}
+        # a costlier model cannot make the same fixed schedule cheaper
+        assert s.sensitivity[MD].fees_paid + s.sensitivity[MD].slippage_cost >= (
+            s.pooled[MD].fees_paid + s.pooled[MD].slippage_cost
+        )
+
+
+def test_sensitivity_never_changes_a_selection_a_gate_dsr_pbo_or_x(
+    evaluation: Phase3Evaluation, sensitive: Phase3Evaluation
+) -> None:
+    assert sensitive.x == evaluation.x and sensitive.qualified == evaluation.qualified
+    assert sensitive.n_trials == evaluation.n_trials
+    assert dict(sensitive.trial_sharpes) == dict(evaluation.trial_sharpes)
+    pairs = zip((sensitive.s0, *sensitive.candidates), (evaluation.s0, *evaluation.candidates), strict=True)
+    for a, b in pairs:
+        assert a.gates == b.gates and a.reported == b.reported
+        assert a.dsr == b.dsr and a.pbo == b.pbo
+        assert (a.walk is None) == (b.walk is None)  # S0 has no walk
+        if a.walk is not None and b.walk is not None:
+            assert a.walk.schedule == b.walk.schedule
+        assert a.pooled[MD].equity == b.pooled[MD].equity  # the run costs still drive the headline series
+
+
+def test_report_shows_the_sensitivity_block_marked_not_gating(sensitive: Phase3Evaluation) -> None:
+    text = render_report(sensitive, SPEC)
+    assert "sensitivity, not gating (D-091)" in text
+    block = text.split("sensitivity, not gating (D-091)", 1)[1].split("\n## ", 1)[0]
+    for s in (sensitive.s0, *sensitive.candidates):
+        for mode in (MD, NO):
+            assert f"| {s.name} ({mode.value}) |" in block
+    assert f"buy-and-hold ({MD.value})" in block and f"buy-and-hold ({NO.value})" in block
+    assert "PROPOSED" not in text and "open reading" not in text
+
+
+def test_report_pbo_line_names_the_gating_convention_and_the_informational_share(
+    evaluation: Phase3Evaluation,
+) -> None:
+    text = render_report(evaluation, SPEC)
+    assert "lambda <= 0, the gating value, D-093" in text
+    assert "share with lambda < 0, for information only" in text

@@ -11,7 +11,7 @@ from tbot.validation.run_record import RunRecord, append_run_record, git_head, r
 
 
 def _record(outcome: str = "evaluated") -> RunRecord:
-    return RunRecord(outcome, "abc", "10 bps", False, 17, problems=("p1",))
+    return RunRecord(outcome, "abc", "10 bps", False, 14, problems=("p1",))
 
 
 def test_records_are_appended_never_rewritten(tmp_path: Path) -> None:
@@ -22,7 +22,7 @@ def test_records_are_appended_never_rewritten(tmp_path: Path) -> None:
     rows = read_run_records(path)
     assert [r.outcome for r in rows] == ["preflight-failed", "evaluated"]
     assert rows[0].started_utc == "2026-10-12T09:00:00+00:00"
-    assert rows[0].problems == ("p1",) and rows[0].non_s0_trials == 17
+    assert rows[0].problems == ("p1",) and rows[0].non_s0_trials == 14
     assert len(path.read_text(encoding="utf-8").splitlines()) == 2
 
 

@@ -7,8 +7,8 @@
   (ending at ``holdout_start``, computed only from pre-holdout data); each +-1-step neighbour keeps >= 70 %
   of P's fixed-parameter pooled OOS manual-delay Sharpe (``gates.neighbour_gate``).
 * **ETH/USDT and indices** (``reuse_run``): BTC's per-period choices are reused unchanged, nothing is
-  re-selected. For the indices (Stooq, daily, 252-day annualisation) a period whose BTC choice is a 4h point
-  is flat (``index_schedule``); they are reported for context only and never gate.
+  re-selected. All Phase 3 points are daily (D-090), so the indices (Stooq, daily, 252-day annualisation) run
+  the same schedule; they are reported for context only and never gate.
 * **x2 cost stress**: the BTC schedule is kept and the pooled series is re-run with the stressed costs
   (``CostSpec.stressed``; selection is NOT redone under the stressed costs: stress asks whether the
   selected strategy survives dearer trading, not what a different selection would have been).
@@ -45,7 +45,6 @@ __all__ = [
     "NeighbourResult",
     "fixed_pooled",
     "fixed_pooled_all",
-    "index_schedule",
     "neighbour_test",
     "parse_stooq_csv",
     "reuse_run",
@@ -64,7 +63,7 @@ def fixed_pooled(
     """The point's fixed-parameter pooled OOS series: the same days, engine and costs as the walk-forward."""
     schedule: list[tuple[datetime, str | None]] = [(spec.first_test_start, point.key)]
     return pooled_run(
-        market, schedule, factory, {point.key: point.timeframe}, spec, mode, costs, strategy_id=point.key
+        market, schedule, factory, spec, mode, costs, strategy_id=point.key
     )
 
 
@@ -118,43 +117,30 @@ def neighbour_test(
 # -- reuse of BTC's choices on other markets -----------------------------------------------------------
 
 
-def index_schedule(
-    schedule: Sequence[tuple[datetime, str | None]], timeframes: Mapping[str, Timeframe]
-) -> list[tuple[datetime, str | None]]:
-    """Indices have daily bars only: a period whose BTC choice is a 4h point is flat (SPEC 7.2 I)."""
-    return [(s, None if k is not None and timeframes[k] is not Timeframe.D1 else k) for s, k in schedule]
-
-
 def reuse_run(
     market: Market,
     result: CandidateResult,
-    candidate: Candidate,
     factory: StrategyFactory,
     spec: WalkForwardSpec,
     mode: FillMode,
     costs: CostSpec,
-    *,
-    daily_only: bool = False,
 ) -> SeriesRun:
-    """The candidate's BTC schedule replayed on ``market`` unchanged (ETH: all; indices: daily only)."""
-    timeframes = {p.key: p.timeframe for p in candidate.points}
-    schedule = list(result.schedule)
-    if daily_only:
-        schedule = index_schedule(schedule, timeframes)
-    return pooled_run(market, schedule, factory, timeframes, spec, mode, costs, strategy_id=candidate.name)
+    """The candidate's BTC schedule replayed on ``market`` unchanged (ETH/USDT and the indices)."""
+    return pooled_run(
+        market, list(result.schedule), factory, spec, mode, costs, strategy_id=result.name
+    )
 
 
 def stress_run(
     market: Market,
     result: CandidateResult,
-    candidate: Candidate,
     factory: StrategyFactory,
     spec: WalkForwardSpec,
     costs: CostSpec,
     mode: FillMode = FillMode.MANUAL_DELAY,
 ) -> SeriesRun:
     """The BTC schedule (selected under the normal costs) re-run with the stressed costs."""
-    return reuse_run(market, result, candidate, factory, spec, mode, costs)
+    return reuse_run(market, result, factory, spec, mode, costs)
 
 
 # -- Stooq index data ------------------------------------------------------------------------------------

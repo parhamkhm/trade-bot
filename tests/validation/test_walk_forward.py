@@ -19,11 +19,12 @@ from __future__ import annotations
 import random
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from itertools import pairwise
 
 import pytest
 
-from tbot.core.types import Strategy, Timeframe
+from tbot.core.types import BarWindow, Strategy, Timeframe
 from tbot.strategies.buy_and_hold import BuyAndHold
 from tbot.validation.grid import HOLDOUT_START, SPEC_PERIODS, make_periods
 from tbot.validation.runs import (
@@ -59,6 +60,7 @@ from tests.validation.wf_fixtures import (
     FIRST_TRADABLE,
     POINTS,
     SPEC,
+    StopAwareSma,
     factory,
     fake_run,
     make_market,
@@ -240,9 +242,8 @@ def fixed_runs(market: Market) -> Fixed:
 
 
 def test_composite_is_flat_before_its_first_start_and_while_the_key_is_none(market: Market) -> None:
-    tf = {"T-sma10": D1}
     sched = [(SPEC.periods[0].start, None), (BOUNDARY, "T-sma10")]
-    run = pooled_run(market, sched, factory, tf, SPEC, NO, NORMAL_COSTS, strategy_id="x")
+    run = pooled_run(market, sched, factory, SPEC, NO, NORMAL_COSTS, strategy_id="x")
     before = run.returns_between(SPEC.periods[0].start, BOUNDARY)
     assert before and all(r == 0.0 for r in before)
     assert run.n_fills >= 1  # it did trade once the key appeared
@@ -263,7 +264,7 @@ def test_pooled_series_of_one_point_is_a_slice_of_its_fixed_anchored_run(
     assert isinstance(costs, CostSpec)
     key = "T-sma10"
     sched = [(p.start, key) for p in SPEC.periods]
-    pooled = pooled_run(market, sched, factory, {key: D1}, SPEC, mode, costs, strategy_id="x")
+    pooled = pooled_run(market, sched, factory, SPEC, mode, costs, strategy_id="x")
     baseline, end = _baseline(market, SPEC.first_test_start), _end(market, SPEC)
     fixed = run_fixed(market, factory(key), D1, mode, costs, end=end)
     keep = [i for i, t in enumerate(fixed.ts) if t >= baseline]
@@ -278,7 +279,7 @@ def test_pooled_series_of_one_point_is_a_slice_of_its_fixed_anchored_run(
 def test_a_position_entered_before_the_first_test_day_is_carried_into_it(market: Market) -> None:
     """A flat-start replay is 0.0 on day one if no signal formed that day; the anchored one is invested."""
     key = "T-sma10"
-    anchored = pooled_run(market, [(SPEC.periods[0].start, key)], factory, {key: D1}, SPEC, NO, NORMAL_COSTS)
+    anchored = pooled_run(market, [(SPEC.periods[0].start, key)], factory, SPEC, NO, NORMAL_COSTS)
     baseline = _baseline(market, SPEC.first_test_start)
     fixed = run_fixed(market, factory(key), D1, NO, NORMAL_COSTS, end=_end(market, SPEC))
     entries_before = fixed.n_fills - anchored.n_fills
@@ -296,14 +297,12 @@ def test_anchor_schedule_applies_the_first_choice_from_the_data_start(market: Ma
         anchor_schedule(market, [])
 
 
-def test_key_at_and_decision_bars(market: Market) -> None:
+def test_key_at_and_the_schedule_validation(market: Market) -> None:
     comp = CompositeStrategy(
         strategy_id="c",
         market=market,
         schedule=[(BOUNDARY, "T-sma10")],
         factory=factory,
-        timeframes={"T-sma10": D1},
-        feed_timeframe=D1,
     )
     assert comp.key_at(BOUNDARY - timedelta(seconds=1)) is None
     assert comp.key_at(BOUNDARY) == "T-sma10"
@@ -313,27 +312,41 @@ def test_key_at_and_decision_bars(market: Market) -> None:
             market=market,
             schedule=[(BOUNDARY, "a"), (BOUNDARY, "b")],
             factory=factory,
-            timeframes={"a": D1, "b": D1},
-            feed_timeframe=D1,
         )
+
+
+class _AwareBuyAndHold(BuyAndHold):
+    """Constant-weight stand-in that is ``StopOutAware`` (it never reports a stop-out)."""
+
+    def stopped_out_on(self, window: BarWindow) -> bool:  # noqa: ARG002
+        return False
+
+
+class _NoStopSma(StopAwareSma):
+    """SMA filter whose protective stop sits at 1 % of the entry price, so it never triggers."""
+
+    def stop_price(self, window: BarWindow, entry_price: Decimal) -> Decimal:  # noqa: ARG002
+        return entry_price / 100
+
+
+def _no_stop_sma(key: str) -> Strategy:
+    return _NoStopSma(int(key.removeprefix("T-sma")))
 
 
 def _const(weights: dict[str, float]) -> Callable[[str], Strategy]:
     def make(key: str) -> Strategy:
         # stop_fraction 0.99: the stand-in's protective stop (engine-enforced since PR #26) sits at 1 % of
         # the entry price, so it can never trigger and these tests isolate the boundary trade
-        return BuyAndHold(weight=weights[key], stop_fraction=0.99)
+        return _AwareBuyAndHold(weight=weights[key], stop_fraction=0.99)
 
     return make
 
 
 def test_a_parameter_change_at_a_boundary_is_charged_as_a_trade(market: Market) -> None:
-    tf = {"a": D1, "b": D1}
     fac = _const({"a": 1.0, "b": 0.4})
-    only_a = pooled_run(market, [(SPEC.periods[0].start, "a")], fac, tf, SPEC, NO, NORMAL_COSTS)
-    a_then_b = pooled_run(
-        market, [(SPEC.periods[0].start, "a"), (BOUNDARY, "b")], fac, tf, SPEC, NO, NORMAL_COSTS
-    )
+    only_a = pooled_run(market, [(SPEC.periods[0].start, "a")], fac, SPEC, NO, NORMAL_COSTS)
+    switch = [(SPEC.periods[0].start, "a"), (BOUNDARY, "b")]
+    a_then_b = pooled_run(market, switch, fac, SPEC, NO, NORMAL_COSTS)
     assert only_a.n_fills == 0  # entered at the anchor, long before the slice: no trade inside it
     # the cut from 1.0 to 0.4 at the boundary is a sale inside the slice (later band rebalances may add more)
     assert a_then_b.n_fills >= 1
@@ -341,7 +354,6 @@ def test_a_parameter_change_at_a_boundary_is_charged_as_a_trade(market: Market) 
 
 
 def test_blend_target_is_the_equal_weight_mean(market: Market) -> None:
-    tf = {"a": D1, "b": D1}
     fac = _const({"a": 1.0, "b": 0.0})
     members = [
         CompositeStrategy(
@@ -349,8 +361,6 @@ def test_blend_target_is_the_equal_weight_mean(market: Market) -> None:
             market=market,
             schedule=[(SPEC.periods[0].start, key)],
             factory=fac,
-            timeframes=tf,
-            feed_timeframe=D1,
         )
         for i, key in enumerate(("a", "b"))
     ]
@@ -363,10 +373,9 @@ def test_blend_target_is_the_equal_weight_mean(market: Market) -> None:
 
 
 def test_blend_run_matches_a_single_member_when_only_one_member_is_given(market: Market) -> None:
-    tf = {"T-sma10": D1}
     sched = [(SPEC.periods[0].start, "T-sma10")]
-    single = pooled_run(market, sched, factory, tf, SPEC, NO, NORMAL_COSTS)
-    blended = blend_run(market, [sched], factory, tf, SPEC, NO, NORMAL_COSTS)
+    single = pooled_run(market, sched, _no_stop_sma, SPEC, NO, NORMAL_COSTS)
+    blended = blend_run(market, [sched], _no_stop_sma, SPEC, NO, NORMAL_COSTS)
     assert blended.returns == single.returns
 
 
