@@ -21,8 +21,10 @@ import pytest
 from tbot.core.types import Bar, BarWindow, Timeframe
 from tbot.strategies.base import validate_strategy
 from tbot.strategies.phase3_registry import PHASE3_ENTRIES, load
-from tbot.strategies.s0_sma100 import PositionState, ReplayStrategy, S0Sma100, make
+from tbot.strategies.replay import PositionState, ReplayStrategy
+from tbot.strategies.s0_sma100 import S0Sma100, make
 from tests.sim_helpers import make_bar
+from tests.strategies.replay_checks import assert_no_lookahead
 from tests.validation.data import find_parquet_root, real_bars, synthetic_bars
 
 D1 = Timeframe.D1
@@ -55,18 +57,6 @@ def window(bars: Sequence[Bar], n: int | None = None) -> BarWindow:
 def states(strategy: ReplayStrategy, bars: Sequence[Bar], first: int = 151) -> list[PositionState]:
     """State after the close of every bar from window length ``first`` on, one growing window at a time."""
     return [strategy.state(window(bars, n)) for n in range(first, len(bars) + 1)]
-
-
-def trace(
-    strategy: ReplayStrategy, bars: Sequence[Bar], n_bars: int
-) -> list[tuple[float, PositionState, Decimal | None]]:
-    """(target weight, state, fixed stop) for every window length warmup_bars .. n_bars."""
-    out = []
-    for n in range(strategy.warmup_bars, n_bars + 1):
-        w = window(bars, n)
-        intent = strategy.on_bar(w)
-        out.append((intent.target_weight, strategy.state(w), strategy.active_stop(w)))
-    return out
 
 
 # ---- construction ----------------------------------------------------------------------------------
@@ -233,7 +223,7 @@ def test_sizing_is_vol_target_over_sigma_hat() -> None:
 
 def test_sma_variant_uses_its_own_window() -> None:
     # SMA 200 needs 200 closes: bar 150's close is above SMA100 (the S0 baseline) but there is no SMA200 yet
-    s200 = make(timeframe=D1, sma_n=200)
+    s200 = make(timeframe=D1, sma_n=200, anchor=None)  # unit fixtures do not start at the anchor
     bars = [*baseline(), *[bar(151 + k, "101", "102", "101", "102") for k in range(60)]]
     assert s200.state(window(bars, 199)) is FLAT
     assert s200.state(window(bars, 200)) is LONG  # close 102 > SMA200 and close #200 is tradable
@@ -278,29 +268,67 @@ def test_cache_is_discarded_when_history_changes_or_the_window_goes_backwards() 
     assert used.state(w) is S0Sma100().state(w)
 
 
+# ---- boundary: exact equality --------------------------------------------------------------------------
+
+
+def equality_series(last_close: str) -> list[Bar]:
+    """Ranging bars (high = close + 5, low = close - 5) whose last close equals SMA100 exactly when 100.
+
+    Closes are 100 except bars 52 and 53 (98) and bar 150 (104). SMA100 at bar 150 is (100 + 98 + 98 +
+    96 x 100 + 104) / 100 = 100 < 104 (entry signal); at bar 151 it is (98 + 98 + 96 x 100 + 104 + c) / 100,
+    which is exactly c for c = 100. The ranges make ATR20 = 10, so the stop (open 104 - 30 = 74) stays
+    untouched
+    and only the SMA rule can act on bar 151.
+    """
+    closes = [100.0] * 150
+    closes[52] = closes[53] = 98.0
+    closes.append(104.0)
+    bars = [
+        make_bar(i, str(closes[max(i - 1, 0)]), str(c), high=str(c + 5), low=str(c - 5))
+        for i, c in enumerate(closes)
+    ]
+    c = Decimal(last_close)
+    bars.append(make_bar(151, "104", last_close, high=str(max(Decimal(109), c)), low="95"))
+    return bars
+
+
+def test_close_equal_to_the_sma_exits_a_long_position() -> None:
+    s0 = S0Sma100()
+    bars = equality_series("100")
+    assert s0.state(window(bars, 151)) is LONG  # close 104 > SMA100 100 on bar 150
+    assert s0.state(window(bars)) is FLAT  # close 100 == SMA100 100 -> LONG -> FLAT (no stop involved)
+    assert s0.on_bar(window(bars)).target_weight == 0.0
+
+
+def test_close_just_above_the_sma_keeps_the_position_long() -> None:
+    s0 = S0Sma100()
+    bars = equality_series("100.01")  # SMA100 = 100.0001 < close
+    assert s0.state(window(bars)) is LONG
+    assert s0.active_stop(window(bars)) == Decimal("74")
+
+
+def test_close_equal_to_the_sma_does_not_enter_a_flat_strategy() -> None:
+    s0 = S0Sma100()
+    bars = flat_prefix(160)  # every close and the SMA100 are 100 exactly
+    assert s0.state(window(bars)) is FLAT
+    assert s0.on_bar(window(bars)).target_weight == 0.0
+
+
 # ---- truncation: nothing at bar > N may change a decision at bar <= N ------------------------------------
 
 
-def assert_truncation_invariant(make_strategy: type[S0Sma100], bars: Sequence[Bar], n: int, k: int) -> None:
-    short = trace(make_strategy(), bars, n)
-    long = trace(make_strategy(), bars, n + k)
-    assert long[: len(short)] == short
-
-
-def test_truncation_synthetic_series_has_stop_outs_and_still_matches() -> None:
+def test_no_lookahead_on_a_synthetic_series_with_every_state() -> None:
     bars = wicky_bars(900, seed=3)
-    seen = {s for _, s, _ in trace(S0Sma100(), bars, len(bars))}
+    seen = assert_no_lookahead(S0Sma100, bars)
     assert seen == {FLAT, LONG, STOPPED}, f"synthetic series does not exercise every state: {seen}"
-    for n, k in ((300, 1), (450, 37), (700, 200)):
-        assert_truncation_invariant(S0Sma100, bars, n, k)
 
 
 @needs_store
-def test_truncation_on_real_binance_btcusdt_1d_before_the_holdout() -> None:
+def test_no_lookahead_on_real_binance_btcusdt_1d_before_the_holdout() -> None:
     bars = real_bars("BTCUSDT", D1, datetime(2018, 1, 1, tzinfo=UTC), datetime(2025, 10, 1, tzinfo=UTC))
     assert bars[0].ts == datetime(2018, 1, 2, tzinfo=UTC) and bars[-1].ts < datetime(2025, 10, 1, tzinfo=UTC)
     assert len(bars) > 2800
-    for n, k in ((1500, 1), (2200, 150)):
-        assert_truncation_invariant(S0Sma100, bars, n, k)
+    seen = assert_no_lookahead(lambda: make(timeframe=D1), bars)
+    assert {FLAT, LONG} <= seen
     # first tradable close is #151, i.e. 2018-06-01 00:00 UTC
     assert bars[150].ts == datetime(2018, 6, 1, tzinfo=UTC)

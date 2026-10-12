@@ -17,14 +17,15 @@ from tbot.strategies.base import validate_strategy
 from tbot.strategies.donchian import DonchianEnsemble, make
 from tbot.strategies.phase3_registry import PHASE3_ENTRIES, load
 from tests.sim_helpers import make_bar
+from tests.strategies.replay_checks import assert_no_lookahead
 from tests.strategies.test_s0_sma100 import (
     FLAT,
     LONG,
     STOPPED,
     baseline,
+    flat_prefix,
     needs_store,
     states,
-    trace,
     wicky_bars,
     window,
 )
@@ -210,27 +211,44 @@ def test_incremental_calls_equal_a_fresh_replay(lookbacks: Lookbacks) -> None:
         assert incremental.active_stop(w) == fresh.active_stop(w)
 
 
-# ---- truncation ----------------------------------------------------------------------------------------
+# ---- boundary: exact equality --------------------------------------------------------------------------
+
+
+def test_close_equal_to_the_upper_channel_does_not_turn_the_channel_long() -> None:
+    rows = [("10", "8", "9"), ("11", "9", "10"), ("12", "10", "11")]  # n=2 at i2: U = max(10, 11) = 11
+    assert channels((2, 3, 4), rows)[2] == (False, False, False)  # close 11 == U: not a breakout
+    above = [*rows[:2], ("12", "10", "11.01")]
+    assert channels((2, 3, 4), above)[2] == (True, False, False)
+
+
+def test_close_equal_to_the_mid_channel_keeps_the_channel_state() -> None:
+    # i2: n=2 turns long; at i3 U = 12, L = 9, M = 10.5 for n=2
+    head = [("10", "8", "9"), ("11", "9", "10"), ("12", "10", "11.5")]
+    assert channels((2, 3, 4), [*head, ("12", "10", "10.5")])[3][0] is True  # close == M: keeps long
+    assert channels((2, 3, 4), [*head, ("12", "10", "10.49")])[3][0] is False  # just below M: flat
+
+
+def test_a_flat_strategy_does_not_enter_on_a_close_equal_to_every_upper_channel() -> None:
+    c1 = DonchianEnsemble((1, 2, 3))
+    bars = [*flat_prefix(), make_bar(150, "100", "100")]  # 150 flat bars at 100: U = 100 for every n
+    assert c1.channel_states(window(bars)) == (False, False, False)
+    assert c1.state(window(bars)) is FLAT
+
+
+# ---- truncation -----------------------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("lookbacks", GRID)
-def test_truncation_on_synthetic_data(lookbacks: Lookbacks) -> None:
+def test_no_lookahead_on_a_synthetic_series(lookbacks: Lookbacks) -> None:
     bars = wicky_bars(900, seed=3)
-    seen = {s for _, s, _ in trace(DonchianEnsemble(lookbacks), bars, len(bars))}
+    seen = assert_no_lookahead(lambda: DonchianEnsemble(lookbacks), bars)
     assert {FLAT, LONG} <= seen, seen
-    for n, k in ((300, 1), (450, 37), (700, 200)):
-        short = trace(DonchianEnsemble(lookbacks), bars, n)
-        longer = trace(DonchianEnsemble(lookbacks), bars, n + k)
-        assert longer[: len(short)] == short
 
 
 @needs_store
 @pytest.mark.parametrize("lookbacks", GRID)
-def test_truncation_on_real_binance_btcusdt_1d_before_the_holdout(lookbacks: Lookbacks) -> None:
+def test_no_lookahead_on_real_binance_btcusdt_1d_before_the_holdout(lookbacks: Lookbacks) -> None:
     bars = real_bars("BTCUSDT", D1, datetime(2018, 1, 1, tzinfo=UTC), datetime(2025, 10, 1, tzinfo=UTC))
     assert bars[-1].ts < datetime(2025, 10, 1, tzinfo=UTC)
-    for n, k in ((1500, 1), (2200, 150)):
-        short = trace(DonchianEnsemble(lookbacks), bars, n)
-        longer = trace(DonchianEnsemble(lookbacks), bars, n + k)
-        assert longer[: len(short)] == short
-    assert LONG in {s for _, s, _ in trace(DonchianEnsemble(lookbacks), bars, 2200)}
+    seen = assert_no_lookahead(lambda: make(timeframe=D1, lookbacks=lookbacks), bars)
+    assert LONG in seen
