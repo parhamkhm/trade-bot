@@ -1,0 +1,558 @@
+"""Engine runs for the Phase 3 harness: markets, fill modes, costs, fixed-parameter and composite runs.
+
+Everything here goes through the public engine API (``run_backtest`` with a ``BacktestConfig``); nothing in
+the engine is reimplemented. Two engine generations are supported without touching either: the base engine
+(``BacktestConfig.drift_tolerance``, no stop execution) and the engine of the stops/band PR
+(``rebalance_band``, ``enforce_stops``). Fields that exist only in one of them are looked up with
+``dataclasses.fields`` / ``inspect.signature`` and set only if present, so this module imports,
+type-checks and runs on both.
+
+Pooled out-of-sample runs
+=========================
+A *composite* strategy (``CompositeStrategy``) follows a per-period schedule (period start -> grid key or
+``None`` for flat) and, at every decision bar, asks the scheduled child strategy for its target weight. Each
+child is called with the **full causal history from the data start**, rebuilt from the market's own series by
+timestamp, so a child that replays from the anchor (SPEC 7.1) sees exactly what it would see in a run that
+started at the anchor, and the harness never has to ``slice`` a window by index in the engine's frame.
+
+Because the composite is flat before the first test period and the feed starts one daily close earlier, the
+entry into the first position is charged like any other trade, and a parameter change at a boundary is traded
+through the engine's normal rebalance rule (the 25 % band, SPEC 7.2 C) -- that is the SPEC's "charged as a
+trade". A 4h point's decisions run on a 4h feed; a daily point on a 4h feed is consulted only at the 00:00
+closes, and between them the composite holds its last target (``GatingRiskManager`` turns off-schedule bars
+into no-ops).
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import inspect
+from bisect import bisect_left, bisect_right
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from decimal import Decimal
+from enum import StrEnum
+from itertools import pairwise
+from typing import Any
+
+from tbot.backtest.config import BacktestConfig
+from tbot.backtest.engine import run_backtest
+from tbot.backtest.feed import BacktestFeed
+from tbot.backtest.result import BacktestResult
+from tbot.backtest.risk_stub import StubRiskManager
+from tbot.core.config import CostConfig
+from tbot.core.types import (
+    Approved,
+    Bar,
+    BarWindow,
+    MarketState,
+    PortfolioView,
+    RiskDecision,
+    RiskManager,
+    Strategy,
+    SymbolFilters,
+    TargetIntent,
+    Timeframe,
+)
+from tbot.strategies.buy_and_hold import BuyAndHold
+from tbot.validation.stats import annualised_sharpe, max_drawdown_of_returns
+
+__all__ = [
+    "NORMAL_COSTS",
+    "STRESS_COSTS",
+    "BlendStrategy",
+    "CompositeStrategy",
+    "CostSpec",
+    "FillMode",
+    "GatingRiskManager",
+    "Market",
+    "SeriesRun",
+    "StrategyFactory",
+    "default_filters",
+    "engine_supports_stops_and_band",
+    "run_buy_and_hold",
+    "run_composite",
+    "run_fixed",
+]
+
+StrategyFactory = Callable[[str], Strategy]
+"""key -> a FRESH strategy instance (strategies replay from the anchor and cache; never share them)."""
+
+_DELAY = timedelta(hours=6)
+
+
+class FillMode(StrEnum):
+    NEXT_OPEN = "next_open"
+    MANUAL_DELAY = "manual_delay"  # the gating mode: 6 h after the signal close, on 1h bars
+
+
+@dataclass(frozen=True)
+class CostSpec:
+    """Fee and slippage per side in bps (SPEC 7.2 F). Every Phase 3 number built from these is PROVISIONAL."""
+
+    fee_bps: Decimal
+    slippage_bps: Decimal
+    label: str
+
+    def to_cost_config(self) -> CostConfig:
+        return CostConfig(
+            taker_fee_bps=self.fee_bps,
+            maker_fee_bps=self.fee_bps,
+            slippage_bps=self.slippage_bps,
+            slippage_provisional=True,
+        )
+
+
+NORMAL_COSTS = CostSpec(Decimal(10), Decimal(5), "10 bps fee + 5 bps slippage (PROVISIONAL flat slippage)")
+STRESS_COSTS = CostSpec(Decimal(20), Decimal(10), "x2 stress: 20 bps fee + 10 bps slippage (PROVISIONAL)")
+
+
+def default_filters(symbol: str) -> SymbolFilters:
+    """LBank-like placeholder rules (price 2, quantity 5, min notional 1 USDT); the harness ignores them."""
+    return SymbolFilters(
+        symbol=symbol,
+        tick_size=Decimal("0.01"),
+        step_size=Decimal("0.00001"),
+        min_qty=Decimal("0.00001"),
+        min_notional=Decimal(1),
+    )
+
+
+class Market:
+    """One instrument's bars by timeframe plus cached feeds. The daily series is required."""
+
+    def __init__(
+        self,
+        symbol: str,
+        bars: Mapping[Timeframe, Sequence[Bar]],
+        *,
+        filters: SymbolFilters | None = None,
+        periods_per_year: float = 365.0,
+        base_asset: str = "BTC",
+    ) -> None:
+        if Timeframe.D1 not in bars or not bars[Timeframe.D1]:
+            raise ValueError("a market needs daily bars")
+        self.symbol = symbol
+        self.filters = filters or default_filters(symbol)
+        self.periods_per_year = periods_per_year
+        self.base_asset = base_asset
+        self._bars: dict[Timeframe, tuple[Bar, ...]] = {}
+        self._ts: dict[Timeframe, list[datetime]] = {}
+        for tf, seq in bars.items():
+            tup = tuple(seq)
+            if any(b.symbol != symbol or b.timeframe != tf for b in tup):
+                raise ValueError(f"foreign bar in {symbol}/{tf}")
+            ts = [b.ts for b in tup]
+            if any(b <= a for a, b in pairwise(ts)):
+                raise ValueError(f"{symbol}/{tf} bars must have strictly increasing close times")
+            self._bars[tf] = tup
+            self._ts[tf] = ts
+        self._feeds: dict[tuple[Timeframe, datetime | None, datetime | None], BacktestFeed] = {}
+
+    def has(self, tf: Timeframe) -> bool:
+        return tf in self._bars and bool(self._bars[tf])
+
+    def series(self, tf: Timeframe) -> tuple[Bar, ...]:
+        return self._bars[tf]
+
+    def closes(self, tf: Timeframe) -> list[datetime]:
+        return self._ts[tf]
+
+    @property
+    def daily_closes(self) -> list[datetime]:
+        return self._ts[Timeframe.D1]
+
+    @property
+    def last_close(self) -> datetime:
+        return self._ts[Timeframe.D1][-1]
+
+    def feed(self, tf: Timeframe, lo: datetime | None = None, hi: datetime | None = None) -> BacktestFeed:
+        """Bars with ``lo <= ts <= hi`` (cached; the feed is re-iterable)."""
+        key = (tf, lo, hi)
+        if key not in self._feeds:
+            ts = self._ts[tf]
+            i = 0 if lo is None else bisect_left(ts, lo)
+            j = len(ts) if hi is None else bisect_right(ts, hi)
+            self._feeds[key] = BacktestFeed(list(self._bars[tf][i:j]))
+        return self._feeds[key]
+
+    def window_to(self, tf: Timeframe, ts: datetime) -> BarWindow | None:
+        """All closed bars of ``tf`` with close time <= ``ts`` (None if none). Causal by construction."""
+        k = bisect_right(self._ts[tf], ts)
+        if k == 0:
+            return None
+        return _window(self.symbol, tf, self._bars[tf][:k])
+
+    def truncated(self, end: datetime) -> Market:
+        """The same market with every bar closing after ``end`` removed."""
+        return Market(
+            self.symbol,
+            {tf: [b for b in bars if b.ts <= end] for tf, bars in self._bars.items()},
+            filters=self.filters,
+            periods_per_year=self.periods_per_year,
+            base_asset=self.base_asset,
+        )
+
+
+def _window(symbol: str, tf: Timeframe, bars: tuple[Bar, ...]) -> BarWindow:
+    """``BarWindow`` without the O(n) revalidation (the bars come from a validated, ordered series)."""
+    window = object.__new__(BarWindow)
+    object.__setattr__(window, "symbol", symbol)
+    object.__setattr__(window, "timeframe", tf)
+    object.__setattr__(window, "bars", bars)
+    return window
+
+
+# -- engine compatibility ----------------------------------------------------------------------
+
+
+def _config_fields() -> frozenset[str]:
+    return frozenset(f.name for f in dataclasses.fields(BacktestConfig))
+
+
+def engine_supports_stops_and_band() -> bool:
+    """True iff the engine has the SPEC 7.1 stop execution and the 25 % relative band (the stops/band PR)."""
+    fields = _config_fields()
+    return "enforce_stops" in fields and "rebalance_band" in fields
+
+
+def _benchmark_overrides() -> dict[str, Any]:
+    """Config fields that make a buy-and-hold run trade exactly once: no stops, no rebalancing."""
+    fields = _config_fields()
+    out: dict[str, Any] = {}
+    if "enforce_stops" in fields:
+        out["enforce_stops"] = False
+    if "rebalance_band" in fields:
+        out["rebalance_band"] = 1.0
+    elif "drift_tolerance" in fields:
+        out["drift_tolerance"] = 0.99
+    return out
+
+
+def make_config(
+    market: Market,
+    timeframe: Timeframe,
+    fill_mode: FillMode,
+    costs: CostSpec,
+    *,
+    benchmark: bool = False,
+) -> BacktestConfig:
+    delayed = fill_mode is FillMode.MANUAL_DELAY
+    cfg = BacktestConfig(
+        symbol=market.symbol,
+        timeframe=timeframe,
+        filters=market.filters,
+        costs=costs.to_cost_config(),
+        base_asset=market.base_asset,
+        fill_delay=_DELAY if delayed else timedelta(0),
+        exec_timeframe=Timeframe.H1 if delayed else None,
+    )
+    if benchmark:
+        cfg = dataclasses.replace(cfg, **_benchmark_overrides())
+    return cfg
+
+
+def make_stub_risk(cfg: BacktestConfig) -> StubRiskManager:
+    """The engine's default ``StubRiskManager`` for ``cfg`` (built the way the engine builds it)."""
+    params = inspect.signature(StubRiskManager.__init__).parameters
+    kwargs: dict[str, Any] = {
+        "taker_fee_bps": cfg.costs.taker_fee_bps,
+        "slippage_bps": cfg.costs.slippage_bps,
+        "buy_buffer_bps": cfg.buy_buffer_bps,
+    }
+    if "rebalance_band" in params:
+        kwargs["rebalance_band"] = getattr(cfg, "rebalance_band", 0.25)
+    elif "drift_tolerance" in params:
+        kwargs["drift_tolerance"] = getattr(cfg, "drift_tolerance", 0.02)
+    return StubRiskManager(**kwargs)
+
+
+# -- results -----------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SeriesRun:
+    """A daily equity series (equity at the 00:00 closes) with the cost bookkeeping of the run."""
+
+    ts: tuple[datetime, ...]  # daily close times; ts[0] is the baseline of the first return
+    equity: tuple[float, ...]
+    periods_per_year: float
+    n_fills: int
+    fees_paid: float
+    slippage_cost: float
+    traded_notional: float
+    n_stop_events: int
+
+    @property
+    def return_ts(self) -> tuple[datetime, ...]:
+        return self.ts[1:]
+
+    @property
+    def returns(self) -> tuple[float, ...]:
+        e = self.equity
+        return tuple(e[i] / e[i - 1] - 1.0 if e[i - 1] > 0 else 0.0 for i in range(1, len(e)))
+
+    def returns_between(self, lo: datetime, hi: datetime) -> list[float]:
+        """Returns whose close time lies in ``[lo, hi)``."""
+        rts, rets = self.return_ts, self.returns
+        i, j = bisect_left(rts, lo), bisect_left(rts, hi)
+        return list(rets[i:j])
+
+    @property
+    def sharpe(self) -> float | None:
+        return annualised_sharpe(self.returns, self.periods_per_year)
+
+    @property
+    def max_drawdown(self) -> float:
+        return max_drawdown_of_returns(self.returns)
+
+    @property
+    def years(self) -> float:
+        return len(self.returns) / self.periods_per_year
+
+    @property
+    def mean_equity(self) -> float:
+        return sum(self.equity) / len(self.equity) if self.equity else 0.0
+
+    @property
+    def turnover_sides_per_year(self) -> float | None:
+        return self.n_fills / self.years if self.years > 0 else None
+
+    @property
+    def turnover_notional_per_year(self) -> float | None:
+        """Traded notional as a multiple of the mean equity, per year."""
+        if self.years <= 0 or self.mean_equity <= 0:
+            return None
+        return self.traded_notional / self.mean_equity / self.years
+
+    @property
+    def cost_drag_annual(self) -> float | None:
+        """(fees + slippage) / mean equity / years -- the same definition as ``backtest.metrics``."""
+        if self.years <= 0 or self.mean_equity <= 0:
+            return None
+        return (self.fees_paid + self.slippage_cost) / self.mean_equity / self.years
+
+
+def _is_daily_close(ts: datetime) -> bool:
+    return ts.hour == 0 and ts.minute == 0 and ts.second == 0
+
+
+def series_from_result(result: BacktestResult, *, periods_per_year: float, daily_only: bool) -> SeriesRun:
+    points = [p for p in result.equity if not daily_only or _is_daily_close(p.ts)]
+    return SeriesRun(
+        ts=tuple(p.ts for p in points),
+        equity=tuple(float(p.equity) for p in points),
+        periods_per_year=periods_per_year,
+        n_fills=len(result.fills),
+        fees_paid=float(result.fees_paid),
+        slippage_cost=float(result.slippage_cost),
+        traded_notional=float(result.traded_notional),
+        n_stop_events=len(getattr(result, "stop_events", ())),
+    )
+
+
+# -- composite strategy ------------------------------------------------------------------------
+
+
+class GatingRiskManager:
+    """Wraps a risk manager; at bars where ``is_decision_bar(ts)`` is false it approves a no-op."""
+
+    def __init__(self, inner: RiskManager, is_decision_bar: Callable[[datetime], bool]) -> None:
+        self._inner = inner
+        self._gate = is_decision_bar
+
+    def evaluate(self, intent: TargetIntent, portfolio: PortfolioView, market: MarketState) -> RiskDecision:
+        if not self._gate(intent.ts):
+            return Approved(intent, None, "off-schedule bar: the held target is unchanged")
+        return self._inner.evaluate(intent, portfolio, market)
+
+
+class CompositeStrategy:
+    """Follows a schedule of ``(start, key | None)``: flat before the first start and while the key is None.
+
+    A child whose timeframe is coarser than the feed is consulted only at the closes of its own timeframe
+    (daily child on a 4h feed: the 00:00 closes) and the last target is held in between.
+    """
+
+    warmup_bars = 1
+
+    def __init__(
+        self,
+        *,
+        strategy_id: str,
+        market: Market,
+        schedule: Sequence[tuple[datetime, str | None]],
+        factory: StrategyFactory,
+        timeframes: Mapping[str, Timeframe],
+        feed_timeframe: Timeframe,
+    ) -> None:
+        if not schedule or any(b[0] <= a[0] for a, b in pairwise(schedule)):
+            raise ValueError("schedule must be non-empty with strictly increasing starts")
+        self.id = strategy_id
+        self._market = market
+        self._starts = [s for s, _ in schedule]
+        self._keys = [k for _, k in schedule]
+        self._factory = factory
+        self._tf = dict(timeframes)
+        self._feed_tf = feed_timeframe
+        self._children: dict[str, Strategy] = {}
+        self._held = 0.0
+        for key in {k for k in self._keys if k is not None}:
+            if self._tf[key].delta < feed_timeframe.delta:
+                raise ValueError(f"{key} is finer than the feed timeframe {feed_timeframe}")
+
+    # -- schedule helpers --
+    def key_at(self, ts: datetime) -> str | None:
+        i = bisect_right(self._starts, ts) - 1
+        return None if i < 0 else self._keys[i]
+
+    def is_decision_bar(self, ts: datetime) -> bool:
+        key = self.key_at(ts)
+        if key is None:
+            return True
+        return self._tf[key] is self._feed_tf or _is_daily_close(ts)
+
+    def _child(self, key: str) -> Strategy:
+        if key not in self._children:
+            self._children[key] = self._factory(key)
+        return self._children[key]
+
+    # -- Strategy protocol --
+    def on_bar(self, window: BarWindow) -> TargetIntent:
+        ts = window.as_of
+        key = self.key_at(ts)
+        if key is None:
+            self._held = 0.0
+            return TargetIntent(self.id, ts, 0.0, "flat: no scheduled point")
+        if self.is_decision_bar(ts):
+            child_window = self._market.window_to(self._tf[key], ts)
+            child = self._child(key)
+            if child_window is None or len(child_window) < child.warmup_bars:
+                self._held = 0.0
+            else:
+                self._held = child.on_bar(child_window).target_weight
+        return TargetIntent(self.id, ts, self._held, f"{key}")
+
+    def stop_price(self, window: BarWindow, entry_price: Decimal) -> Decimal:
+        key = self.key_at(window.as_of)
+        if key is None:
+            raise ValueError("stop requested while no point is scheduled")
+        child_window = self._market.window_to(self._tf[key], window.as_of)
+        if child_window is None:
+            raise ValueError(f"no {self._tf[key]} history at {window.as_of}")
+        return self._child(key).stop_price(child_window, entry_price)
+
+
+class BlendStrategy:
+    """Equal-weight mean of member strategies' targets (S1); the stop of the first member is used.
+
+    All Phase 3 strategies share the same stop rule (``P_ref - 3 x ATR20``, SPEC 7.2 C), so which member
+    supplies it does not matter for the pre-registered members.
+    """
+
+    warmup_bars = 1
+
+    def __init__(self, strategy_id: str, members: Sequence[CompositeStrategy]) -> None:
+        if not members:
+            raise ValueError("a blend needs at least one member")
+        self.id = strategy_id
+        self._members = list(members)
+
+    def is_decision_bar(self, ts: datetime) -> bool:
+        return any(m.is_decision_bar(ts) for m in self._members)
+
+    def on_bar(self, window: BarWindow) -> TargetIntent:
+        weights = [m.on_bar(window).target_weight for m in self._members]
+        return TargetIntent(self.id, window.as_of, sum(weights) / len(weights), f"mean of {len(weights)}")
+
+    def stop_price(self, window: BarWindow, entry_price: Decimal) -> Decimal:
+        for member in self._members:
+            if member.key_at(window.as_of) is not None:
+                return member.stop_price(window, entry_price)
+        raise ValueError("stop requested while no member has a scheduled point")
+
+
+# -- runners -----------------------------------------------------------------------------------
+
+
+def _exec_feed(market: Market, lo: datetime, hi: datetime) -> BacktestFeed:
+    if not market.has(Timeframe.H1):
+        raise ValueError(f"{market.symbol}: the manual-delay model needs 1h execution bars")
+    return market.feed(Timeframe.H1, lo, hi)
+
+
+def run_fixed(
+    market: Market,
+    strategy: Strategy,
+    timeframe: Timeframe,
+    fill_mode: FillMode,
+    costs: CostSpec,
+    *,
+    end: datetime | None = None,
+) -> SeriesRun:
+    """One fixed-parameter run over the full history (from the first bar to the last daily close).
+
+    A 4h point runs on its own 4h feed; the daily equity series is read at the 00:00 closes.
+    """
+    last = end or market.last_close
+    first = market.series(timeframe)[0].ts
+    cfg = make_config(market, timeframe, fill_mode, costs)
+    exec_feed = _exec_feed(market, first, last) if fill_mode is FillMode.MANUAL_DELAY else None
+    result = run_backtest(market.feed(timeframe, None, last), strategy, cfg, exec_feed=exec_feed)
+    return series_from_result(result, periods_per_year=market.periods_per_year, daily_only=True)
+
+
+def run_composite(
+    market: Market,
+    strategy: CompositeStrategy | BlendStrategy,
+    feed_timeframe: Timeframe,
+    fill_mode: FillMode,
+    costs: CostSpec,
+    *,
+    baseline: datetime,
+    end: datetime,
+    benchmark: bool = False,
+) -> SeriesRun:
+    """A pooled run on ``[baseline, end]``: ``baseline`` is the daily close before the first test close."""
+    cfg = make_config(market, feed_timeframe, fill_mode, costs, benchmark=benchmark)
+    exec_feed = _exec_feed(market, baseline, end) if fill_mode is FillMode.MANUAL_DELAY else None
+    risk: RiskManager | None = None
+    if feed_timeframe is not Timeframe.D1:
+        risk = GatingRiskManager(make_stub_risk(cfg), strategy.is_decision_bar)
+    result = run_backtest(
+        market.feed(feed_timeframe, baseline, end), strategy, cfg, risk=risk, exec_feed=exec_feed
+    )
+    return series_from_result(result, periods_per_year=market.periods_per_year, daily_only=True)
+
+
+def run_buy_and_hold(
+    market: Market,
+    fill_mode: FillMode,
+    costs: CostSpec,
+    *,
+    first_test_close: datetime,
+    end: datetime,
+) -> SeriesRun:
+    """Weight 1 held over the pooled test days: entered once at the first decision, never rebalanced, no stop.
+
+    Same fee and slippage as the strategy runs (SPEC 7.2 E). The decision is taken at the first test close
+    (``first_test_close``) like the strategies' first decision, and fills per ``fill_mode``.
+    """
+    closes = market.daily_closes
+    idx = bisect_left(closes, first_test_close)
+    if idx == 0:
+        raise ValueError("need a daily close before the first test close as the return baseline")
+    baseline = closes[idx - 1]
+    bh = BuyAndHold(weight=1.0, warmup_bars=1)
+    composite = CompositeStrategy(
+        strategy_id="buy_and_hold",
+        market=market,
+        schedule=[(first_test_close, "BH")],
+        factory=lambda _key: bh,
+        timeframes={"BH": Timeframe.D1},
+        feed_timeframe=Timeframe.D1,
+    )
+    return run_composite(
+        market, composite, Timeframe.D1, fill_mode, costs, baseline=baseline, end=end, benchmark=True
+    )
