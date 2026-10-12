@@ -59,7 +59,9 @@ is handed each execution bar as it becomes available:
   what is cancelled around it is the ENGINE's business; the broker only prices the exit.
 
 Fees and slippage come from ``FeeSchedule`` / ``SlippageModel`` objects built from configuration.
-``SlippageModel`` is the hook where the depth-curve model of SPEC section 7 (G3) plugs in later.
+``SlippageModel`` is the hook for the depth-curve model of SPEC section 7 (G3): :class:`DepthCurveSlippage`.
+The context handed to the model carries the account equity at the bar's open (cash + position), which only
+the optional equity normaliser of the depth curve uses.
 """
 
 from __future__ import annotations
@@ -67,6 +69,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
+from itertools import pairwise
 from typing import Literal, Protocol
 
 from tbot.core.config import CostConfig
@@ -84,6 +87,8 @@ from tbot.core.types import (
 
 __all__ = [
     "BrokerError",
+    "CurvePoints",
+    "DepthCurveSlippage",
     "ExecutionReport",
     "FeeSchedule",
     "FillRecord",
@@ -144,15 +149,18 @@ class SlippageContext:
 
     side: Side
     quantity: Decimal
-    reference_price: Decimal  # the execution bar's open
+    reference_price: Decimal  # the price the slippage is added to (the open; a stop exit: min(open, stop))
     ts: datetime  # fill time (open time of the execution bar)
+    # Account equity (cash + position marked at the bar's open) just before this fill, in the quote asset.
+    # ``None`` when the caller cannot supply it; only models with an equity normaliser need it.
+    equity: Decimal | None = None
 
 
 class SlippageModel(Protocol):
     """Adverse price impact in basis points of the reference price (always ``>= 0``).
 
-    The default is :class:`FlatSlippage`. The depth-at-size curve of SPEC section 7 (G3) will be a second
-    implementation of this protocol, evaluated at ``quantity * reference_price`` notional.
+    The default is :class:`FlatSlippage`. :class:`DepthCurveSlippage` (SPEC section 7 G3 / D-067) is the
+    size-dependent implementation, evaluated at ``quantity * reference_price`` notional.
     """
 
     def slippage_bps(self, ctx: SlippageContext) -> Decimal: ...
@@ -174,6 +182,114 @@ class FlatSlippage:
 
     def slippage_bps(self, ctx: SlippageContext) -> Decimal:  # noqa: ARG002 - flat by definition
         return self.bps
+
+
+CurvePoints = tuple[tuple[Decimal, Decimal], ...]  # ((notional_quote, cost_bps), ...) sorted by notional
+
+
+def _validated_curve(name: str, raw: object) -> CurvePoints:
+    """Normalise and check one side of a depth curve (see :class:`DepthCurveSlippage`)."""
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError(f"DepthCurveSlippage.{name} must be a list/tuple of (notional, cost_bps) pairs")
+    points: list[tuple[Decimal, Decimal]] = []
+    for item in raw:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise ValueError(f"DepthCurveSlippage.{name}: every point must be a (notional, cost_bps) pair")
+        n, c = item
+        if not (isinstance(n, Decimal) and isinstance(c, Decimal) and n.is_finite() and c.is_finite()):
+            raise ValueError(f"DepthCurveSlippage.{name}: points must be finite Decimals, got {item!r}")
+        points.append((n, c))
+    if len(points) < 2:
+        raise ValueError(f"DepthCurveSlippage.{name} needs at least 2 points (origin (0, 0) plus one more)")
+    if points[0] != (_ZERO, _ZERO):
+        raise ValueError(f"DepthCurveSlippage.{name} must start at (0, 0), got {points[0]!r}")
+    for (n0, c0), (n1, c1) in pairwise(points):
+        if n1 <= n0:
+            raise ValueError(f"DepthCurveSlippage.{name}: notionals must be strictly increasing")
+        if c1 < c0:
+            raise ValueError(
+                f"DepthCurveSlippage.{name}: cost_bps must not decrease with size (impact is adverse), "
+                f"got {c0} then {c1}"
+            )
+    return tuple(points)
+
+
+def _curve_bps(points: CurvePoints, notional: Decimal) -> Decimal:
+    """Piecewise-linear cost in bps at ``notional``; beyond the last point the slope of the last two."""
+    if notional <= _ZERO:
+        return _ZERO
+    for (n0, c0), (n1, c1) in pairwise(points):
+        if notional <= n1:
+            return c0 + (c1 - c0) * (notional - n0) / (n1 - n0)
+    (n0, c0), (n1, c1) = points[-2], points[-1]
+    return c1 + (c1 - c0) * (notional - n1) / (n1 - n0)
+
+
+@dataclass(frozen=True, slots=True)
+class DepthCurveSlippage:
+    """Depth-at-size slippage (SPEC section 7 G3, D-067): cost grows with the order's own notional.
+
+    ``buy_points`` / ``sell_points`` are the curve of each side as ``(notional_quote, cost_bps)`` pairs,
+    sorted by strictly increasing notional, starting at ``(0, 0)``, cost non-decreasing. The points are INPUT:
+    nothing about how they are measured is hard-coded here (the provisional construction lives in
+    :func:`tbot.backtest.slippage.curve_from_g0_summary`).
+
+    The cost of an order of notional ``n`` on its side is the piecewise-linear interpolation of the curve at
+    ``n``; beyond the last point it is extrapolated linearly at the slope of the last two points. Then
+    ``half_spread_bps`` is added exactly once. The result is adverse by construction (buys fill higher, sells
+    lower: the broker applies the sign), and the broker prices at ``quantity * reference_price`` of the FINAL
+    quantity (D-081 re-pricing).
+
+    ``equity_normaliser`` (the SPEC G3 rule "evaluated at the trade's own notional with the backtest equity
+    fixed at 10,000 USDT") is optional: when set to ``E``, the lookup notional is
+    ``order_notional * E / current_equity``, i.e. the order is looked up as if the account were ``E`` big
+    (the same fraction of equity costs the same bps at any account size). ``None`` looks up the raw notional.
+    """
+
+    buy_points: CurvePoints
+    sell_points: CurvePoints
+    half_spread_bps: Decimal
+    equity_normaliser: Decimal | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "buy_points", _validated_curve("buy_points", self.buy_points))
+        object.__setattr__(self, "sell_points", _validated_curve("sell_points", self.sell_points))
+        hs = self.half_spread_bps
+        if not isinstance(hs, Decimal) or not hs.is_finite() or hs < 0:
+            raise ValueError(f"DepthCurveSlippage.half_spread_bps must be a finite Decimal >= 0, got {hs!r}")
+        eq = self.equity_normaliser
+        if eq is not None and (not isinstance(eq, Decimal) or not eq.is_finite() or eq <= 0):
+            raise ValueError(f"DepthCurveSlippage.equity_normaliser must be a finite Decimal > 0, got {eq!r}")
+
+    def scaled(self, factor: Decimal) -> DepthCurveSlippage:
+        """Copy with every ``cost_bps`` AND the half spread multiplied by ``factor`` (the x2 stress)."""
+        if not isinstance(factor, Decimal) or not factor.is_finite() or factor < 0:
+            raise ValueError(f"scale factor must be a finite Decimal >= 0, got {factor!r}")
+
+        def scale(points: CurvePoints) -> CurvePoints:
+            return tuple((n, c * factor) for n, c in points)
+
+        return DepthCurveSlippage(
+            buy_points=scale(self.buy_points),
+            sell_points=scale(self.sell_points),
+            half_spread_bps=self.half_spread_bps * factor,
+            equity_normaliser=self.equity_normaliser,
+        )
+
+    def lookup_notional(self, ctx: SlippageContext) -> Decimal:
+        """The notional the curve is read at: the order's own, rescaled when an equity normaliser is set."""
+        notional = ctx.quantity * ctx.reference_price
+        if self.equity_normaliser is None:
+            return notional
+        if ctx.equity is None or ctx.equity <= _ZERO:
+            raise ValueError(
+                f"equity_normaliser needs a positive equity in the SlippageContext, got {ctx.equity!r}"
+            )
+        return notional * self.equity_normaliser / ctx.equity
+
+    def slippage_bps(self, ctx: SlippageContext) -> Decimal:
+        points = self.buy_points if ctx.side is Side.BUY else self.sell_points
+        return _curve_bps(points, self.lookup_notional(ctx)) + self.half_spread_bps
 
 
 # ---------------------------------------------------------------------------------
@@ -506,7 +622,10 @@ class SimulatedBroker:
         """Adverse-slipped, tick-rounded price; ``reference`` defaults to the bar's open (a stop exit
         passes ``min(open, stop)``)."""
         ref = bar.open if reference is None else reference
-        ctx = SlippageContext(side=side, quantity=quantity, reference_price=ref, ts=bar.open_ts)
+        equity = self._cash + self._qty * bar.open  # marked at the bar's open, before this fill
+        ctx = SlippageContext(
+            side=side, quantity=quantity, reference_price=ref, ts=bar.open_ts, equity=equity
+        )
         bps = self._slippage.slippage_bps(ctx)
         if bps < 0:
             raise BrokerError(f"slippage model returned negative bps ({bps}); slippage is always adverse")

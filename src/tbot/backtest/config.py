@@ -31,8 +31,11 @@ class BacktestConfig:
     close it was sized at is a ``price_move`` (valid run, however large the move); one that was not even
     affordable there is a sizing bug, an ``anomaly``, and marks the run invalid.
 
-    ``slippage_model`` is the hook for the depth-at-size model of SPEC section 7 (calibrated in phase 3);
-    until one is supplied, the flat ``costs.slippage_bps`` placeholder applies.
+    ``slippage_model`` is the hook for the depth-at-size model of SPEC section 7 / D-067
+    (``tbot.execution.simulated.DepthCurveSlippage``; its PROPOSED points builder is
+    ``tbot.backtest.slippage.curve_from_g0_summary``). It is opt-in: until one is supplied, the flat
+    ``costs.slippage_bps`` applies. The stub risk manager's sizing divisor still uses the flat
+    ``costs.slippage_bps`` as an estimate; the broker caps any BUY the real curve price makes unaffordable.
 
     Protective stops (SPEC 7.1, D-050) are executed by the engine when ``enforce_stops`` is true (default):
     the level is ``Strategy.stop_price(window_at_signal, P_ref)`` with ``P_ref`` the open of signal bar
