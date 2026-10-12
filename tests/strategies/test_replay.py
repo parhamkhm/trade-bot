@@ -141,3 +141,12 @@ def test_the_look_ahead_check_passes_for_the_causal_toy_and_s0() -> None:
     bars = wicky_bars(500, seed=3)
     assert PositionState.LONG in assert_no_lookahead(lambda: Momentum(set_before_super=True), bars)
     assert PositionState.LONG in assert_no_lookahead(S0Sma100, bars)
+
+
+def test_replay_base_class_refuses_a_non_daily_window() -> None:
+    """The daily sigma-hat / ATR20 rules must never run silently on 4h or 1h bars (SPEC D-090 review)."""
+    from tests.strategies.test_volume_invariance import _ohlc
+
+    strategy = PeekingS0()
+    with pytest.raises(ValueError, match="daily bars only"):
+        strategy.on_bar(BarWindow.of(_ohlc(Timeframe.H4, 400)))

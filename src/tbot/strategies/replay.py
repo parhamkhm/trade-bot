@@ -44,7 +44,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import NamedTuple
 
-from tbot.core.types import Bar, BarWindow, TargetIntent
+from tbot.core.types import Bar, BarWindow, TargetIntent, Timeframe
 from tbot.indicators import atr_simple, sigma_hat_kernel
 
 __all__ = [
@@ -129,6 +129,9 @@ class ReplayStrategy(ABC):
         self._reset_signal()
 
     def _check_anchor(self, window: BarWindow) -> None:
+        if window.timeframe is not Timeframe.D1:
+            # sigma_hat (sqrt(365)) and ATR20 are DAILY rules (SPEC 7.1, 7.2 C): wrong on any other bars
+            raise ValueError(f"{self.id}: daily bars only, got a {window.timeframe.value} window")
         if self.anchor is None:
             return
         expected = self.anchor + window.timeframe.delta
