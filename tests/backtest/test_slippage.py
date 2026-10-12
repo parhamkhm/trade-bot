@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from decimal import Decimal as Dec
 from pathlib import Path
 
@@ -12,41 +13,124 @@ from tbot.backtest.config import BacktestConfig
 from tbot.backtest.engine import run_backtest
 from tbot.backtest.feed import BacktestFeed
 from tbot.backtest.slippage import curve_from_g0_summary
-from tbot.execution.simulated import DepthCurveSlippage, FlatSlippage
+from tbot.core.types import Side
+from tbot.execution.simulated import DepthCurveSlippage, FlatSlippage, SlippageContext
 from tests.backtest.helpers import Scripted, make_config
 from tests.backtest.test_engine import five_bars
 
 REPO = Path(__file__).resolve().parents[2]
+T0 = datetime(2024, 1, 1, tzinfo=UTC)
 G0_SUMMARY = REPO / "research/reports/g0_lbank_20261011/lbank_probe_20261011T042800Z.summary.json"
 
 
 def test_builder_reads_the_real_g0_summary() -> None:
-    """Per side: (0, 0), (median quote within 0.1 %, 10 bps), (median quote within 0.5 %, 50 bps).
-    A BUY eats the ASK side, a SELL the BID side. Spread median 1.2041733037747128e-05 % of mid
-    = 1.2041733037747128e-05 * 100 bps = 0.0012041733037747128 bps; half of it is 0.0006020866518873564."""
+    """Points come from book.max_fill[band]["vs_touch"][side]["quote_median"]: the LARGEST MARKET ORDER that
+    fills within 0.1 % / 0.5 % of the touch. A BUY eats the ASK side (max_fill "buy"), a SELL the BID side
+    ("sell"). Cost at those sizes is the band itself: 10 and 50 bps. Spread median 1.2041733037747128e-05 % of
+    mid = 0.0012041733037747128 bps; half of it is 0.0006020866518873564."""
     m = curve_from_g0_summary(G0_SUMMARY)
     assert m.buy_points == (
         (Dec(0), Dec(0)),
-        (Dec("693641.6038858"), Dec(10)),
-        (Dec("694530.3491568"), Dec(50)),
+        (Dec("791337.7167268150914253939475"), Dec(10)),
+        (Dec("1579159.116131694431457999032"), Dec(50)),
     )
     assert m.sell_points == (
         (Dec(0), Dec(0)),
-        (Dec("1334062.39904865"), Dec(10)),
-        (Dec("1334148.0537138"), Dec(50)),
+        (Dec("1507954.925878956487830472434"), Dec(10)),
+        (Dec("2299814.294177067930772980798"), Dec(50)),
     )
     assert m.half_spread_bps == Dec("0.0006020866518873564")
     assert m.equity_normaliser is None
 
 
+def test_builder_p10_statistic_is_the_conservative_sensitivity() -> None:
+    m = curve_from_g0_summary(G0_SUMMARY, statistic="p10")
+    assert m.buy_points == (
+        (Dec(0), Dec(0)),
+        (Dec("292989.4011110195692658545460"), Dec(10)),
+        (Dec("607395.7384117860242833704533"), Dec(50)),
+    )
+    assert m.sell_points == (
+        (Dec(0), Dec(0)),
+        (Dec("880697.2835246913241879442317"), Dec(10)),
+        (Dec("1785742.864994034092678461543"), Dec(50)),
+    )
+    assert m.half_spread_bps == Dec("0.0006020866518873564")  # always the median spread
+    median = curve_from_g0_summary(G0_SUMMARY)
+    # a thinner book is costlier at the same size
+    assert m.slippage_bps(_ctx(Side.BUY, "10000")) > median.slippage_bps(_ctx(Side.BUY, "10000"))
+    assert m.slippage_bps(_ctx(Side.SELL, "10000")) > median.slippage_bps(_ctx(Side.SELL, "10000"))
+    with pytest.raises(ValueError, match="statistic"):
+        curve_from_g0_summary(G0_SUMMARY, statistic="mean")  # type: ignore[arg-type]
+
+
+def _ctx(side: Side, notional: str) -> SlippageContext:
+    return SlippageContext(side=side, quantity=Dec(notional) / 100, reference_price=Dec(100), ts=T0)
+
+
+def test_cost_of_a_10000_usdt_order_under_each_statistic() -> None:
+    """Hand formula on the first segment: bps = 10 * 10000 / N1 + half spread (HS = 0.000602086...)."""
+    hs = Dec("0.0006020866518873564")
+    median = curve_from_g0_summary(G0_SUMMARY)
+    p10 = curve_from_g0_summary(G0_SUMMARY, statistic="p10")
+    # median: buy 100000 / 791337.7167... = 0.12636 bps, sell 100000 / 1507954.9258... = 0.06632 bps
+    assert (
+        median.slippage_bps(_ctx(Side.BUY, "10000"))
+        == Dec(100_000) / Dec("791337.7167268150914253939475") + hs
+    )
+    assert (
+        median.slippage_bps(_ctx(Side.SELL, "10000"))
+        == Dec(100_000) / Dec("1507954.925878956487830472434") + hs
+    )
+    assert Dec("0.1269") < median.slippage_bps(_ctx(Side.BUY, "10000")) < Dec("0.1270")
+    assert Dec("0.0669") < median.slippage_bps(_ctx(Side.SELL, "10000")) < Dec("0.0670")
+    # p10: buy 100000 / 292989.4011... = 0.34131 bps, sell 100000 / 880697.2835... = 0.11354 bps
+    assert (
+        p10.slippage_bps(_ctx(Side.BUY, "10000")) == Dec(100_000) / Dec("292989.4011110195692658545460") + hs
+    )
+    assert (
+        p10.slippage_bps(_ctx(Side.SELL, "10000")) == Dec(100_000) / Dec("880697.2835246913241879442317") + hs
+    )
+    assert Dec("0.341") < p10.slippage_bps(_ctx(Side.BUY, "10000")) < Dec("0.342")
+    assert Dec("0.1141") < p10.slippage_bps(_ctx(Side.SELL, "10000")) < Dec("0.1142")
+
+
+def test_builder_does_not_read_the_depth_section(tmp_path: Path) -> None:
+    """book.depth is depth WITHIN a band of mid, a different quantity: wrecking it must change nothing, and
+    the file does not even need it."""
+    expected = curve_from_g0_summary(G0_SUMMARY)
+    data = json.loads(G0_SUMMARY.read_text(encoding="utf-8"))
+    for band in data["book"]["depth"].values():
+        for side in band.values():
+            side["quote_median"] = "1"
+            side["quote_p10"] = "1"
+    wrecked = tmp_path / "wrecked.json"
+    wrecked.write_text(json.dumps(data), encoding="utf-8")
+    assert curve_from_g0_summary(wrecked) == expected
+    del data["book"]["depth"]
+    gone = tmp_path / "gone.json"
+    gone.write_text(json.dumps(data), encoding="utf-8")
+    assert curve_from_g0_summary(gone) == expected
+    # and the points are the max_fill ones, not the (much smaller) depth-within-band ones
+    assert expected.buy_points[1][0] != Dec("693641.6038858")
+
+
+def test_builder_uses_the_vs_touch_reference_not_vs_mid(tmp_path: Path) -> None:
+    data = json.loads(G0_SUMMARY.read_text(encoding="utf-8"))
+    for band in data["book"]["max_fill"].values():
+        for side in band["vs_mid"].values():
+            side["quote_median"] = "1"
+    changed = tmp_path / "vs_mid_changed.json"
+    changed.write_text(json.dumps(data), encoding="utf-8")
+    assert curve_from_g0_summary(changed) == curve_from_g0_summary(G0_SUMMARY)
+
+
 def test_builder_options_and_stress_scaling() -> None:
     m = curve_from_g0_summary(G0_SUMMARY, equity_normaliser=Dec(10_000))
     assert m.equity_normaliser == Dec(10_000)
-    far = curve_from_g0_summary(G0_SUMMARY, near_band="0.005", far_band="0.01")
-    assert far.buy_points[1:] == ((Dec("694530.3491568"), Dec(50)), (Dec("1794735.3478725"), Dec(100)))
     twice = m.scaled(Dec(2))
     assert twice.half_spread_bps == Dec("0.0012041733037747128")
-    assert twice.buy_points[1] == (Dec("693641.6038858"), Dec(20))
+    assert twice.buy_points[1] == (Dec("791337.7167268150914253939475"), Dec(20))
 
 
 def test_builder_rejects_files_that_are_not_a_g0_summary(tmp_path: Path) -> None:
@@ -55,7 +139,7 @@ def test_builder_rejects_files_that_are_not_a_g0_summary(tmp_path: Path) -> None
     with pytest.raises(ValueError, match="not a G0 probe summary"):
         curve_from_g0_summary(junk)
     data = json.loads(G0_SUMMARY.read_text(encoding="utf-8"))
-    del data["book"]["depth"]["0.005"]
+    del data["book"]["max_fill"]["0.005"]
     cut = tmp_path / "cut.json"
     cut.write_text(json.dumps(data), encoding="utf-8")
     with pytest.raises(ValueError, match=r"0\.005"):
