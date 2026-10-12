@@ -3,10 +3,11 @@
 ``DepthCurveSlippage`` itself (``tbot.execution.simulated``) takes its curve points as INPUT. This module
 holds the one place that turns a measurement into points.
 
-PROPOSED -- pending Parham's approval (D-067 construction). :func:`curve_from_g0_summary` implements the
-PROPOSED construction of the provisional curve, not an approved one. The backtest engine does not use it by
-default (``BacktestConfig.slippage_model`` stays ``None`` = flat bps); a harness must opt in explicitly, and
-every number produced with it is PROVISIONAL.
+:func:`curve_from_g0_summary` implements the construction of the provisional D-067 curve DECIDED by Parham on
+2026-10-12 (SPEC D-091): the per-notional median for the run, and the adverse per-notional p90 of cost as a
+sensitivity that is reported only. The backtest engine does not use it by default
+(``BacktestConfig.slippage_model`` stays ``None`` = flat bps); a harness must opt in explicitly, and every
+number produced with it is PROVISIONAL.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from typing import Any, Literal, NamedTuple
 from tbot.core.config import CostConfig
 from tbot.execution.simulated import CurvePoints, DepthCurveSlippage, FlatSlippage, SlippageModel
 
-__all__ = ["DEFAULT_EQUITY_NORMALISER", "StressedCosts", "curve_from_g0_summary", "stressed"]
+__all__ = ["DEFAULT_EQUITY_NORMALISER", "Statistic", "StressedCosts", "curve_from_g0_summary", "stressed"]
 
 _ZERO = Decimal(0)
 # SPEC section 7 G3: the curve is read "with equity fixed at 10,000 USDT" (the same fraction of equity costs
@@ -28,6 +29,15 @@ DEFAULT_EQUITY_NORMALISER = Decimal(10_000)
 _PCT_TO_BPS = Decimal(100)  # 1 % = 100 bps
 _REFERENCE = "vs_touch"  # max_fill reference: measured from the best price consumed (SPEC 7 G3)
 _FRACTION_TO_BPS = Decimal(10_000)  # a band given as a fraction of price: 0.001 = 10 bps
+
+Statistic = Literal["median", "adverse_p90_cost"]
+# statistic -> (the max_fill size quantile, the spread quantile) it reads from the G0 summary. The p90 of COST
+# at a given size is the p10 of the fillable SIZE at a given cost (each sample's cost is monotone in size);
+# the probe stores no p90 spread, so the adverse variant uses the more adverse p95 (SPEC D-091).
+_QUANTILES: dict[str, tuple[str, str]] = {
+    "median": ("median", "median"),
+    "adverse_p90_cost": ("p10", "p95"),
+}
 
 
 def _as_decimal(value: object, what: str, path: Path) -> Decimal:
@@ -63,10 +73,10 @@ def curve_from_g0_summary(
     *,
     near_band: str = "0.001",
     far_band: str = "0.005",
-    statistic: Literal["median", "p10"] = "median",
+    statistic: Statistic = "median",
     equity_normaliser: Decimal | None = DEFAULT_EQUITY_NORMALISER,
 ) -> DepthCurveSlippage:
-    """PROPOSED -- pending Parham's approval (D-067 construction): curve points from the G0 probe summary.
+    """The D-067 provisional curve as decided in SPEC D-091: curve points from the G0 probe summary.
 
     Reads ``book.max_fill`` and ``book.spread_pct`` of the LBank G0 probe summary JSON (for example
     ``research/reports/g0_lbank_20261011/lbank_probe_20261011T042800Z.summary.json``). ``max_fill[band]`` is
@@ -78,14 +88,18 @@ def curve_from_g0_summary(
     * ``(quote notional of the largest order within near_band (0.1 %), near_band in bps (10))``;
     * ``(quote notional of the largest order within far_band (0.5 %), far_band in bps (50))``.
 
-    ``statistic`` picks the per-sample distribution statistic across the probe's samples: ``"median"``
-    (default; what D-067 / SPEC section 7 G3 specify) or ``"p10"`` (the conservative sensitivity variant: the
-    thin-book 10th-percentile sample).
+    ``statistic`` (SPEC D-091):
+
+    * ``"median"`` (default; the run): the per-notional MEDIAN of cost, the SPEC section 7 G3 statistic. Each
+      sample's cost rises monotonically with notional, so the median fillable size at 10 (50) bps is exactly
+      the notional at which the median cost is 10 (50) bps. Reads ``quote_median`` and the median spread.
+    * ``"adverse_p90_cost"`` (sensitivity, reported only, never gating): the per-notional p90 of COST, the
+      thin-book tail. By the same argument its points are the p10 of the fillable SIZE (``quote_p10``); the
+      half spread uses the p95 spread (no p90 is stored; p95 is the more adverse).
 
     A BUY consumes the ASK side of the book, a SELL the BID side, so ``buy_points`` come from ``max_fill[..]
     ["buy"]`` and ``sell_points`` from ``["sell"]``. ``half_spread_bps`` = median spread / 2 in bps (the
-    summary stores the spread in PERCENT of mid, hence ``* 100 / 2``; it is always the median spread, whatever
-    ``statistic`` is).
+    summary stores the spread in PERCENT of mid, hence ``* 100 / 2``; median or p95 per ``statistic``).
 
     ``equity_normaliser`` defaults to 10,000 USDT (SPEC section 7 G3: equity fixed at 10,000 USDT); it is
     overridable, and ``None`` disables the rescaling (raw order notional).
@@ -96,21 +110,22 @@ def curve_from_g0_summary(
 
     Numbers are parsed as exact ``Decimal`` (no float round trip).
     """
-    if statistic not in ("median", "p10"):
-        raise ValueError(f"statistic must be 'median' or 'p10', got {statistic!r}")
+    if statistic not in _QUANTILES:
+        raise ValueError(f"statistic must be one of {sorted(_QUANTILES)}, got {statistic!r}")
+    size_q, spread_q = _QUANTILES[statistic]
     p = Path(path)
     data = json.loads(p.read_text(encoding="utf-8"), parse_float=Decimal)
     try:
         book = data["book"]
         max_fill = book["max_fill"]
-        raw_spread = book["spread_pct"]["median"]
+        raw_spread = book["spread_pct"][spread_q]
     except (KeyError, TypeError) as exc:
         raise ValueError(
-            f"{p}: not a G0 probe summary (need book.max_fill and book.spread_pct.median)"
+            f"{p}: not a G0 probe summary (need book.max_fill and book.spread_pct.{spread_q})"
         ) from exc
-    spread_pct = _as_decimal(raw_spread, "book.spread_pct.median", p)
+    spread_pct = _as_decimal(raw_spread, f"book.spread_pct.{spread_q}", p)
     if spread_pct < _ZERO:
-        raise ValueError(f"{p}: book.spread_pct.median must be >= 0, got {spread_pct}")
+        raise ValueError(f"{p}: book.spread_pct.{spread_q} must be >= 0, got {spread_pct}")
     bands = [
         (near_band, Decimal(near_band) * _FRACTION_TO_BPS),
         (far_band, Decimal(far_band) * _FRACTION_TO_BPS),
@@ -119,7 +134,7 @@ def curve_from_g0_summary(
     def side_points(side: str) -> CurvePoints:
         return (
             (_ZERO, _ZERO),
-            *((_max_fill_quote(max_fill, band, side, statistic, p), bps) for band, bps in bands),
+            *((_max_fill_quote(max_fill, band, side, size_q, p), bps) for band, bps in bands),
         )
 
     return DepthCurveSlippage(
