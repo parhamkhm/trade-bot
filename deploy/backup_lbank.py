@@ -3,8 +3,9 @@
 Runs on the host as root from ``tbot-lbank-backup.timer`` (~02:40 UTC). Plan §4, approved 2026-10-10.
 
 **Closed days** (the UTC day has ended at least ``GRACE`` ago and neither the database nor its ``-wal``
-has been written for ``GRACE``): every recorder stream switches to the new day file on its first
-write after midnight, the slowest within an hour, so a closed file has no writer left. Each one is
+has been written for ``GRACE``; an empty ``-wal`` is not a write, see ``_last_write``): every
+recorder stream switches to the new day file on its first write after midnight, the slowest within an
+hour, so a closed file has no writer left. Each one is
 
 1. copied with SQLite's online backup API from a read-only connection into a staging file, switched
    to ``journal_mode=DELETE`` and checked with ``PRAGMA integrity_check``;
@@ -316,12 +317,21 @@ def _sidecars(db: Path) -> list[Path]:
 
 
 def _last_write(db: Path) -> float:
-    """Newest mtime of the database and its ``-wal``: in WAL mode recent writes live in the ``-wal``."""
-    times = [db.stat().st_mtime]
-    wal = _sidecars(db)[0]
-    if wal.exists():
-        times.append(wal.stat().st_mtime)
-    return max(times)
+    """Newest mtime of the database and its ``-wal``: in WAL mode recent writes live in the ``-wal``.
+
+    Only a ``-wal`` that holds data counts, and the ``-shm`` never does. Opening a clean (no ``-wal``)
+    WAL-mode database read-only -- which this script does itself to snapshot and count rows -- makes
+    SQLite create an *empty* ``-wal`` (and a ``-shm``) stamped with the current time. That is not a
+    write by the recorder: counting it would make a closed day look "written just now" (never
+    archived, or "source changed after it was archived; both kept") after nothing but our own read.
+    A real write by the recorder either grows the ``-wal`` beyond zero bytes or changes the database
+    file (a checkpoint), and both are seen."""
+    mtime = db.stat().st_mtime
+    try:
+        wal = _sidecars(db)[0].stat()
+    except OSError:  # no -wal (the usual state of a cleanly closed day)
+        return mtime
+    return max(mtime, wal.st_mtime) if wal.st_size > 0 else mtime
 
 
 def is_closed(db: Path, now: datetime) -> bool:
