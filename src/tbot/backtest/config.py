@@ -32,7 +32,7 @@ class BacktestConfig:
     affordable there is a sizing bug, an ``anomaly``, and marks the run invalid.
 
     ``slippage_model`` is the hook for the depth-at-size model of SPEC section 7 / D-067
-    (``tbot.execution.simulated.DepthCurveSlippage``; its PROPOSED points builder is
+    (``tbot.execution.simulated.DepthCurveSlippage``; its points builder (SPEC D-091) is
     ``tbot.backtest.slippage.curve_from_g0_summary``). It is opt-in: until one is supplied, the flat
     ``costs.slippage_bps`` applies. The stub risk manager's sizing divisor still uses the flat
     ``costs.slippage_bps`` as an estimate; the broker caps any BUY the real curve price makes unaffordable.
