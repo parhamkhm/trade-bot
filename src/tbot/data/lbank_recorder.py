@@ -48,6 +48,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -423,7 +424,15 @@ class DayStore:
             self.close()
             self._dir.mkdir(parents=True, exist_ok=True)
             with _OPEN_LOCK:  # see _OPEN_LOCK: serializes first-open/create against other threads
-                conn = sqlite3.connect(str(self.path_for(day)), timeout=30.0, isolation_level=None)
+                # check_same_thread=False: a concurrent stream's DayStore is created inside one
+                # ThreadPoolExecutor worker thread but closed from the dispatcher thread once
+                # `executor.shutdown(wait=True)` has returned (see `_run_concurrent_stream`), after
+                # which nothing else touches the connection. All actual reads/writes still happen
+                # from a single thread at a time; WAL + busy_timeout, not this flag, is what makes
+                # concurrent *writers* (separate connections) to the same day file safe.
+                conn = sqlite3.connect(
+                    str(self.path_for(day)), timeout=30.0, isolation_level=None, check_same_thread=False
+                )
                 conn.execute("PRAGMA busy_timeout=30000")
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute("PRAGMA synchronous=NORMAL")
@@ -476,6 +485,9 @@ class StreamStatus:
     unparsed_total: int = 0
     consecutive_bad_polls: int = 0  # polls with unparseable items or no items at all
     last_new_rows_ms: int | None = None  # last time a poll stored at least one new trade
+    # streams polled through a bounded executor (depth): slots skipped because every concurrent slot
+    # was already in flight (see `_run_concurrent_stream`); zero for streams that never skip.
+    skipped_total: int = 0
 
 
 @dataclass(frozen=True)
@@ -485,6 +497,9 @@ class RecorderConfig:
     perp_symbol: str = "BTCUSDT"
     depth_size: int = 20
     depth_interval_s: float = 10.0
+    # at most this many depth calls may be in flight at once (see `_run_concurrent_stream`); a slot
+    # due while all of them are busy is skipped and counted, never queued and never bursted.
+    depth_max_concurrent: int = 3
     trades_interval_s: float = 30.0
     trades_size: int = 600
     kline_interval_s: Mapping[str, float] = field(
@@ -496,6 +511,16 @@ class RecorderConfig:
     funding_interval_s: float = 60.0
     http_timeout_s: float = 20.0
     heartbeat_interval_s: float = 10.0
+
+
+class _StreamLocal(threading.local):
+    """One ``DayStore`` per worker thread of a concurrent stream's executor (see `_run_concurrent_stream`).
+
+    A plain ``threading.local()`` instance works the same way but is untyped; subclassing it gives
+    ``store`` a real type and a per-thread default of ``None`` without any extra bookkeeping.
+    """
+
+    store: DayStore | None = None
 
 
 class LBankRecorder:
@@ -526,17 +551,30 @@ class LBankRecorder:
     def start(self) -> None:
         # the heartbeat may run before any stream has written; it must find its directory
         self._cfg.data_dir.mkdir(parents=True, exist_ok=True)
-        jobs: list[tuple[str, float, Callable[[httpx.Client, DayStore], int]]] = [
-            ("depth", self._cfg.depth_interval_s, self._poll_depth),
-            ("trades", self._cfg.trades_interval_s, self._poll_trades),
-            ("funding", self._cfg.funding_interval_s, self._poll_funding),
+        # (name, period, job, max_concurrent, http timeout) -- max_concurrent > 1 only for depth;
+        # trades keeps max_concurrent=1 (its gap/cursor logic depends on strict call order) but gets
+        # its own shorter timeout so a slow call frees the next slot promptly.
+        jobs: list[tuple[str, float, Callable[[httpx.Client, DayStore], int], int, float]] = [
+            (
+                "depth",
+                self._cfg.depth_interval_s,
+                self._poll_depth,
+                self._cfg.depth_max_concurrent,
+                self._cfg.http_timeout_s,
+            ),
+            ("trades", self._cfg.trades_interval_s, self._poll_trades, 1, self._cfg.http_timeout_s),
+            ("funding", self._cfg.funding_interval_s, self._poll_funding, 1, self._cfg.http_timeout_s),
         ]
         for interval, period in self._cfg.kline_interval_s.items():
-            jobs.append((f"kline_{interval}", period, self._make_kline_job(interval)))
-        for name, period, job in jobs:
+            kline_job = self._make_kline_job(interval)
+            jobs.append((f"kline_{interval}", period, kline_job, 1, self._cfg.http_timeout_s))
+        for name, period, job, max_concurrent, timeout in jobs:
             self.status[name] = StreamStatus()
             thread = threading.Thread(
-                target=self._run_stream, args=(name, period, job), name=name, daemon=True
+                target=self._run_stream,
+                args=(name, period, job, max_concurrent, timeout),
+                name=name,
+                daemon=True,
             )
             self._threads.append(thread)
         self._threads.append(threading.Thread(target=self._run_heartbeat, name="heartbeat", daemon=True))
@@ -557,13 +595,25 @@ class LBankRecorder:
 
     # -- loop --
 
-    def _client(self) -> httpx.Client:
-        return httpx.Client(timeout=self._cfg.http_timeout_s, transport=self._transport)
+    def _client(self, timeout: float | None = None) -> httpx.Client:
+        return httpx.Client(
+            timeout=timeout if timeout is not None else self._cfg.http_timeout_s, transport=self._transport
+        )
 
-    def _run_stream(self, name: str, period: float, job: Callable[[httpx.Client, DayStore], int]) -> None:
+    def _run_stream(
+        self,
+        name: str,
+        period: float,
+        job: Callable[[httpx.Client, DayStore], int],
+        max_concurrent: int = 1,
+        timeout: float | None = None,
+    ) -> None:
+        if max_concurrent > 1:
+            self._run_concurrent_stream(name, period, job, max_concurrent, timeout)
+            return
         store = DayStore(self._cfg.data_dir)
         next_due = time.monotonic()
-        with self._client() as client:
+        with self._client(timeout) as client:
             while not self._stop.is_set():
                 self.run_once(name, job, client, store)
                 next_due += period
@@ -572,6 +622,91 @@ class LBankRecorder:
                     next_due = now + period - ((now - next_due) % period)
                 self._stop.wait(max(0.0, next_due - time.monotonic()))
         store.close()
+
+    def _run_concurrent_stream(
+        self,
+        name: str,
+        period: float,
+        job: Callable[[httpx.Client, DayStore], int],
+        max_concurrent: int,
+        timeout: float | None,
+    ) -> None:
+        """Fire every slot on schedule even while earlier calls are still in flight.
+
+        At most ``max_concurrent`` calls run at once, each with its own ``DayStore`` (so no two
+        worker threads ever share a SQLite connection; concurrent writers to the same day file are
+        still serialized safely by WAL + ``busy_timeout``, and each call picks its own day file from
+        its own ``recv_ms`` so a rollover mid-flight is never an issue). A slot due while all workers
+        are busy is skipped and counted (see ``_note_skip``) rather than queued, so the average
+        request rate never exceeds one per period and a run of slow calls never causes a catch-up
+        burst once they finally return.
+        """
+        executor = ThreadPoolExecutor(max_workers=max_concurrent, thread_name_prefix=f"{name}-poll")
+        local = _StreamLocal()
+        stores: list[DayStore] = []
+        stores_lock = threading.Lock()
+        client = self._client(timeout)
+
+        def worker_store() -> DayStore:
+            store = local.store
+            if store is None:
+                store = DayStore(self._cfg.data_dir)
+                local.store = store
+                with stores_lock:
+                    stores.append(store)
+            return store
+
+        def task() -> None:
+            try:
+                store = worker_store()
+            except Exception as exc:  # e.g. mkdir/connect failure: counted and alerted, never silent (3.8)
+                self._note_worker_failure(name, exc)
+                return
+            self.run_once(name, job, client, store)
+
+        def observe(future: Future[None]) -> None:
+            # backstop: anything that still escapes `task` must not vanish inside the Future
+            exc = future.exception()
+            if exc is not None:
+                self._note_worker_failure(name, exc)
+
+        in_flight: set[Future[None]] = set()
+        try:
+            next_due = time.monotonic()
+            while not self._stop.is_set():
+                in_flight = {f for f in in_flight if not f.done()}
+                if len(in_flight) >= max_concurrent:
+                    self._note_skip(name)
+                else:
+                    future = executor.submit(task)
+                    future.add_done_callback(observe)
+                    in_flight.add(future)
+                next_due += period
+                now = time.monotonic()
+                if next_due < now:  # keep the rate at one dispatch per period, never catch up
+                    next_due = now + period - ((now - next_due) % period)
+                self._stop.wait(max(0.0, next_due - time.monotonic()))
+        finally:
+            # waits for every in-flight call (each bounded by `timeout`) before closing its store
+            executor.shutdown(wait=True)
+            for store in stores:
+                store.close()
+            client.close()
+
+    def _note_worker_failure(self, name: str, exc: BaseException) -> None:
+        status = self.status[name]
+        with self._lock:
+            status.last_attempt_ms = self._now_ms()
+            status.consecutive_errors += 1
+            status.last_error = f"{type(exc).__name__}: {exc}"[:300]
+        logger.error("lbank_recorder.worker_failed", stream=name, error=status.last_error)
+
+    def _note_skip(self, name: str) -> None:
+        status = self.status[name]
+        with self._lock:
+            status.skipped_total += 1
+            total = status.skipped_total
+        logger.warning("lbank_recorder.slot_skipped", stream=name, skipped_total=total)
 
     def run_once(
         self, name: str, job: Callable[[httpx.Client, DayStore], int], client: httpx.Client, store: DayStore
@@ -783,6 +918,7 @@ class LBankRecorder:
                     "unparsed_total": s.unparsed_total,
                     "consecutive_bad_polls": s.consecutive_bad_polls,
                     "last_new_rows_ms": s.last_new_rows_ms,
+                    "skipped_total": s.skipped_total,
                 }
                 for name, s in self.status.items()
             }
