@@ -203,8 +203,9 @@ def _sha256(path: Path) -> str:
 _LOCK_OFFSET = 1 << 20  # Windows: lock one byte far beyond the holder text so that text stays readable
 
 
-def _epoch() -> float:
-    return time.time()
+def utc_now() -> datetime:
+    """The production clock. Every function that stamps a time takes a ``clock`` and defaults to this."""
+    return datetime.now(UTC)
 
 
 @dataclass(frozen=True)
@@ -253,8 +254,9 @@ class RunLock:
     The holder writes ``"<pid> <start epoch>"`` into the file so a second run can tell a healthy
     holder from a dead or stuck one (see ``run``)."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, clock: Callable[[], datetime] = utc_now) -> None:
         self._path = path
+        self._clock = clock
         self._fh: IO[bytes] | None = None
 
     def acquire(self) -> bool:
@@ -271,7 +273,7 @@ class RunLock:
         self._fh = fh
         with contextlib.suppress(OSError):  # best effort: the lock itself is what protects the run
             fh.truncate(0)
-            fh.write(f"{os.getpid()} {_epoch():.3f}\n".encode("ascii"))
+            fh.write(f"{os.getpid()} {self._clock().timestamp():.3f}\n".encode("ascii"))
             fh.flush()
         return True
 
@@ -702,7 +704,7 @@ def _process(source_dir: Path, dest_dir: Path, codec: Codec, now: datetime, out:
             out.attempt(archive.name, partial(_copy_archive, archive, dest_dir, out))
 
 
-def _lock_busy(lock: RunLock, lock_path: Path) -> tuple[bool, int, str]:
+def _lock_busy(lock: RunLock, lock_path: Path, now: datetime) -> tuple[bool, int, str]:
     """The lock is held. Returns ``(took_over, exit_code, message)``.
 
     * holder pid dead (an orphan kept the descriptor): take the lock over and run;
@@ -717,8 +719,8 @@ def _lock_busy(lock: RunLock, lock_path: Path) -> tuple[bool, int, str]:
             EXIT_STUCK,
             f"lock held, recorded holder pid {holder.pid} is dead and cannot be replaced",
         )
-    if holder is not None and _epoch() - holder.started > STUCK_AFTER_S:
-        age = int(_epoch() - holder.started)
+    if holder is not None and now.timestamp() - holder.started > STUCK_AFTER_S:
+        age = int(now.timestamp() - holder.started)
         return (
             False,
             EXIT_STUCK,
@@ -727,9 +729,9 @@ def _lock_busy(lock: RunLock, lock_path: Path) -> tuple[bool, int, str]:
     return False, EXIT_LOCKED, "another run holds the lock"
 
 
-def _status_payload(started_ts: str, **fields: object) -> dict[str, object]:
+def _status_payload(started_ts: str, *, ts: str, **fields: object) -> dict[str, object]:
     base: dict[str, object] = {
-        "ts": datetime.now(UTC).isoformat(),
+        "ts": ts,
         "ok": False,
         "in_progress": False,
         "started_ts": started_ts,
@@ -742,21 +744,37 @@ def _status_payload(started_ts: str, **fields: object) -> dict[str, object]:
     return {**base, **fields}
 
 
-def run(source_dir: Path, dest_dir: Path, *, codec: Codec | None = None, now: datetime | None = None) -> int:
+def run(
+    source_dir: Path,
+    dest_dir: Path,
+    *,
+    codec: Codec | None = None,
+    now: datetime | None = None,
+    clock: Callable[[], datetime] | None = None,
+) -> int:
+    """One backup run. Every time this run reads or writes (the lock holder's start time, the
+    status.json stamps and the closed-day cut-off) comes from one source: the callable ``clock``, or
+    the fixed instant ``now``, or (neither given) the real UTC clock. The closed-day cut-off is read
+    once at the start of the run. Passing both ``now`` and ``clock`` raises ``TypeError``: two
+    "nows" in one run is a bug, not a feature."""
+    if now is not None and clock is not None:
+        raise TypeError("pass either now= or clock=, not both: one run has exactly one notion of now")
     codec = codec or ZstdCli()
-    now = now or datetime.now(UTC)
+    fixed = now
+    clock_fn: Callable[[], datetime] = clock or (utc_now if fixed is None else (lambda: fixed))
+    now = fixed or clock_fn()
     dest_dir.mkdir(parents=True, exist_ok=True)
     lock_path = dest_dir / ".lock"
-    lock = RunLock(lock_path)
+    lock = RunLock(lock_path, clock_fn)
     if not lock.acquire():
-        took_over, code, message = _lock_busy(lock, lock_path)
+        took_over, code, message = _lock_busy(lock, lock_path, clock_fn())
         line = {"event": "lbank_backup", "exit_code": code, "message": message}
         print(json.dumps(line), file=sys.stderr)
         if not took_over:
             return code  # status.json is left as the holder wrote it (in_progress, ok=false)
     try:
         started, out = time.monotonic(), Summary()
-        started_ts = datetime.now(UTC).isoformat()
+        started_ts = clock_fn().isoformat()
         # A run that is killed or times out must not leave the previous night's OK behind.
         _write_status(
             dest_dir,
@@ -774,6 +792,7 @@ def run(source_dir: Path, dest_dir: Path, *, codec: Codec | None = None, now: da
             dest_dir,
             _status_payload(
                 started_ts,
+                ts=clock_fn().isoformat(),
                 ok=code == EXIT_OK,
                 exit_code=code,
                 days_archived=sorted(n.removeprefix("lbank-")[:10] for n in out.archived),
@@ -789,14 +808,14 @@ def run(source_dir: Path, dest_dir: Path, *, codec: Codec | None = None, now: da
         lock.release()
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, clock: Callable[[], datetime] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--source-dir", type=Path, required=True)
     parser.add_argument("--dest-dir", type=Path, default=Path("/var/backups/tbot/lbank"))
     args = parser.parse_args(argv)
-    return run(args.source_dir, args.dest_dir)
+    return run(args.source_dir, args.dest_dir, clock=clock)
 
 
 if __name__ == "__main__":

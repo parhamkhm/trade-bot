@@ -45,6 +45,13 @@ def _load_module() -> ModuleType:
 
 backup_trades = _load_module()
 
+# The fixed instant every test that does not care about a specific date runs at.
+NOW = datetime(2026, 1, 15, 2, 30, 0, tzinfo=UTC)
+
+
+def _clock() -> datetime:
+    return NOW
+
 
 def _create_source_db(path: Path, *, n_rows: int = 5) -> None:
     conn = sqlite3.connect(str(path))
@@ -94,7 +101,7 @@ def test_perform_backup_creates_a_verified_copy(source_db: Path, dest_dir: Path)
 
 def test_perform_backup_copy_is_independently_readable(source_db: Path, dest_dir: Path) -> None:
     """The copy must be a complete, standalone database -- not a reference to the source."""
-    result = backup_trades.perform_backup(source_db, dest_dir)
+    result = backup_trades.perform_backup(source_db, dest_dir, now=NOW)
 
     conn = sqlite3.connect(str(result.dest_path))
     try:
@@ -118,14 +125,14 @@ def test_perform_backup_opens_source_read_only(source_db: Path, dest_dir: Path) 
     # And perform_backup's own source connection genuinely goes through that same read-only
     # path -- the backup must still succeed (reading is fine), proving mode=ro is in effect
     # rather than merely asserted above on a throwaway connection.
-    result = backup_trades.perform_backup(source_db, dest_dir)
+    result = backup_trades.perform_backup(source_db, dest_dir, now=NOW)
     assert result.copy_trade_count == 10
 
 
 def test_perform_backup_no_partial_file_left_under_the_final_name_on_a_clean_run(
     source_db: Path, dest_dir: Path
 ) -> None:
-    result = backup_trades.perform_backup(source_db, dest_dir)
+    result = backup_trades.perform_backup(source_db, dest_dir, now=NOW)
     leftovers = list(dest_dir.glob("*.tmp"))
     assert leftovers == []
     assert result.dest_path.suffix == ".sqlite"
@@ -169,7 +176,7 @@ def test_backup_of_a_concurrently_written_database_is_consistent(
     writer_thread = threading.Thread(target=_writer, daemon=True)
     writer_thread.start()
     try:
-        result = backup_trades.perform_backup(source_db, dest_dir)
+        result = backup_trades.perform_backup(source_db, dest_dir, now=NOW)
     finally:
         stop.set()
         writer_thread.join(timeout=10)
@@ -274,7 +281,7 @@ def test_perform_backup_wal_source_completes_under_a_fast_concurrent_writer_proc
     writer = subprocess.Popen([sys.executable, "-c", writer_code, str(source_db)])
     time.sleep(0.3)  # let the writer get going before the backup starts
     try:
-        result = backup_trades.perform_backup(source_db, dest_dir)
+        result = backup_trades.perform_backup(source_db, dest_dir, now=NOW)
     finally:
         writer.kill()
         writer.wait(timeout=5)
@@ -299,7 +306,7 @@ def test_perform_backup_wal_copy_has_no_orphan_sidecars_and_is_delete_mode(
     finally:
         conn.close()
 
-    result = backup_trades.perform_backup(source_db, dest_dir)
+    result = backup_trades.perform_backup(source_db, dest_dir, now=NOW)
 
     sidecars = list(dest_dir.glob("*-wal")) + list(dest_dir.glob("*-shm"))
     assert sidecars == []
@@ -369,7 +376,7 @@ def test_perform_backup_runs_integrity_check_on_tmp_before_the_rename(
 
     monkeypatch.setattr(backup_trades, "_integrity_check_ok", _spy_check)
 
-    result = backup_trades.perform_backup(source_db, dest_dir)
+    result = backup_trades.perform_backup(source_db, dest_dir, now=NOW)
 
     assert seen["path"] is not None
     assert str(seen["path"]).endswith(".tmp")
@@ -390,7 +397,7 @@ def test_perform_backup_integrity_failure_never_creates_the_final_named_file(
     monkeypatch.setattr(backup_trades, "_integrity_check_ok", _fake_integrity_check_ok)
 
     with pytest.raises(backup_trades.IntegrityCheckError):
-        backup_trades.perform_backup(source_db, dest_dir)
+        backup_trades.perform_backup(source_db, dest_dir, now=NOW)
 
     assert list(dest_dir.glob("trades-*.sqlite")) == []
     assert list(dest_dir.glob("*.tmp")) == []
@@ -413,7 +420,7 @@ def test_perform_backup_corrupt_source_raises_backup_error_not_a_raw_traceback(
     garbage_source.write_bytes(b"not a database" * 100)
 
     with pytest.raises(backup_trades.BackupError):
-        backup_trades.perform_backup(garbage_source, dest_dir)
+        backup_trades.perform_backup(garbage_source, dest_dir, now=NOW)
 
     assert list(dest_dir.glob("*.tmp")) == []
     assert list(dest_dir.glob("*-wal")) == []
@@ -430,7 +437,9 @@ def test_run_exits_1_on_a_corrupt_source_with_no_leftover_tmp_file(
     garbage_source = dest_dir.parent / "garbage.sqlite"
     garbage_source.write_bytes(b"not a database" * 100)
 
-    code = backup_trades.run(["--source", str(garbage_source), "--dest-dir", str(dest_dir)])
+    code = backup_trades.run(
+        ["--source", str(garbage_source), "--dest-dir", str(dest_dir)], clock=_clock
+    )
 
     assert code == 1
     stderr_payload = json.loads(capsys.readouterr().err)
@@ -451,7 +460,7 @@ def test_integrity_check_failure_deletes_the_bad_copy_and_raises(
     monkeypatch.setattr(backup_trades, "_integrity_check_ok", _fake_integrity_check_ok)
 
     with pytest.raises(backup_trades.IntegrityCheckError):
-        backup_trades.perform_backup(source_db, dest_dir)
+        backup_trades.perform_backup(source_db, dest_dir, now=NOW)
 
     # The bad copy must not be left on disk for a later run (or an operator) to trust.
     remaining = list(dest_dir.glob("trades-*.sqlite"))
@@ -467,7 +476,7 @@ def test_run_exits_2_and_logs_on_integrity_failure(
     monkeypatch.setattr(backup_trades, "_integrity_check_ok", _fake_integrity_check_ok)
 
     code = backup_trades.main(
-        ["--source", str(source_db), "--dest-dir", str(dest_dir)]
+        ["--source", str(source_db), "--dest-dir", str(dest_dir)], clock=_clock
     )
     assert code == 2
 
@@ -481,7 +490,7 @@ def test_run_exits_2_and_logs_on_integrity_failure(
 
 def test_run_exits_1_when_source_does_not_exist(dest_dir: Path) -> None:
     code = backup_trades.main(
-        ["--source", "/does/not/exist/trades.sqlite", "--dest-dir", str(dest_dir)]
+        ["--source", "/does/not/exist/trades.sqlite", "--dest-dir", str(dest_dir)], clock=_clock
     )
     assert code == 1
 
@@ -503,7 +512,7 @@ def test_perform_backup_raises_backup_error_after_exhausting_retries(
     monkeypatch.setattr(backup_trades, "_BACKOFF_MAX_SECONDS", 0.002)
 
     with pytest.raises(backup_trades.BackupError):
-        backup_trades.perform_backup(source_db, dest_dir)
+        backup_trades.perform_backup(source_db, dest_dir, now=NOW)
 
     assert len(attempts) == backup_trades._MAX_ATTEMPTS
     # No leftover .tmp file after every attempt fails.
@@ -528,7 +537,7 @@ def test_perform_backup_succeeds_after_transient_failures(
     monkeypatch.setattr(backup_trades, "_BACKOFF_BASE_SECONDS", 0.001)
     monkeypatch.setattr(backup_trades, "_BACKOFF_MAX_SECONDS", 0.002)
 
-    result = backup_trades.perform_backup(source_db, dest_dir)
+    result = backup_trades.perform_backup(source_db, dest_dir, now=NOW)
     assert result.attempts == 3
     assert result.copy_trade_count == 10
 
@@ -594,7 +603,7 @@ def test_rotation_ignores_non_matching_files(dest_dir: Path) -> None:
 
 def test_rotation_on_empty_directory_deletes_nothing(dest_dir: Path) -> None:
     dest_dir.mkdir(parents=True, exist_ok=True)
-    assert backup_trades.rotate_backups(dest_dir, keep_days=14) == []
+    assert backup_trades.rotate_backups(dest_dir, keep_days=14, now=NOW) == []
 
 
 def test_rotation_exactly_at_keep_days_boundary_is_not_deleted(dest_dir: Path) -> None:
@@ -627,7 +636,8 @@ def test_run_end_to_end_success_prints_json_and_rotates(
             str(dest_dir),
             "--keep-days",
             "14",
-        ]
+        ],
+        clock=lambda: now,
     )
     assert code == 0
     assert not old_backup.exists()

@@ -181,7 +181,8 @@ def _run_service(service: TabdealRecorderService, *, once: bool, symbol: str) ->
     return 0
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv: Sequence[str] | None = None, *, clock: Clock | None = None) -> int:
+    """Entry point. ``clock`` (default: :class:`SystemClock`) is injectable for tests."""
     args = _parse_args(argv)
     secrets = Secrets()
     # MAJOR M-C (third fix round): register every raw credential this process holds with the
@@ -207,7 +208,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         os.environ.get("TBOT_HEARTBEAT_FILE", str(_DEFAULT_HEARTBEAT_FILE))
     )
 
-    clock: Clock = SystemClock()
+    clock = clock or SystemClock()
     client = _build_client(config, clock)
     store = RecorderStore(db_path)
     service = TabdealRecorderService(

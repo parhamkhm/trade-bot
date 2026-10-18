@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -183,6 +184,7 @@ def _run_reports(
                 as_float=True,
                 caller="scripts/download_binance.py",
                 reason="quality report",
+                now=now,
             )
             for timeframe in timeframes
         }
@@ -197,7 +199,7 @@ def _run_reports(
             )
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, clock: Callable[[], datetime] = lambda: datetime.now(UTC)) -> int:
     args = _parse_args(argv)
     config = load_config(args.config)
     data_config = config.data
@@ -209,7 +211,7 @@ def main(argv: list[str] | None = None) -> int:
         else data_config.timeframes
     )
     report_dir = Path(args.report_dir) if args.report_dir else _DEFAULT_REPORT_DIR
-    now = datetime.now(UTC)
+    now = clock()
 
     if not args.report_only:
         _ingest_all(symbols, timeframes, data_config, now)

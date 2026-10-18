@@ -1274,7 +1274,11 @@ def test_cli_ratelimit_with_injected_transport(tmp_path: Path) -> None:
 def test_cli_summarize_rebuilds_summary_from_jsonl(tmp_path: Path) -> None:
     _, _, paths, _ = run_fixture_sampling(tmp_path, samples=2)
     out = tmp_path / "re"
-    assert lp.main(["--summarize", str(paths.jsonl), "--out-dir", str(out)]) == 0
+    env = lp.VirtualEnv(datetime(2031, 3, 4, 5, 6, 7, tzinfo=UTC))  # the clock that stamps the output name
+    assert lp.main(["--summarize", str(paths.jsonl), "--out-dir", str(out)], env=env) == 0
+    assert [p.name for p in out.glob("lbank_probe_resummary_*.summary.json")] == [
+        f"lbank_probe_resummary_{lp._stamp(env.now())}.summary.json"
+    ]
     rebuilt = json.loads(next(out.glob("*.summary.json")).read_text(encoding="utf-8"))
     assert rebuilt["g0"]["plan"]["samples"] == 2
     assert rebuilt["provenance"]["summarized_from"] == str(paths.jsonl)

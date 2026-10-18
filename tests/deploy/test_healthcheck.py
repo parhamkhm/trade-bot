@@ -36,6 +36,13 @@ def _load_healthcheck_module() -> ModuleType:
 
 healthcheck = _load_healthcheck_module()
 
+# Every "now" in this file is this fixed instant (no test depends on today's date).
+NOW = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
+
+
+def _clock() -> datetime:
+    return NOW
+
 
 @pytest.fixture
 def clean_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
@@ -283,7 +290,7 @@ def test_bool_consecutive_cycle_exceptions_is_unhealthy_not_a_crash() -> None:
 )
 def test_non_dict_payload_is_unhealthy_not_a_crash(payload: object) -> None:
     healthy, reason = healthcheck.evaluate_heartbeat(
-        payload, now=datetime.now(UTC), max_age_seconds=180, max_consecutive_errors=10
+        payload, now=NOW, max_age_seconds=180, max_consecutive_errors=10
     )
     assert healthy is False
     assert reason
@@ -292,7 +299,7 @@ def test_non_dict_payload_is_unhealthy_not_a_crash(payload: object) -> None:
 def test_missing_last_poll_ts_is_unhealthy_not_a_crash() -> None:
     healthy, reason = healthcheck.evaluate_heartbeat(
         {"consecutive_errors": 0},
-        now=datetime.now(UTC),
+        now=NOW,
         max_age_seconds=180,
         max_consecutive_errors=10,
     )
@@ -303,7 +310,7 @@ def test_missing_last_poll_ts_is_unhealthy_not_a_crash() -> None:
 def test_malformed_last_poll_ts_is_unhealthy_not_a_crash() -> None:
     healthy, reason = healthcheck.evaluate_heartbeat(
         _payload(last_poll_ts="not-a-timestamp"),
-        now=datetime.now(UTC),
+        now=NOW,
         max_age_seconds=180,
         max_consecutive_errors=10,
     )
@@ -313,8 +320,8 @@ def test_malformed_last_poll_ts_is_unhealthy_not_a_crash() -> None:
 
 def test_missing_consecutive_errors_is_unhealthy_not_a_crash() -> None:
     healthy, reason = healthcheck.evaluate_heartbeat(
-        {"last_poll_ts": datetime.now(UTC).isoformat()},
-        now=datetime.now(UTC),
+        {"last_poll_ts": NOW.isoformat()},
+        now=NOW,
         max_age_seconds=180,
         max_consecutive_errors=10,
     )
@@ -326,7 +333,7 @@ def test_bool_consecutive_errors_is_unhealthy_not_a_crash() -> None:
     """bool is a subclass of int in Python; explicitly reject it so a stray `true`/`false`
     in the JSON (e.g. from a future schema change) can't silently coerce into 0 or 1.
     """
-    now = datetime.now(UTC)
+    now = NOW
     healthy, reason = healthcheck.evaluate_heartbeat(
         _payload(last_poll_ts=now.isoformat(), consecutive_errors=True),
         now=now,
@@ -553,7 +560,7 @@ def test_main_is_unhealthy_when_file_is_missing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_env: None
 ) -> None:
     monkeypatch.setenv("TBOT_HEARTBEAT_FILE", str(tmp_path / "does-not-exist.json"))
-    assert healthcheck.main([]) == 1
+    assert healthcheck.main([], clock=_clock) == 1
 
 
 def test_main_is_unhealthy_when_file_is_malformed_json(
@@ -562,7 +569,7 @@ def test_main_is_unhealthy_when_file_is_malformed_json(
     path = tmp_path / "heartbeat.json"
     path.write_text("{not valid json", encoding="utf-8")
     monkeypatch.setenv("TBOT_HEARTBEAT_FILE", str(path))
-    assert healthcheck.main([]) == 1  # must not raise
+    assert healthcheck.main([], clock=_clock) == 1  # must not raise
 
 
 def test_main_is_unhealthy_when_file_is_valid_json_but_not_an_object(
@@ -571,7 +578,7 @@ def test_main_is_unhealthy_when_file_is_valid_json_but_not_an_object(
     path = tmp_path / "heartbeat.json"
     path.write_text("[1, 2, 3]", encoding="utf-8")
     monkeypatch.setenv("TBOT_HEARTBEAT_FILE", str(path))
-    assert healthcheck.main([]) == 1
+    assert healthcheck.main([], clock=_clock) == 1
 
 
 def test_main_prints_evaluate_heartbeat_reason_not_the_payload_itself(
@@ -592,7 +599,7 @@ def test_main_prints_evaluate_heartbeat_reason_not_the_payload_itself(
     path.write_text('"some status"', encoding="utf-8")  # valid JSON, a bare string
     monkeypatch.setenv("TBOT_HEARTBEAT_FILE", str(path))
 
-    assert healthcheck.main([]) == 1
+    assert healthcheck.main([], clock=_clock) == 1
 
     stderr = capsys.readouterr().err
     assert "some status" not in stderr
@@ -620,10 +627,10 @@ def test_main_is_healthy_for_a_fresh_low_error_heartbeat(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_env: None
 ) -> None:
     path = tmp_path / "heartbeat.json"
-    payload = _payload(last_poll_ts=datetime.now(UTC).isoformat(), consecutive_errors=0)
+    payload = _payload(last_poll_ts=NOW.isoformat(), consecutive_errors=0)
     path.write_text(json.dumps(payload), encoding="utf-8")
     monkeypatch.setenv("TBOT_HEARTBEAT_FILE", str(path))
-    assert healthcheck.main([]) == 0
+    assert healthcheck.main([], clock=_clock) == 0
 
 
 def test_main_is_unhealthy_when_consecutive_errors_crosses_env_threshold(
@@ -631,23 +638,23 @@ def test_main_is_unhealthy_when_consecutive_errors_crosses_env_threshold(
 ) -> None:
     """Reviewer's exact M5 scenario end to end: every poll failing, file still fresh."""
     path = tmp_path / "heartbeat.json"
-    payload = _payload(last_poll_ts=datetime.now(UTC).isoformat(), consecutive_errors=10)
+    payload = _payload(last_poll_ts=NOW.isoformat(), consecutive_errors=10)
     path.write_text(json.dumps(payload), encoding="utf-8")
     monkeypatch.setenv("TBOT_HEARTBEAT_FILE", str(path))
     monkeypatch.setenv("TBOT_HEARTBEAT_MAX_CONSECUTIVE_ERRORS", "10")
-    assert healthcheck.main([]) == 1
+    assert healthcheck.main([], clock=_clock) == 1
 
 
 def test_main_respects_overridden_max_age_env_var(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_env: None
 ) -> None:
     path = tmp_path / "heartbeat.json"
-    stale_ts = datetime.now(UTC) - timedelta(seconds=30)
+    stale_ts = NOW - timedelta(seconds=30)
     payload = _payload(last_poll_ts=stale_ts.isoformat(), consecutive_errors=0)
     path.write_text(json.dumps(payload), encoding="utf-8")
     monkeypatch.setenv("TBOT_HEARTBEAT_FILE", str(path))
     monkeypatch.setenv("TBOT_HEARTBEAT_MAX_AGE_SECONDS", "10")  # stricter than the 30s-old file
-    assert healthcheck.main([]) == 1
+    assert healthcheck.main([], clock=_clock) == 1
 
 
 def test_main_falls_back_to_defaults_on_malformed_env_vars(
@@ -657,12 +664,12 @@ def test_main_falls_back_to_defaults_on_malformed_env_vars(
     the healthcheck -- it should fall back to the built-in defaults.
     """
     path = tmp_path / "heartbeat.json"
-    payload = _payload(last_poll_ts=datetime.now(UTC).isoformat(), consecutive_errors=0)
+    payload = _payload(last_poll_ts=NOW.isoformat(), consecutive_errors=0)
     path.write_text(json.dumps(payload), encoding="utf-8")
     monkeypatch.setenv("TBOT_HEARTBEAT_FILE", str(path))
     monkeypatch.setenv("TBOT_HEARTBEAT_MAX_AGE_SECONDS", "not-a-number")
     monkeypatch.setenv("TBOT_HEARTBEAT_MAX_CONSECUTIVE_ERRORS", "also-not-a-number")
-    assert healthcheck.main([]) == 0
+    assert healthcheck.main([], clock=_clock) == 0
 
 
 def test_main_is_unhealthy_when_trade_staleness_crosses_env_threshold(
@@ -671,7 +678,7 @@ def test_main_is_unhealthy_when_trade_staleness_crosses_env_threshold(
     """m3 end to end: polling itself looks perfectly healthy, but the trade feed is stale per a
     tightened TBOT_HEARTBEAT_MAX_TRADE_STALENESS_SECONDS."""
     path = tmp_path / "heartbeat.json"
-    now = datetime.now(UTC)
+    now = NOW
     stale_trade_ms = int((now - timedelta(seconds=120)).timestamp() * 1000)
     payload = _payload(
         last_poll_ts=now.isoformat(), consecutive_errors=0, last_new_trade_ts_ms=stale_trade_ms
@@ -679,7 +686,7 @@ def test_main_is_unhealthy_when_trade_staleness_crosses_env_threshold(
     path.write_text(json.dumps(payload), encoding="utf-8")
     monkeypatch.setenv("TBOT_HEARTBEAT_FILE", str(path))
     monkeypatch.setenv("TBOT_HEARTBEAT_MAX_TRADE_STALENESS_SECONDS", "60")  # stricter than 120s old
-    assert healthcheck.main([]) == 1
+    assert healthcheck.main([], clock=_clock) == 1
 
 
 def test_main_uses_default_trade_staleness_when_env_var_is_unset(
@@ -689,14 +696,14 @@ def test_main_uses_default_trade_staleness_when_env_var_is_unset(
     inter-trade gap -- see the module docstring) must not false-alarm on an ordinary quiet
     period."""
     path = tmp_path / "heartbeat.json"
-    now = datetime.now(UTC)
+    now = NOW
     quiet_but_fine_ms = int((now - timedelta(seconds=2000)).timestamp() * 1000)  # > old 1800s default
     payload = _payload(
         last_poll_ts=now.isoformat(), consecutive_errors=0, last_new_trade_ts_ms=quiet_but_fine_ms
     )
     path.write_text(json.dumps(payload), encoding="utf-8")
     monkeypatch.setenv("TBOT_HEARTBEAT_FILE", str(path))
-    assert healthcheck.main([]) == 0
+    assert healthcheck.main([], clock=_clock) == 0
 
 
 def test_main_is_unhealthy_when_no_trade_ever_recorded_past_staleness_window(
@@ -705,7 +712,7 @@ def test_main_is_unhealthy_when_no_trade_ever_recorded_past_staleness_window(
     """NIT end to end: a database that has never recorded a single trade must fail once
     first_poll_ts_ms is older than the (possibly env-overridden) trade-staleness threshold."""
     path = tmp_path / "heartbeat.json"
-    now = datetime.now(UTC)
+    now = NOW
     first_poll_ms = int((now - timedelta(seconds=120)).timestamp() * 1000)
     payload = _payload(
         last_poll_ts=now.isoformat(),
@@ -716,18 +723,18 @@ def test_main_is_unhealthy_when_no_trade_ever_recorded_past_staleness_window(
     path.write_text(json.dumps(payload), encoding="utf-8")
     monkeypatch.setenv("TBOT_HEARTBEAT_FILE", str(path))
     monkeypatch.setenv("TBOT_HEARTBEAT_MAX_TRADE_STALENESS_SECONDS", "60")
-    assert healthcheck.main([]) == 1
+    assert healthcheck.main([], clock=_clock) == 1
 
 
 def test_main_falls_back_to_default_trade_staleness_on_malformed_env_var(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_env: None
 ) -> None:
     path = tmp_path / "heartbeat.json"
-    payload = _payload(last_poll_ts=datetime.now(UTC).isoformat(), consecutive_errors=0)
+    payload = _payload(last_poll_ts=NOW.isoformat(), consecutive_errors=0)
     path.write_text(json.dumps(payload), encoding="utf-8")
     monkeypatch.setenv("TBOT_HEARTBEAT_FILE", str(path))
     monkeypatch.setenv("TBOT_HEARTBEAT_MAX_TRADE_STALENESS_SECONDS", "not-a-number")
-    assert healthcheck.main([]) == 0  # must not crash; falls back to the default
+    assert healthcheck.main([], clock=_clock) == 0  # must not crash; falls back to the default
 
 
 def test_module_is_self_contained_stdlib_only() -> None:

@@ -8,8 +8,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
-import time
-from datetime import UTC, datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -190,7 +189,7 @@ def test_m2_second_run_exits_3_without_touching_anything(tmp_path: Path) -> None
     _make_day(src / DAY, 5)
     dst.mkdir()
     (dst / "status.json").write_text('{"sentinel": 1}', encoding="utf-8")
-    holder = backup.RunLock(dst / ".lock")
+    holder = backup.RunLock(dst / ".lock", lambda: NOW)
     assert holder.acquire()
     try:
         assert backup.run(src, dst, codec=GzipCodec(), now=NOW) == 3
@@ -216,6 +215,15 @@ sys.exit(backup.run(Path({src!r}), Path({dst!r}), codec=Slow(), now=NOW))
 """
 
 
+_CLI_SCRIPT = """
+import sys
+sys.path.insert(0, {repo!r})
+sys.path.insert(0, {deploy!r})
+from tests.deploy.test_backup_lbank import backup, NOW
+sys.exit(backup.main(["--source-dir", {src!r}, "--dest-dir", {dst!r}], clock=lambda: NOW))
+"""
+
+
 def test_m2_two_processes_at_once_second_does_nothing_destructive(tmp_path: Path) -> None:
     src, dst = _dirs(tmp_path)
     _make_day(src / DAY, 9)
@@ -224,9 +232,11 @@ def test_m2_two_processes_at_once_second_does_nothing_destructive(tmp_path: Path
     try:
         assert first.stdout is not None
         assert first.stdout.readline().strip() == "compressing"  # A is inside the critical section
-        cli = [sys.executable, str(REPO / "deploy" / "backup_lbank.py")]
-        second = subprocess.run(
-            [*cli, "--source-dir", str(src), "--dest-dir", str(dst)],
+        cli_script = _CLI_SCRIPT.format(
+            repo=str(REPO), deploy=str(REPO / "deploy"), src=str(src), dst=str(dst)
+        )
+        second = subprocess.run(  # the real CLI entry point, on the same fixed clock as process A
+            [sys.executable, "-c", cli_script],
             capture_output=True,
             text=True,
             timeout=120,
@@ -323,7 +333,7 @@ def test_m6_status_json_schema_on_success(tmp_path: Path) -> None:
     assert started.utcoffset() is not None and started <= datetime.fromisoformat(status["ts"])
     ts = datetime.fromisoformat(status["ts"])
     assert ts.utcoffset() is not None and ts.utcoffset().total_seconds() == 0  # type: ignore[union-attr]
-    assert abs((datetime.now(UTC) - ts).total_seconds()) < 120
+    assert ts == NOW and started == NOW  # every stamp comes from the run's clock, not the real one
     assert status["ok"] is True and status["exit_code"] == 0
     assert status["days_archived"] == ["2026-10-11"] and status["days_pending"] == []
     assert isinstance(status["message"], str) and status["integrity_ok"] is True
@@ -405,29 +415,28 @@ def test_major1_status_is_in_progress_and_not_ok_while_the_run_works(
 
 def test_major1_lock_file_records_pid_and_start_time(tmp_path: Path) -> None:
     lock_path = tmp_path / ".lock"
-    lock = backup.RunLock(lock_path)
+    lock = backup.RunLock(lock_path, lambda: NOW)
     assert lock.acquire()
     try:
         holder = backup.read_holder(lock_path)
         assert holder is not None and holder.pid == os.getpid()
-        assert abs(holder.started - time.time()) < 60
+        assert holder.started == pytest.approx(NOW.timestamp(), abs=0.001)
     finally:
         lock.release()
 
 
 def test_major1_holder_older_than_the_timeout_exits_4_and_touches_nothing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     src, dst = _dirs(tmp_path)
     _make_day(src / DAY, 5)
     dst.mkdir()
     (dst / "status.json").write_text('{"sentinel": 1}', encoding="utf-8")
-    holder = backup.RunLock(dst / ".lock")
+    started = NOW - timedelta(seconds=backup.STUCK_AFTER_S + 5)  # the holder is past the timeout ...
+    holder = backup.RunLock(dst / ".lock", lambda: started)
     assert holder.acquire()
-    real_epoch = backup._epoch
-    monkeypatch.setattr(backup, "_epoch", lambda: real_epoch() + backup.STUCK_AFTER_S + 5)
     try:
-        assert backup.run(src, dst, codec=GzipCodec(), now=NOW) == 4
+        assert backup.run(src, dst, codec=GzipCodec(), clock=lambda: NOW) == 4  # ... at the run's NOW
     finally:
         holder.release()
     assert "running" in capsys.readouterr().err  # said so in the log
@@ -435,25 +444,30 @@ def test_major1_holder_older_than_the_timeout_exits_4_and_touches_nothing(
     assert (dst / "status.json").read_text(encoding="utf-8") == '{"sentinel": 1}'
 
 
-def test_major1_holder_younger_than_the_timeout_still_exits_3(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_major1_holder_younger_than_the_timeout_still_exits_3(tmp_path: Path) -> None:
     src, dst = _dirs(tmp_path)
     dst.mkdir()
-    holder = backup.RunLock(dst / ".lock")
+    started = NOW - timedelta(seconds=backup.STUCK_AFTER_S - 60)  # one minute short of the timeout
+    holder = backup.RunLock(dst / ".lock", lambda: started)
     assert holder.acquire()
-    real_epoch = backup._epoch
-    monkeypatch.setattr(backup, "_epoch", lambda: real_epoch() + backup.STUCK_AFTER_S - 60)
     try:
-        assert backup.run(src, dst, codec=GzipCodec(), now=NOW) == 3
+        assert backup.run(src, dst, codec=GzipCodec(), clock=lambda: NOW) == 3
     finally:
         holder.release()
+
+
+def test_major1_now_and_clock_together_are_rejected(tmp_path: Path) -> None:
+    src, dst = _dirs(tmp_path)
+    _make_day(src / DAY, 5)
+    with pytest.raises(TypeError, match="not both"):
+        backup.run(src, dst, codec=GzipCodec(), now=NOW, clock=lambda: NOW)
+    assert _count(src / DAY) == 5 and not dst.exists()  # rejected before anything was touched
 
 
 def test_major1_unreadable_holder_info_is_treated_as_a_normal_busy_lock(tmp_path: Path) -> None:
     src, dst = _dirs(tmp_path)
     dst.mkdir()
-    holder = backup.RunLock(dst / ".lock")
+    holder = backup.RunLock(dst / ".lock", lambda: NOW)
     assert holder.acquire()
     try:
         (dst / ".lock").write_text("not a pid\n", encoding="ascii")
@@ -473,9 +487,10 @@ def test_major1_lock_of_a_dead_pid_is_taken_over(tmp_path: Path) -> None:
     )
     dead_pid = int(dead.stdout)
     assert not backup._pid_alive(dead_pid)
-    orphan = backup.RunLock(dst / ".lock")  # stands for a descriptor inherited by an orphaned child
+    # stands for a descriptor inherited by an orphaned child
+    orphan = backup.RunLock(dst / ".lock", lambda: NOW)
     assert orphan.acquire()
-    (dst / ".lock").write_text(f"{dead_pid} {time.time():.3f}\n", encoding="ascii")
+    (dst / ".lock").write_text(f"{dead_pid} {NOW.timestamp():.3f}\n", encoding="ascii")
     try:
         assert backup.run(src, dst, codec=GzipCodec(), now=NOW) == 0
     finally:

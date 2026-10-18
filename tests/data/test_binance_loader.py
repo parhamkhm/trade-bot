@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import io
 import zipfile
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from itertools import pairwise
 from pathlib import Path
@@ -27,6 +27,7 @@ from tbot.data import quality as quality_mod
 from tbot.data import store as store_mod
 
 FIXTURES = Path(__file__).parent / "fixtures"
+HOLDOUT_NOW = datetime(2031, 3, 4, 5, 6, 7, tzinfo=UTC)  # stamped on the holdout-log rows these tests write
 
 
 def _csv_bytes(name: str) -> bytes:
@@ -991,7 +992,12 @@ def test_holdout_refuses_when_only_one_lock_is_present(
 
     with pytest.raises(bl.HoldoutLockError, match="BOTH"):
         bl.load_bars(
-            "BTCUSDT", Timeframe.H1, allow_holdout=allow_holdout, config=config, holdout_log_path=log_path
+            "BTCUSDT",
+            Timeframe.H1,
+            allow_holdout=allow_holdout,
+            config=config,
+            holdout_log_path=log_path,
+            now=HOLDOUT_NOW,
         )
 
     assert log_path.is_file()
@@ -1013,6 +1019,7 @@ def test_holdout_unseals_with_both_locks_and_logs(tmp_path: Path, monkeypatch: p
         caller="test-suite",
         reason="gate G4 rehearsal",
         holdout_log_path=log_path,
+        now=HOLDOUT_NOW,
     )
 
     assert len(bars) == 6  # both months, holdout included
@@ -1021,6 +1028,7 @@ def test_holdout_unseals_with_both_locks_and_logs(tmp_path: Path, monkeypatch: p
     assert "unsealed" in log_text
     assert "test-suite" in log_text
     assert "gate G4 rehearsal" in log_text
+    assert "2031-03-04T05:06:07Z" in log_text  # the injected instant, not today's date
 
 
 # --- BLOCKER B1 / decision D-026: holdout_start is a code constant, not a config value ----------
@@ -1040,7 +1048,9 @@ def test_holdout_start_later_than_canonical_is_refused_not_extra_rows(
     log_path = tmp_path / "holdout.md"
 
     with pytest.raises(bl.HoldoutLockError, match="canonical"):
-        bl.load_bars("BTCUSDT", Timeframe.H1, config=config, holdout_log_path=log_path)
+        bl.load_bars(
+            "BTCUSDT", Timeframe.H1, config=config, holdout_log_path=log_path, now=HOLDOUT_NOW
+        )
 
     assert log_path.is_file()
     assert "refused: holdout_start overridden" in log_path.read_text(encoding="utf-8")
@@ -1057,7 +1067,13 @@ def test_holdout_start_earlier_than_canonical_is_also_refused(
     _ingest_june_2024_ms(config)
 
     with pytest.raises(bl.HoldoutLockError, match="canonical"):
-        bl.load_bars("BTCUSDT", Timeframe.H1, config=config, holdout_log_path=tmp_path / "holdout.md")
+        bl.load_bars(
+            "BTCUSDT",
+            Timeframe.H1,
+            config=config,
+            holdout_log_path=tmp_path / "holdout.md",
+            now=HOLDOUT_NOW,
+        )
 
 
 def test_holdout_start_mismatch_allowed_when_both_locks_engaged(
@@ -1079,6 +1095,7 @@ def test_holdout_start_mismatch_allowed_when_both_locks_engaged(
         caller="test-suite",
         reason="gate G4 rehearsal",
         holdout_log_path=tmp_path / "holdout.md",
+        now=HOLDOUT_NOW,
     )
 
     assert len(bars) == 6
@@ -1256,6 +1273,7 @@ def test_ingest_unsealed_with_both_locks_reaches_the_holdout_year(
     log_text = log_path.read_text(encoding="utf-8")
     assert "ingest_symbol_timeframe" in log_text
     assert "unsealed" in log_text
+    assert "2025-11-15T00:00:00Z" in log_text  # the ingest's injected ``now``
 
 
 # --- minor fix 3: the sidecar is saved after every month, not once at the end -------------------
@@ -1295,6 +1313,49 @@ def test_ingest_saves_sidecar_incrementally_so_a_crash_mid_run_keeps_earlier_mon
         config.parquet_root, source="binance", symbol="BTCUSDT", timeframe=Timeframe.H1, year=2024, month=6
     )
     assert part_path.is_file()
+
+
+# --- review minor: _append_holdout_log rejects a naive `now`, stamps via astimezone(UTC) --------
+
+
+def test_append_holdout_log_rejects_a_naive_now(tmp_path: Path) -> None:
+    log_path = tmp_path / "holdout.md"
+    with pytest.raises(ValueError, match="timezone-aware"):
+        bl._append_holdout_log(
+            log_path,
+            caller="test",
+            reason="r",
+            outcome="refused: test",
+            now=datetime(2026, 1, 1),  # noqa: DTZ001 -- deliberately naive; that's what's rejected
+        )
+    assert not log_path.is_file()  # rejected before any row was written
+
+
+def test_append_holdout_log_stamps_a_non_utc_now_converted_to_utc(tmp_path: Path) -> None:
+    log_path = tmp_path / "holdout.md"
+    tehran = timezone(timedelta(hours=3, minutes=30))
+    now = datetime(2026, 1, 1, 12, 0, tzinfo=tehran)  # 2026-01-01T08:30:00Z
+
+    bl._append_holdout_log(log_path, caller="test", reason="r", outcome="refused: test", now=now)
+
+    text = log_path.read_text(encoding="utf-8")
+    assert "2026-01-01T08:30:00Z" in text
+    assert "12:00:00" not in text  # the naive local wall-clock value must never leak through
+
+
+def test_append_holdout_log_default_now_is_unchanged(tmp_path: Path) -> None:
+    """Production default (``now=None``) is unaffected by the added validation --
+    ``datetime.now(UTC)`` is already timezone-aware, so it must not raise, and the stamped row
+    must still be a well-formed UTC timestamp (``...Z``). The actual value is the real clock, so
+    this test does not (and must not) assert a specific instant."""
+    log_path = tmp_path / "holdout.md"
+
+    bl._append_holdout_log(log_path, caller="test", reason="r", outcome="refused: test", now=None)
+
+    row = log_path.read_text(encoding="utf-8").splitlines()[-1]
+    timestamp = row.split("|")[1].strip()
+    assert timestamp.endswith("Z")
+    datetime.fromisoformat(timestamp.replace("Z", "+00:00"))  # parses as a valid instant
 
 
 # --- minor fix 1: the holdout-log default path is resolved explicitly, not guessed --------------
@@ -1360,7 +1421,9 @@ def test_the_real_research_holdout_log_is_never_touched_by_the_suite(
     _ingest_june_2024_ms(config)
 
     with pytest.raises(bl.HoldoutLockError):
-        bl.load_bars("BTCUSDT", Timeframe.H1, allow_holdout=True, config=config)  # no holdout_log_path!
+        bl.load_bars(
+            "BTCUSDT", Timeframe.H1, allow_holdout=True, config=config, now=HOLDOUT_NOW
+        )  # no holdout_log_path!
 
     after = real_log.read_text(encoding="utf-8") if real_log.is_file() else None
     assert after == before  # untouched -- the autouse fixture redirected the default path
@@ -1388,7 +1451,7 @@ def test_refused_or_unsealed_access_still_resolves_the_default_log_path_when_nee
     monkeypatch.setattr(bl, "_default_holdout_log_path", _fake_default)
 
     with pytest.raises(bl.HoldoutLockError, match="BOTH"):
-        bl.load_bars("BTCUSDT", Timeframe.H1, allow_holdout=True, config=config)
+        bl.load_bars("BTCUSDT", Timeframe.H1, allow_holdout=True, config=config, now=HOLDOUT_NOW)
 
     assert calls == 1
     assert fake_default_path.is_file()

@@ -1657,7 +1657,6 @@ def test_setup_logging_quietens_http_libraries_and_emits_json(capsys: pytest.Cap
 @pytest.fixture
 def cli(monkeypatch: pytest.MonkeyPatch, host: Host) -> Host:
     monkeypatch.setattr(hm, "setup_logging", lambda *_a, **_k: None)
-    monkeypatch.setattr(hm, "Probes", host.probes)
     return host
 
 
@@ -1665,7 +1664,9 @@ def test_main_without_credentials_exits_2_and_never_prints_values(
     cli: Host, capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
 ) -> None:
     with caplog.at_level(logging.ERROR):
-        code = hm.main([], env={hm.ENV_TOKEN: "garbage-value-FAKE", hm.ENV_CHAT_ID: FAKE_CHAT})
+        code = hm.main(
+            [], env={hm.ENV_TOKEN: "garbage-value-FAKE", hm.ENV_CHAT_ID: FAKE_CHAT}, probes=cli.probes()
+        )
     assert code == 2
     assert "garbage-value-FAKE" not in caplog.text + capsys.readouterr().out
 
@@ -1675,7 +1676,7 @@ def test_main_check_prints_problems_and_sends_nothing(
 ) -> None:
     seen = patch_urlopen(monkeypatch, FakeResponse(200, b'{"ok": true}'))
     cli.failed_units = {"tbot-trades-backup.service"}
-    assert hm.main(["--check"], env={}) == 0
+    assert hm.main(["--check"], env={}, probes=cli.probes()) == 0
     out = capsys.readouterr().out
     assert "backup:unit:tbot-trades-backup.service" in out
     assert seen == []
@@ -1686,7 +1687,7 @@ def test_main_send_test_sends_one_message(
 ) -> None:
     seen = patch_urlopen(monkeypatch, FakeResponse(200, b'{"ok": true}'))
     env = {hm.ENV_TOKEN: FAKE_TOKEN, hm.ENV_CHAT_ID: FAKE_CHAT}
-    assert hm.main(["--send-test"], env=env) == 0
+    assert hm.main(["--send-test"], env=env, probes=cli.probes()) == 0
     assert len(seen) == 1
     assert "TEST" in seen[0].full_url
     captured = capsys.readouterr()
@@ -1699,7 +1700,7 @@ def test_main_send_test_failure_exits_1_without_leaking_the_token(
 ) -> None:
     patch_urlopen(monkeypatch, _http_error)
     env = {hm.ENV_TOKEN: FAKE_TOKEN, hm.ENV_CHAT_ID: FAKE_CHAT}
-    assert hm.main(["--send-test"], env=env) == 1
+    assert hm.main(["--send-test"], env=env, probes=cli.probes()) == 1
     captured = capsys.readouterr()
     assert "HTTP 401" in captured.err
     assert FAKE_TOKEN not in captured.out + captured.err
@@ -1884,7 +1885,7 @@ def test_main_exits_2_for_an_unknown_retired_name(
     seen = patch_urlopen(monkeypatch, FakeResponse(200, b'{"ok": true}'))
     env = {hm.ENV_TOKEN: FAKE_TOKEN, hm.ENV_CHAT_ID: FAKE_CHAT, hm.ENV_RETIRED: "tabdael"}
     with caplog.at_level(logging.ERROR):
-        assert hm.main([], env=env) == 2
+        assert hm.main([], env=env, probes=cli.probes()) == 2
     assert "unknown target name" in caplog.text
     assert "tabdael" in caplog.text
     assert FAKE_TOKEN not in caplog.text + capsys.readouterr().out
@@ -1892,7 +1893,7 @@ def test_main_exits_2_for_an_unknown_retired_name(
 
 
 def test_main_check_mode_also_rejects_an_unknown_retired_name(cli: Host) -> None:
-    assert hm.main(["--check"], env={hm.ENV_RETIRED: "nope"}) == 2
+    assert hm.main(["--check"], env={hm.ENV_RETIRED: "nope"}, probes=cli.probes()) == 2
 
 
 def test_started_message_and_log_list_the_retired_targets(

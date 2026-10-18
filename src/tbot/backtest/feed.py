@@ -14,6 +14,7 @@ from __future__ import annotations
 import contextlib
 import os
 from collections.abc import Iterator, Sequence
+from datetime import datetime
 
 from tbot.core.types import Bar, Timeframe
 from tbot.data.binance_loader import (
@@ -35,7 +36,10 @@ class FeedError(ValueError):
 class BacktestFeed:
     """Re-iterable replay of one (symbol, timeframe) series."""
 
-    def __init__(self, bars: Sequence[Bar], *, allow_holdout: bool = False) -> None:
+    def __init__(
+        self, bars: Sequence[Bar], *, allow_holdout: bool = False, now: datetime | None = None
+    ) -> None:
+        """``now`` is the instant stamped on a holdout-log row (``None``: the real UTC clock)."""
         if not bars:
             raise FeedError("BacktestFeed needs at least one bar")
         first = bars[0]
@@ -54,7 +58,10 @@ class BacktestFeed:
             # best-effort: no repo root above an installed package means nowhere to log
             with contextlib.suppress(RuntimeError):
                 log_holdout_event(
-                    caller="BacktestFeed.__init__", reason="backtest feed construction", outcome=outcome
+                    caller="BacktestFeed.__init__",
+                    reason="backtest feed construction",
+                    outcome=outcome,
+                    now=now,
                 )
             if not unsealed:
                 raise HoldoutLockError(

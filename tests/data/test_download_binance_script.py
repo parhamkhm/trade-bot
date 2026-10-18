@@ -13,12 +13,15 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
 import scripts.download_binance as download_binance
 
 from tbot.core.types import Timeframe
+from tbot.data import binance_loader
 from tbot.data import store as store_mod
 
 FIXTURES = Path(__file__).parent / "fixtures"
+NOW = datetime(2024, 8, 1, 2, tzinfo=UTC)  # the injected clock: one bar after the last stored bar
 
 
 def _write_config(tmp_path: Path) -> Path:
@@ -104,7 +107,8 @@ def test_report_only_applies_gap_classification_from_sidecar(tmp_path: Path) -> 
     report_dir = tmp_path / "reports"
 
     exit_code = download_binance.main(
-        ["--config", str(config_path), "--report-only", "--report-dir", str(report_dir)]
+        ["--config", str(config_path), "--report-only", "--report-dir", str(report_dir)],
+        clock=lambda: NOW,
     )
     assert exit_code == 0
 
@@ -115,3 +119,36 @@ def test_report_only_applies_gap_classification_from_sidecar(tmp_path: Path) -> 
     assert report["unclassified_gap_count"] == 0
     assert len(report["gaps"]) == 1
     assert report["gaps"][0]["classification"] == "exchange_outage"
+
+
+def test_run_reports_passes_the_injected_clock_to_load_frame(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review minor: ``_run_reports`` builds ``date_tag`` from the injected ``now`` but used to
+    call ``binance_loader.load_frame`` without ``now=now`` at all, so that one call fell through
+    to ``load_frame``'s own default (the real UTC clock) -- one run no longer had one single
+    notion of "now". Capture every ``now`` kwarg ``load_frame`` actually receives and assert it is
+    always the clock injected into ``main()``, never ``None`` (which would mean "ask the real
+    clock instead").
+    """
+    config_path = _write_config(tmp_path)
+    _seed_store_with_a_classified_gap(tmp_path)
+    report_dir = tmp_path / "reports"
+
+    seen_now: list[datetime | None] = []
+    real_load_frame = binance_loader.load_frame
+
+    def _spy_load_frame(*args: object, now: datetime | None = None, **kwargs: object) -> object:
+        seen_now.append(now)
+        return real_load_frame(*args, now=now, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(binance_loader, "load_frame", _spy_load_frame)
+
+    exit_code = download_binance.main(
+        ["--config", str(config_path), "--report-only", "--report-dir", str(report_dir)],
+        clock=lambda: NOW,
+    )
+    assert exit_code == 0
+
+    assert seen_now, "load_frame was never called"
+    assert all(value == NOW for value in seen_now), seen_now

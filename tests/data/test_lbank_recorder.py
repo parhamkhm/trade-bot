@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import json
 import sqlite3
 from decimal import Decimal
@@ -147,8 +148,11 @@ def _rows(data_dir: Path, sql: str) -> list[Any]:
     return rows
 
 
-def _recorder(tmp_path: Path) -> LBankRecorder:
-    rec = LBankRecorder(RecorderConfig(data_dir=tmp_path))
+FIXED_NOW_MS = 1_791_637_448_128  # 2026-10-10 12:44:08 UTC; the injected clock of every recorder below
+
+
+def _recorder(tmp_path: Path, now_ms: int = FIXED_NOW_MS) -> LBankRecorder:
+    rec = LBankRecorder(RecorderConfig(data_dir=tmp_path), now_ms=lambda: now_ms)
     for name in ("depth", "trades", "funding", "kline_minute1"):
         rec.status[name] = lr.StreamStatus()
     return rec
@@ -181,10 +185,9 @@ def test_each_stream_writes_its_raw_rows(tmp_path: Path) -> None:
 
 
 @respx.mock
-def test_same_millisecond_polls_never_drop_a_row(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_same_millisecond_polls_never_drop_a_row(tmp_path: Path) -> None:
     _mock_all()
-    monkeypatch.setattr(lr, "_now_ms", lambda: 1791637448128)
-    rec = _recorder(tmp_path)
+    rec = _recorder(tmp_path)  # the injected clock never advances: every poll lands in the same ms
     store = DayStore(tmp_path)
     with httpx.Client() as client:
         for _ in range(3):
@@ -235,6 +238,7 @@ def test_a_failing_stream_never_stops_another(tmp_path: Path) -> None:
 def test_heartbeat_failure_never_touches_ingestion(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """CLAUDE.md §3.8: the heartbeat is downstream; its failure must not stop raw writes."""
     _mock_all()
+    ticks = itertools.count()  # a fake clock that advances 1 ms per read; next() is atomic across threads
     rec = LBankRecorder(
         RecorderConfig(
             data_dir=tmp_path,
@@ -244,7 +248,8 @@ def test_heartbeat_failure_never_touches_ingestion(tmp_path: Path, monkeypatch: 
             kline_interval_s={"minute1": 0.05},
             kline_lookback_bars={"minute1": 2},
             heartbeat_interval_s=0.01,
-        )
+        ),
+        now_ms=lambda: FIXED_NOW_MS + next(ticks),
     )
 
     def broken() -> None:

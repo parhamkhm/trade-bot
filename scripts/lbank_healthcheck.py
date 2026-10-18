@@ -17,6 +17,7 @@ import os
 import shutil
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -92,7 +93,7 @@ def disk_problem(used: int, total: int, max_pct: float) -> str | None:
     return f"disk {pct:.1f} % used (alarm at {max_pct:g} %)" if pct >= max_pct else None
 
 
-def main() -> int:
+def main(now_ms: Callable[[], int] = lambda: int(time.time() * 1000)) -> int:
     path = Path(os.environ.get("TBOT_LBANK_HEARTBEAT_FILE", "/app/data/lbank/heartbeat.json"))
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -101,7 +102,7 @@ def main() -> int:
         return 1
     ok, reason = evaluate(
         payload,
-        int(time.time() * 1000),
+        now_ms(),
         trades_idle_s=float(os.environ.get("TBOT_LBANK_TRADES_IDLE_S", TRADES_IDLE_S_DEFAULT)),
         bad_polls_max=int(os.environ.get("TBOT_LBANK_BAD_POLLS_MAX", BAD_POLLS_MAX_DEFAULT)),
     )
