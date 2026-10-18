@@ -40,10 +40,11 @@ well as the incoming point's (``CompositeStrategy.stopped_out``).
 Known limitation (engine, not changed here): the tag is per close and is consulted only when the engine routes
 the intent. If the engine skips the decision (``SKIPPED_PENDING``: an earlier order still unfilled, engine.py
 ``on_bar``), the tag of that close is lost and the next close is judged on its own. This cannot occur in the
-OOS window: a pending order at the next daily close needs every 1h bar opening in [t+6h, t+24h) to be
-missing, i.e. 18 or more consecutive missing 1h bars under the manual-delay fill (next-open fills are always done by the
-next close). The 2026-10-05 data-quality reports (research/reports/data_quality_20261005_*_1h.md) show no such
-gap after 2018-02-08; re-check this after any data refresh.
+OOS window: a pending order at the next daily close needs every 1h bar opening in
+[t+6h, t+24h) to be missing, i.e. 18 or more consecutive missing 1h bars under the manual-delay
+fill (next-open fills are always done by the next close). The 2026-10-05 data-quality reports
+(research/reports/data_quality_20261005_*_1h.md) show no such gap after 2018-02-08; re-check this
+after any data refresh.
 """
 
 from __future__ import annotations
@@ -530,9 +531,10 @@ class CompositeStrategy:
         Normally that is the child scheduled at this close. At a schedule-switch close (the key differs from
         the key at the previous daily close) a stop hit on that bar by the OUTGOING point counts too, so the
         answer is ``outgoing.stopped_out_on(w) or incoming.stopped_out_on(w)``. A ``None`` key means "not
-        scheduled" (flat, no child is built) and never reports a stop. A stop reported by the INCOMING point on
-        a switch close also tags it, although S1 did not hold that point's position during the bar: D-092 says
-        "any member enters STOPPED", and the incoming point's state machine did.
+        scheduled" (flat, no child is built) and never reports a stop. A stop reported by
+        the INCOMING point on a switch close also tags it, although S1 did not hold that point's
+        position during the bar: D-092 says "any member enters STOPPED", and the incoming point's
+        state machine did.
         """
         ts = window.as_of
         incoming = self.key_at(ts)
