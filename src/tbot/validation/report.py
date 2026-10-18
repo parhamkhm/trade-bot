@@ -112,8 +112,10 @@ def _header(spec: WalkForwardSpec, ev: Phase3Evaluation) -> list[str]:
         f"Decided items (Parham, 2026-10-12): {POLICY_SUMMARY}.",
         "S1 has no intraday stop of its own; it follows its members' daily stopped states (D-092).",
         "S1 stop-out tag limitation: the engine drops the tag if it skips the decision as SKIPPED_PENDING "
-        "(an earlier order still unfilled). That needs a 1h data gap of 6 bars or more and there is none "
-        "after 2019-08-15, so it cannot occur in the OOS window.",
+        "(an earlier order still unfilled). Under the 6 h manual delay that needs 18 or more consecutive "
+        "missing 1h bars; the 2026-10-05 data-quality reports "
+        "(research/reports/data_quality_20261005_*_1h.md) show none after 2018-02-08, so it cannot occur "
+        "in the OOS window.",
         "",
     ]
 
