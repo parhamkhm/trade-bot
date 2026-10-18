@@ -184,6 +184,7 @@ def _run_reports(
                 as_float=True,
                 caller="scripts/download_binance.py",
                 reason="quality report",
+                now=now,
             )
             for timeframe in timeframes
         }

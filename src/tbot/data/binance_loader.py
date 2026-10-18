@@ -952,8 +952,20 @@ def _append_holdout_log(
     log_path: Path, *, caller: str, reason: str, outcome: str, now: datetime | None = None
 ) -> None:
     """Append one row. ``now`` is the instant stamped on the row; ``None`` (production) reads the
-    real UTC clock, tests pass a fixed instant."""
-    timestamp = (now or datetime.now(UTC)).isoformat().replace("+00:00", "Z")
+    real UTC clock, tests pass a fixed instant.
+
+    Review minor: ``now`` must be timezone-aware. A naive datetime has no defined offset from
+    UTC, so silently treating it as UTC could stamp the wrong instant on the row (exactly the
+    kind of silent clock bug D-094 exists to prevent) -- reject it loudly instead. A non-UTC
+    aware instant is still accepted and converted with ``astimezone(UTC)`` rather than assumed.
+    """
+    instant = now if now is not None else datetime.now(UTC)
+    if instant.tzinfo is None:
+        raise ValueError(
+            "_append_holdout_log: now must be timezone-aware (got a naive datetime); "
+            "pass an aware instant, e.g. datetime(..., tzinfo=UTC)"
+        )
+    timestamp = instant.astimezone(UTC).isoformat().replace("+00:00", "Z")
     row = f"| {timestamp} | {caller} | {reason or '(no reason given)'} | — | {outcome} |\n"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     if not log_path.is_file():

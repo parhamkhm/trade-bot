@@ -16,6 +16,8 @@ Allowed without a marker: ``time.monotonic`` / ``time.perf_counter`` (durations,
 from __future__ import annotations
 
 import ast
+import io
+import tokenize
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -46,69 +48,144 @@ _BANNED: frozenset[str] = frozenset(
 # Banned only when called without the argument that makes them deterministic: ``localtime()`` /
 # ``gmtime()`` / ``ctime()`` read the clock, ``localtime(0)`` does not; ``strftime(fmt)`` reads it,
 # ``strftime(fmt, tuple)`` does not. Value = highest argument count that still reads the clock.
-# As a bare reference (``clock=time.gmtime``) they are always flagged.
+# As a bare reference (``clock=time.gmtime``) they are always flagged. An explicit literal ``None``
+# argument does not count towards this limit: the C stdlib treats ``localtime(None)`` exactly like
+# ``localtime()`` ("now"), so it must not look safe merely because an argument was supplied.
 _BANNED_WITHOUT_ARG: dict[str, int] = {
     "time.localtime": 0,
     "time.gmtime": 0,
     "time.ctime": 0,
     "time.strftime": 1,
 }
-# Constructors that read the clock when handed the string "now" / "today".
-_NOW_STRING_CTORS: frozenset[str] = frozenset({"pandas.Timestamp", "pandas.to_datetime", "numpy.datetime64"})
+# Constructors that read the clock when handed the string "now" / "today", either positionally
+# (arg 0) or through specific keyword arguments.
+_NOW_STRING_CTORS: frozenset[str] = frozenset(
+    {"pandas.Timestamp", "pandas.to_datetime", "numpy.datetime64", "pandas.date_range"}
+)
 _NOW_STRINGS = frozenset({"now", "today"})
+_NOW_STRING_KWARGS: dict[str, frozenset[str]] = {
+    "pandas.Timestamp": frozenset({"ts_input"}),
+    "pandas.date_range": frozenset({"start", "end"}),
+}
+# ``time.clock_gettime(time.CLOCK_REALTIME)`` / ``time.clock_gettime_ns(time.CLOCK_REALTIME)`` read
+# the real wall clock; the same calls with ``time.CLOCK_MONOTONIC`` (or any other clock id) do not,
+# so this one needs its first-argument value inspected rather than just the function name.
+_CLOCK_GETTIME_FUNCS: frozenset[str] = frozenset({"time.clock_gettime", "time.clock_gettime_ns"})
+_REALTIME_CLOCK_IDS: frozenset[str] = frozenset({"time.CLOCK_REALTIME"})
 
 
-def _import_aliases(tree: ast.AST) -> dict[str, str]:
-    """Local name -> fully qualified dotted name, for every import anywhere in the file."""
-    aliases: dict[str, str] = {}
+def _import_aliases(tree: ast.AST) -> dict[str, frozenset[str]]:
+    """Local name -> every fully qualified dotted name it has been imported as, anywhere in the
+    file (module-level or nested in a function/class).
+
+    This module does no scope analysis, so a name rebound in a narrower scope -- e.g. a
+    module-level ``import datetime`` shadowed by a ``from datetime import datetime`` inside one
+    function -- used to simply overwrite the single mapping with whichever import ``ast.walk``
+    happened to visit last, independent of which binding is actually in effect at a given call
+    site. That could make a real ``datetime.datetime.now()`` elsewhere in the file resolve
+    through the wrong alias and go unflagged. Instead, every name an import ever binds anywhere
+    in the file is recorded, and a call is flagged if ANY of its possible bindings would read the
+    clock. False positives are acceptable here; false negatives are not.
+    """
+    aliases: dict[str, set[str]] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for item in node.names:
                 if item.asname:
-                    aliases[item.asname] = item.name
+                    aliases.setdefault(item.asname, set()).add(item.name)
                 else:  # ``import a.b`` binds ``a``
                     top = item.name.split(".")[0]
-                    aliases[top] = top
+                    aliases.setdefault(top, set()).add(top)
         elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
             for item in node.names:
-                aliases[item.asname or item.name] = f"{node.module}.{item.name}"
-    return aliases
+                local = item.asname or item.name
+                aliases.setdefault(local, set()).add(f"{node.module}.{item.name}")
+    return {name: frozenset(qualified) for name, qualified in aliases.items()}
 
 
-def _qualified(node: ast.AST, aliases: dict[str, str]) -> str | None:
-    """Dotted name of a ``Name`` / ``Attribute`` chain with import aliases resolved, else ``None``."""
+def _qualified(node: ast.AST, aliases: dict[str, frozenset[str]]) -> frozenset[str] | None:
+    """Every candidate dotted name a ``Name`` / ``Attribute`` chain could resolve to, with every
+    recorded import binding for each name expanded (see ``_import_aliases``), else ``None``."""
     if isinstance(node, ast.Name):
-        return aliases.get(node.id, node.id)
+        return aliases.get(node.id, frozenset({node.id}))
     if isinstance(node, ast.Attribute):
-        base = _qualified(node.value, aliases)
-        return None if base is None else f"{base}.{node.attr}"
+        bases = _qualified(node.value, aliases)
+        return None if bases is None else frozenset(f"{base}.{node.attr}" for base in bases)
     return None
 
 
-def _reads_clock(name: str, call: ast.Call | None) -> bool:
-    """Does ``name`` -- called as ``call``, or merely referenced when ``call`` is None -- read the clock?"""
-    if name in _BANNED:
+def _effective_arg_count(call: ast.Call) -> int:
+    """Argument count for the ``_BANNED_WITHOUT_ARG`` check, except an explicit literal ``None``
+    positional argument never counts: ``time.localtime(None)`` reads the real clock exactly like
+    ``time.localtime()``."""
+    args = [a for a in call.args if not (isinstance(a, ast.Constant) and a.value is None)]
+    return len(args) + len(call.keywords)
+
+
+def _reads_clock(names: frozenset[str], call: ast.Call | None) -> bool:
+    """Does any candidate name in ``names`` -- called as ``call``, or merely referenced when
+    ``call`` is ``None`` -- read the clock?"""
+    if names & _BANNED:
         return True
-    limit = _BANNED_WITHOUT_ARG.get(name)
-    return limit is not None and (call is None or len(call.args) + len(call.keywords) <= limit)
+    count = _effective_arg_count(call) if call is not None else None
+    for name in names:
+        limit = _BANNED_WITHOUT_ARG.get(name)
+        if limit is not None and (count is None or count <= limit):
+            return True
+    return False
 
 
-def _is_now_string_ctor(name: str | None, call: ast.Call) -> bool:
-    if name not in _NOW_STRING_CTORS or not call.args:
-        return False
-    first = call.args[0]
+def _is_now_string(node: ast.expr) -> bool:
     return (
-        isinstance(first, ast.Constant)
-        and isinstance(first.value, str)
-        and first.value.strip().lower() in _NOW_STRINGS
+        isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and node.value.strip().lower() in _NOW_STRINGS
     )
 
 
-def _marked(lines: list[str], node: ast.AST) -> bool:
+def _is_now_string_ctor(names: frozenset[str] | None, call: ast.Call) -> bool:
+    if not names or not (names & _NOW_STRING_CTORS):
+        return False
+    if call.args and _is_now_string(call.args[0]):
+        return True
+    allowed_kwargs: set[str] = set()
+    for name in names & _NOW_STRING_CTORS:
+        allowed_kwargs |= _NOW_STRING_KWARGS.get(name, frozenset())
+    return any(kw.arg in allowed_kwargs and _is_now_string(kw.value) for kw in call.keywords if kw.arg)
+
+
+def _is_realtime_clock_gettime(
+    names: frozenset[str] | None, call: ast.Call, aliases: dict[str, frozenset[str]]
+) -> bool:
+    if not names or not (names & _CLOCK_GETTIME_FUNCS) or not call.args:
+        return False
+    arg_names = _qualified(call.args[0], aliases)
+    return bool(arg_names and arg_names & _REALTIME_CLOCK_IDS)
+
+
+def _comment_tokens(source: str) -> dict[int, str]:
+    """Map line number -> comment text, for real ``COMMENT`` tokens only (via ``tokenize``) -- a
+    ``# wall-clock-ok:`` that merely appears inside a string literal (e.g. in a docstring showing
+    an example) must never suppress a real finding, and scanning raw source text for the marker
+    substring cannot tell the two apart."""
+    comments: dict[int, str] = {}
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(source).readline):
+            if tok.type == tokenize.COMMENT:
+                comments[tok.start[0]] = tok.string
+    except (tokenize.TokenError, SyntaxError, IndentationError):
+        pass
+    return comments
+
+
+def _marked(comments: dict[int, str], node: ast.AST) -> bool:
     start = getattr(node, "lineno", 1)
     end = getattr(node, "end_lineno", start) or start
-    span = lines[start - 1 : end]
-    return any(MARKER in text and text.split(MARKER, 1)[1].strip() for text in span)
+    for lineno in range(start, end + 1):
+        text = comments.get(lineno)
+        if text and MARKER in text and text.split(MARKER, 1)[1].strip():
+            return True
+    return False
 
 
 def find_wall_clock_reads(source: str) -> list[tuple[int, str]]:
@@ -116,11 +193,13 @@ def find_wall_clock_reads(source: str) -> list[tuple[int, str]]:
 
     Catches calls (``datetime.now()``), uncalled references (``clock=datetime.now``,
     ``functools.partial(dt.datetime.now, UTC)``), ``from``-imported and aliased spellings, pandas
-    ``Timestamp.now/utcnow/today``, and the string forms ``Timestamp("now")`` / ``datetime64("today")``.
+    ``Timestamp.now/utcnow/today``, the string forms ``Timestamp("now")`` / ``datetime64("today")``
+    (positionally or via ``ts_input=``/``start=``/``end=``), and ``time.clock_gettime(_ns)`` called
+    with ``time.CLOCK_REALTIME``.
     """
     tree = ast.parse(source)
-    lines = source.splitlines()
     aliases = _import_aliases(tree)
+    comments = _comment_tokens(source)
     parent: dict[int, ast.AST] = {}
     for outer in ast.walk(tree):
         for child in ast.iter_child_nodes(outer):
@@ -129,20 +208,24 @@ def find_wall_clock_reads(source: str) -> list[tuple[int, str]]:
     hits: set[tuple[int, str]] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
-            if _is_now_string_ctor(_qualified(node.func, aliases), node) and not _marked(lines, node):
-                hits.add((node.lineno, f"{ast.unparse(node.func)}({ast.unparse(node.args[0])})"))
+            func_names = _qualified(node.func, aliases)
+            flagged = _is_now_string_ctor(func_names, node) or _is_realtime_clock_gettime(
+                func_names, node, aliases
+            )
+            if flagged and not _marked(comments, node):
+                hits.add((node.lineno, ast.unparse(node)))
             continue
         if not isinstance(node, ast.Attribute | ast.Name):
             continue
-        if isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+        if not isinstance(node.ctx, ast.Load):  # e.g. ``time.time = lambda: 0.0`` is not a read
             continue
         enclosing = parent.get(id(node))
         call = enclosing if isinstance(enclosing, ast.Call) and enclosing.func is node else None
-        name = _qualified(node, aliases)
-        if name is None or not _reads_clock(name, call):
+        names = _qualified(node, aliases)
+        if names is None or not _reads_clock(names, call):
             continue
         anchor: ast.AST = call or node  # a marker anywhere on a multi-line call covers it
-        if _marked(lines, anchor):
+        if _marked(comments, anchor):
             continue
         text = ast.unparse(node)
         hits.add((node.lineno, f"{text}()" if call is not None else f"{text} (uncalled reference)"))
@@ -167,6 +250,18 @@ def test_no_test_reads_the_wall_clock() -> None:
     )
 
 
+def test_test_files_discovers_the_real_test_tree() -> None:
+    """Sanity check on ``_test_files()`` itself, separate from any audit result: a glob that
+    silently stopped covering a subdirectory (e.g. a typo'd pattern, or ``tests/deploy/`` dropping
+    out) would make every rule above vacuously true for exactly the files it stopped seeing.
+    Pin down that the walk still reaches this file and a file nested under a subdirectory, and
+    that the total count is comfortably above what a badly scoped pattern could produce."""
+    discovered = {path.relative_to(TESTS_DIR) for path in _test_files()}
+    assert len(discovered) > 40
+    assert Path(__file__).resolve().relative_to(TESTS_DIR) in discovered
+    assert Path("deploy") / "test_backup_lbank_safety.py" in discovered
+
+
 # -- negative control: the detector itself must detect --------------------------------------------
 
 
@@ -183,6 +278,7 @@ def test_no_test_reads_the_wall_clock() -> None:
         "from datetime import datetime as D\nx = D.now()\n",
         "from datetime import date\nx = date.today()\n",
         "import datetime\nx = datetime.date.today()\n",
+        "import datetime\nx = datetime.datetime.today()\n",
         "from datetime import datetime, UTC\nx = datetime.now(UTC)\n",
         "import time\nx = time.gmtime()\n",
         "import time\nx = time.localtime()\n",
@@ -209,6 +305,25 @@ def test_no_test_reads_the_wall_clock() -> None:
         "import numpy as np\nx = np.datetime64('now')\n",
         "import numpy as np\nx = np.datetime64('today')\n",
         "from numpy import datetime64\nx = datetime64('now', 'ms')\n",
+        # a name rebound in a narrower scope must not shield the module-level usage (item 3a)
+        "import datetime\n\n\ndef helper() -> None:\n"
+        "    from datetime import datetime\n    return datetime\n\n\nx = datetime.datetime.now()\n",
+        # explicit None argument still reads the clock (item 3b)
+        "import time\nx = time.localtime(None)\n",
+        "import time\nx = time.gmtime(None)\n",
+        "import time\nx = time.ctime(None)\n",
+        # time.clock_gettime(_ns) with CLOCK_REALTIME (item 3b)
+        "import time\nx = time.clock_gettime(time.CLOCK_REALTIME)\n",
+        "import time\nx = time.clock_gettime_ns(time.CLOCK_REALTIME)\n",
+        "from time import CLOCK_REALTIME, clock_gettime\nx = clock_gettime(CLOCK_REALTIME)\n",
+        # keyword forms of the "now"/"today" string constructors (item 3b)
+        "import pandas as pd\nx = pd.Timestamp(ts_input='now')\n",
+        "import pandas as pd\nx = pd.date_range(start='now', periods=3)\n",
+        "import pandas as pd\nx = pd.date_range(end='today', periods=3)\n",
+        "import pandas as pd\nx = pd.date_range('now', periods=3)\n",
+        # a marker that only appears inside a string literal, on the SAME line as the call
+        # (item 3c), is not a real comment and must not suppress this real finding
+        "import time\nx = time.time(); s = '# wall-clock-ok: not a real comment'\n",
     ],
 )
 def test_detector_flags_wall_clock_reads(snippet: str) -> None:
@@ -231,6 +346,23 @@ def test_detector_flags_wall_clock_reads(snippet: str) -> None:
         "import time\nx = time.process_time()\n",
         "import datetime as dt\nclock = lambda: dt.datetime(2031, 2, 28, tzinfo=dt.UTC)\n",
         "from datetime import datetime\nf(clock=datetime.now)  # wall-clock-ok: the default under test\n",
+        # safe controls requested for the new rules (item 3f)
+        "import time\nx = time.ctime(0)\n",
+        "import pandas as pd\nx = pd.to_datetime('2031-02-28')\n",
+        # explicit non-None argument is still safe (item 3b)
+        "import time\nx = time.localtime(0)\ny = time.gmtime(86400)\nz = time.ctime(0)\n",
+        # CLOCK_MONOTONIC (or any non-realtime id) must not be flagged (item 3b)
+        "import time\nx = time.clock_gettime(time.CLOCK_MONOTONIC)\n",
+        "import time\nx = time.clock_gettime_ns(time.CLOCK_MONOTONIC)\n",
+        # a plain variable passed as the clock id resolves to nothing known -> not flagged
+        "import time\nclock_id = 1\nx = time.clock_gettime(clock_id)\n",
+        # keyword forms with an ordinary fixed value are safe (item 3f)
+        "import pandas as pd\nx = pd.Timestamp(ts_input='2031-02-28')\n",
+        "import pandas as pd\nx = pd.date_range(start='2031-01-01', end='2031-02-01')\n",
+        # assignment / deletion targets are not reads (item 3d)
+        "import time\ntime.time = lambda: 0.0\n",
+        "import datetime\ndatetime.datetime.now = lambda: 0\n",
+        "import time\ndel time.time\n",
     ],
 )
 def test_detector_ignores_safe_code(snippet: str) -> None:
@@ -239,6 +371,13 @@ def test_detector_ignores_safe_code(snippet: str) -> None:
 
 def test_marker_needs_a_reason() -> None:
     assert find_wall_clock_reads("import time\nx = time.time()  # wall-clock-ok:\n")
+
+
+def test_marker_as_a_real_comment_suppresses_the_finding() -> None:
+    """Companion to the string-literal negative control above: the SAME marker text, as an
+    actual ``#`` comment, does suppress the finding -- proving ``_comment_tokens`` is keyed by
+    real ``tokenize.COMMENT`` tokens and not merely "the marker text appears somewhere nearby"."""
+    assert find_wall_clock_reads("import time\nx = time.time()  # wall-clock-ok: reason here\n") == []
 
 
 def test_detector_catches_a_planted_offender_in_a_real_file(tmp_path: Path) -> None:

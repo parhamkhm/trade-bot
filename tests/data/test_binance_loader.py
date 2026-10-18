@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import io
 import zipfile
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from itertools import pairwise
 from pathlib import Path
@@ -1313,6 +1313,49 @@ def test_ingest_saves_sidecar_incrementally_so_a_crash_mid_run_keeps_earlier_mon
         config.parquet_root, source="binance", symbol="BTCUSDT", timeframe=Timeframe.H1, year=2024, month=6
     )
     assert part_path.is_file()
+
+
+# --- review minor: _append_holdout_log rejects a naive `now`, stamps via astimezone(UTC) --------
+
+
+def test_append_holdout_log_rejects_a_naive_now(tmp_path: Path) -> None:
+    log_path = tmp_path / "holdout.md"
+    with pytest.raises(ValueError, match="timezone-aware"):
+        bl._append_holdout_log(
+            log_path,
+            caller="test",
+            reason="r",
+            outcome="refused: test",
+            now=datetime(2026, 1, 1),  # noqa: DTZ001 -- deliberately naive; that's what's rejected
+        )
+    assert not log_path.is_file()  # rejected before any row was written
+
+
+def test_append_holdout_log_stamps_a_non_utc_now_converted_to_utc(tmp_path: Path) -> None:
+    log_path = tmp_path / "holdout.md"
+    tehran = timezone(timedelta(hours=3, minutes=30))
+    now = datetime(2026, 1, 1, 12, 0, tzinfo=tehran)  # 2026-01-01T08:30:00Z
+
+    bl._append_holdout_log(log_path, caller="test", reason="r", outcome="refused: test", now=now)
+
+    text = log_path.read_text(encoding="utf-8")
+    assert "2026-01-01T08:30:00Z" in text
+    assert "12:00:00" not in text  # the naive local wall-clock value must never leak through
+
+
+def test_append_holdout_log_default_now_is_unchanged(tmp_path: Path) -> None:
+    """Production default (``now=None``) is unaffected by the added validation --
+    ``datetime.now(UTC)`` is already timezone-aware, so it must not raise, and the stamped row
+    must still be a well-formed UTC timestamp (``...Z``). The actual value is the real clock, so
+    this test does not (and must not) assert a specific instant."""
+    log_path = tmp_path / "holdout.md"
+
+    bl._append_holdout_log(log_path, caller="test", reason="r", outcome="refused: test", now=None)
+
+    row = log_path.read_text(encoding="utf-8").splitlines()[-1]
+    timestamp = row.split("|")[1].strip()
+    assert timestamp.endswith("Z")
+    datetime.fromisoformat(timestamp.replace("Z", "+00:00"))  # parses as a valid instant
 
 
 # --- minor fix 1: the holdout-log default path is resolved explicitly, not guessed --------------
