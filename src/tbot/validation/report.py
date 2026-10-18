@@ -96,11 +96,11 @@ def _gate_line(g: GateResult) -> list[str]:
 
 
 def _header(spec: WalkForwardSpec, ev: Phase3Evaluation) -> list[str]:
+    costs = ev.costs_label or "run costs: label not recorded"
     return [
         "# Phase 3 walk-forward evaluation (T6 steps H1-H5)",
         "",
-        f"> **PROVISIONAL.** Every number below carries the label `{LABEL}`: costs (fee 10 bps per side plus",
-        "> the run's slippage model, the G0 median depth curve of D-091),",
+        f"> **PROVISIONAL.** Every number below carries the label `{LABEL}`: costs ({costs}),",
         "> the 25 % rebalance band and the 6 h manual delay are provisional until the G2 re-pricing, so",
         "> none of",
         "> these results is final and none may be used for a go / no-go decision on its own.",
@@ -111,6 +111,9 @@ def _header(spec: WalkForwardSpec, ev: Phase3Evaluation) -> list[str]:
         f"Logged non-S0 trials used for the DSR: {ev.n_trials}.",
         f"Decided items (Parham, 2026-10-12): {POLICY_SUMMARY}.",
         "S1 has no intraday stop of its own; it follows its members' daily stopped states (D-092).",
+        "S1 stop-out tag limitation: the engine drops the tag if it skips the decision as SKIPPED_PENDING "
+        "(an earlier order still unfilled). That needs a 1h data gap of 6 bars or more and there is none "
+        "after 2019-08-15, so it cannot occur in the OOS window.",
         "",
     ]
 
@@ -153,7 +156,7 @@ SENSITIVITY_BLOCK = "sensitivity, not gating (D-091)"
 
 
 def _sensitivity_section(ev: Phase3Evaluation) -> list[str]:
-    """D-091: adverse-p90 curve, pooled OOS Sharpe and maxDD per contender, both fill modes. Not gating."""
+    """D-091: sensitivity costs, pooled OOS Sharpe and maxDD per contender, both fill modes. Not gating."""
     if not ev.sensitivity_benchmark and not any(s.sensitivity for s in _strategies(ev)):
         return []
     header = ["strategy", "Sharpe(365)", "maxDD"]
@@ -166,11 +169,13 @@ def _sensitivity_section(ev: Phase3Evaluation) -> list[str]:
             if mode in s.sensitivity:
                 run = s.sensitivity[mode]
                 rows.append([f"{s.name} ({mode.value})", _num(run.sharpe), _pct(run.max_drawdown)])
+    run_costs = ev.costs_label or "label not recorded"
+    sens_costs = ev.sensitivity_costs_label or "label not recorded"
     return [
-        f"## Slippage sensitivity, adverse p90 cost curve ({SENSITIVITY_BLOCK})",
+        f"## Slippage sensitivity ({SENSITIVITY_BLOCK})",
         "",
-        "The same fixed schedules re-run with the adverse-p90-cost depth curve. These rows never feed a "
-        "selection, a gate, the DSR, the PBO or X; the numbers above use the median curve.",
+        f"The same fixed schedules re-run with the sensitivity costs: {sens_costs}. These rows never feed a "
+        f"selection, a gate, the DSR, the PBO or X; the numbers above use the run costs: {run_costs}.",
         "",
         *_table(header, rows),
     ]

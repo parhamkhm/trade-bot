@@ -13,12 +13,13 @@ import pytest
 from tbot.backtest.slippage import stressed
 from tbot.core.types import Side, Timeframe
 from tbot.execution.simulated import DepthCurveSlippage, FlatSlippage, SlippageContext
-from tbot.validation import policy, stats
+from tbot.validation import policy, runs, stats
 from tbot.validation.runs import (
     NORMAL_COSTS,
     STRESS_COSTS,
     FillMode,
     make_config,
+    make_stub_risk,
 )
 from tests.validation.wf_fixtures import make_market
 
@@ -136,3 +137,26 @@ def test_pbo_gating_value_is_the_lambda_le_zero_share_and_the_strict_share_is_in
     assert res.pbo == sum(1 for x in res.logits if x <= 0.0) / n
     assert res.pbo_strict == sum(1 for x in res.logits if x < 0.0) / n
     assert res.pbo > res.pbo_strict
+
+
+# -- make_stub_risk never drops an override silently ---------------------------------------------
+
+
+class _OldStub:
+    """A StubRiskManager of an engine generation that has neither ``rebalance_band`` nor ``id_prefix``."""
+
+    def __init__(
+        self, *, taker_fee_bps: Decimal, slippage_bps: Decimal, buy_buffer_bps: Decimal = Decimal(0)
+    ) -> None:
+        self.args = (taker_fee_bps, slippage_bps, buy_buffer_bps)
+
+
+def test_make_stub_risk_raises_when_an_override_cannot_be_applied(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = make_config(make_market(), D1, FillMode.NEXT_OPEN, NORMAL_COSTS)
+    assert make_stub_risk(cfg, rebalance_band=0.0, id_prefix="so") is not None  # this engine supports both
+    monkeypatch.setattr(runs, "StubRiskManager", _OldStub)
+    with pytest.raises(TypeError, match="rebalance_band"):
+        make_stub_risk(cfg, rebalance_band=0.0)
+    with pytest.raises(TypeError, match="id_prefix"):
+        make_stub_risk(cfg, id_prefix="so")
+    assert make_stub_risk(cfg) is not None  # no override asked: nothing to drop

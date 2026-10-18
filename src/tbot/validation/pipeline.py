@@ -151,6 +151,8 @@ class Phase3Evaluation:
     trial_sharpes: Mapping[str, float]
     n_trials: int
     sensitivity_benchmark: Mapping[FillMode, SeriesRun] = field(default_factory=dict)  # D-091, not gating
+    costs_label: str = ""  # ``CostSpec.label`` of the run costs, printed by the report
+    sensitivity_costs_label: str = ""  # ``CostSpec.label`` of the D-091 sensitivity costs ("" = none)
 
 
 def _period_score(sharpe: float | None) -> float:
@@ -295,6 +297,8 @@ def evaluate(inp: EvalInputs) -> Phase3Evaluation:
         trial_sharpes=trial_sharpes,
         n_trials=inp.logged_non_s0_trials,
         sensitivity_benchmark=sens_bh,
+        costs_label=inp.costs.label,
+        sensitivity_costs_label=inp.sensitivity_costs.label if inp.sensitivity_costs is not None else "",
     )
 
 

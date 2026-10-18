@@ -161,13 +161,11 @@ def check_stop_out_aware(
 ) -> list[str]:
     """Every grid strategy implements ``stopped_out_on(window)`` (D-092): S1 follows its members' stop-outs.
 
-    A strategy that fails to load is skipped here (``check_registry_importable`` reports it). S0 is not an S1
-    member, so it is not asked.
+    A strategy that fails to load is skipped here (``check_registry_importable`` reports it). S0 is asked too:
+    it can be an S1 member (a strategy that passed G3, S0 included, D-092 / SPEC 7.2 H3).
     """
     problems: list[str] = []
     for entry in entries:
-        if entry.key == "S0":
-            continue
         try:
             strategy = loader(entry)
         except Exception:

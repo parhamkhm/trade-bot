@@ -254,9 +254,10 @@ MEMBER_WEIGHT = 0.4
 KEYS = ("m0", "m1", "m2", "m3", "m4")
 
 
-def _flat_market(n: int = N_FLAT) -> Market:
+def _flat_market(n: int = N_FLAT, *, hourly: bool = False) -> Market:
     """A market whose price never moves, so the held weight stays at the entry weight (~0.40) and a band
-    decision is a pure function of the target path. Daily bars only (the next-open fill needs no 1h feed)."""
+    decision is a pure function of the target path. Daily bars, plus flat 1h bars with ``hourly`` (the 6 h
+    manual-delay fill needs the 1h execution feed)."""
     price = Decimal("20000.00")
     bars = [
         Bar(
@@ -271,7 +272,26 @@ def _flat_market(n: int = N_FLAT) -> Market:
         )
         for i in range(n)
     ]
-    return Market(SYMBOL, {D1: bars}, filters=lbank_like_filters())
+    series = {D1: bars}
+    if hourly:
+        series[Timeframe.H1] = [
+            Bar(
+                symbol=SYMBOL,
+                timeframe=Timeframe.H1,
+                ts=START + (k + 1) * Timeframe.H1.delta,
+                open=price,
+                high=price,
+                low=price,
+                close=price,
+                volume=Decimal(1),
+            )
+            for k in range(n * 24)
+        ]
+    return Market(SYMBOL, series, filters=lbank_like_filters())
+
+
+def _market_for(mode: FillMode) -> Market:
+    return _flat_market(hourly=mode is MD)
 
 
 class _Scripted:
@@ -369,11 +389,12 @@ def _sells_after(result: BacktestResult, ts: datetime) -> list[object]:
 STOP_TS = START + (STOP_DAY_INDEX + 1) * D1.delta  # close of the stop-out day
 
 
-def test_a_stop_out_driven_cut_of_the_blend_from_040_to_032_trades_without_the_band() -> None:
+@pytest.mark.parametrize("mode", [NO, MD])
+def test_a_stop_out_driven_cut_of_the_blend_from_040_to_032_trades_without_the_band(mode: FillMode) -> None:
     """(a) 5 members at 0.40 each; m0 is stopped out on STOP_TS: the mean falls 0.40 -> 0.32 (a 20 % relative
     cut, inside the 25 % band) and the order is still sent."""
-    market = _flat_market()
-    result, _ = _run_flat(market, _scripted_factory(STOP_TS, reports_stop=True))
+    market = _market_for(mode)
+    result, _ = _run_flat(market, _scripted_factory(STOP_TS, reports_stop=True), mode)
     before_ts = STOP_TS - D1.delta
     assert _decision(result, before_ts)[0] == pytest.approx(0.40)
     held = next(p.weight for p in result.equity if p.ts == STOP_TS)
@@ -386,30 +407,32 @@ def test_a_stop_out_driven_cut_of_the_blend_from_040_to_032_trades_without_the_b
     assert after == pytest.approx(0.32, abs=0.01)
 
 
-def test_the_same_cut_from_an_ordinary_vol_resize_is_blocked_by_the_band() -> None:
+@pytest.mark.parametrize("mode", [NO, MD])
+def test_the_same_cut_from_an_ordinary_vol_resize_is_blocked_by_the_band(mode: FillMode) -> None:
     """(b) the identical 0.40 -> 0.32 target path, but m0 does NOT report a stop-out (a vol resize): the
     25 % band holds the position."""
-    market = _flat_market()
-    result, _ = _run_flat(market, _scripted_factory(STOP_TS, reports_stop=False))
+    market = _market_for(mode)
+    result, _ = _run_flat(market, _scripted_factory(STOP_TS, reports_stop=False), mode)
     target, outcome = _decision(result, STOP_TS)
     assert target == pytest.approx(0.32) and outcome == NO_ACTION
     assert _sells_after(result, STOP_TS) == []
     assert all(p.weight == pytest.approx(0.40, abs=0.01) for p in result.equity if p.ts >= STOP_TS)
 
 
-def test_an_ordinary_signal_exit_of_one_member_keeps_the_band_but_the_same_cut_by_a_stop_out_trades() -> None:
+@pytest.mark.parametrize("mode", [NO, MD])
+def test_an_ordinary_signal_exit_keeps_the_band_but_the_same_cut_by_a_stop_out_trades(mode: FillMode) -> None:
     """Netting rule, ordinary-exit case: 5 members at 0.5 (each contributes 0.1 to S1). m0 leaves by an
     ordinary signal exit: S1 0.5 -> 0.4 (a 20 % cut) is inside the 25 % band and is NOT traded. The same cut
     caused by m0 being stopped out IS traded."""
-    market = _flat_market()
-    ordinary, _ = _run_flat(market, _scripted_factory(STOP_TS, reports_stop=False, weight=0.5))
+    market = _market_for(mode)
+    ordinary, _ = _run_flat(market, _scripted_factory(STOP_TS, reports_stop=False, weight=0.5), mode)
     assert _decision(ordinary, STOP_TS - D1.delta)[0] == pytest.approx(0.5)
     target, outcome = _decision(ordinary, STOP_TS)
     assert target == pytest.approx(0.4) and outcome == NO_ACTION
     assert _sells_after(ordinary, STOP_TS) == []
     assert all(p.weight == pytest.approx(0.5, abs=0.01) for p in _points_from(ordinary, STOP_TS))
 
-    stopped, _ = _run_flat(market, _scripted_factory(STOP_TS, reports_stop=True, weight=0.5))
+    stopped, _ = _run_flat(market, _scripted_factory(STOP_TS, reports_stop=True, weight=0.5), mode)
     target, outcome = _decision(stopped, STOP_TS)
     assert target == pytest.approx(0.4) and outcome == ORDER
     assert len(_sells_after(stopped, STOP_TS)) == 1
@@ -421,20 +444,131 @@ def _points_from(result: BacktestResult, ts: datetime) -> list[Any]:
     return [p for p in result.equity if p.ts >= ts]
 
 
-def test_at_a_stop_out_close_the_other_members_moves_are_netted_into_one_trade_to_the_full_target() -> None:
+@pytest.mark.parametrize("mode", [NO, MD])
+def test_at_a_stop_out_close_other_members_moves_are_netted_into_one_trade_to_the_full_target(
+    mode: FillMode,
+) -> None:
     """Netting rule: at the close where m0 enters STOPPED, m1 also raises its weight by 0.2 (an ordinary
     change). S1 goes 0.40 -> (0 + 0.6 + 3 x 0.4) / 5 = 0.36: a 10 % net cut that the band alone would block.
     With the stop-out tag it trades to the full new target (0.36), the other member's move included."""
-    market = _flat_market()
+    market = _market_for(mode)
     move = (STOP_TS, 0.6)
-    stopped, _ = _run_flat(market, _scripted_factory(STOP_TS, reports_stop=True, m1_move=move))
+    stopped, _ = _run_flat(market, _scripted_factory(STOP_TS, reports_stop=True, m1_move=move), mode)
     target, outcome = _decision(stopped, STOP_TS)
     assert target == pytest.approx(0.36) and outcome == ORDER
     after = next(p.weight for p in stopped.equity if p.ts == STOP_TS + D1.delta)
     assert after == pytest.approx(0.36, abs=0.01)
-    untagged, _ = _run_flat(market, _scripted_factory(STOP_TS, reports_stop=False, m1_move=move))
+    untagged, _ = _run_flat(market, _scripted_factory(STOP_TS, reports_stop=False, m1_move=move), mode)
     target, outcome = _decision(untagged, STOP_TS)
     assert target == pytest.approx(0.36) and outcome == NO_ACTION
+
+
+def _boundary_blend(market: Market, member_for: Callable[[str], Strategy]) -> BlendStrategy:
+    """m0 switches point at STOP_TS (m0-out -> m0-in); m1..m4 hold one point throughout."""
+    anchor = market.anchor
+    schedules: dict[str, Schedule] = {
+        "m0": [(anchor, "m0-out"), (STOP_TS, "m0-in")],
+        **{k: [(anchor, k)] for k in KEYS[1:]},
+    }
+    members = [
+        CompositeStrategy(strategy_id=k, market=market, schedule=sch, factory=member_for)
+        for k, sch in schedules.items()
+    ]
+    return BlendStrategy("S1", members)
+
+
+def _boundary_factory(*, outgoing_stops: bool) -> Callable[[str], Strategy]:
+    """The outgoing point of m0 is stopped out ON the switch close (reports it when ``outgoing_stops``);
+    the incoming point is flat and never reports a stop; the other members sit at 0.40."""
+
+    def make(key: str) -> Strategy:
+        if key == "m0-out":
+            return _Scripted(STOP_TS, reports_stop=outgoing_stops)
+        if key == "m0-in":
+            return _Scripted(None, reports_stop=False, weight=0.0)
+        return _Scripted(None, reports_stop=False)
+
+    return make
+
+
+@pytest.mark.parametrize("mode", [NO, MD])
+def test_a_stop_hit_by_the_outgoing_point_on_a_schedule_switch_close_is_tagged_and_traded(
+    mode: FillMode,
+) -> None:
+    """D-092 at a schedule boundary: the outgoing point is stopped out on the very close the schedule moves
+    to the incoming point (flat). The mean falls 0.40 -> 0.32 (inside the 25 % band) and must still trade,
+    though the INCOMING point reports no stop."""
+    market = _market_for(mode)
+    blend = _boundary_blend(market, _boundary_factory(outgoing_stops=True))
+    result = engine_composite(
+        market, blend, mode, NORMAL_COSTS, baseline=market.anchor, end=market.last_close
+    )
+    target, outcome = _decision(result, STOP_TS)
+    assert target == pytest.approx(0.32) and outcome == ORDER
+    assert len(_sells_after(result, STOP_TS)) == 1
+    after = next(p.weight for p in result.equity if p.ts == STOP_TS + D1.delta)
+    assert after == pytest.approx(0.32, abs=0.01)
+
+
+@pytest.mark.parametrize("mode", [NO, MD])
+def test_the_same_boundary_cut_without_an_outgoing_stop_is_blocked_by_the_band(mode: FillMode) -> None:
+    """Control: identical target path (0.40 -> 0.32 at the switch close), but the outgoing point reports no
+    stop, so it is an ordinary change and the band holds the position."""
+    market = _market_for(mode)
+    blend = _boundary_blend(market, _boundary_factory(outgoing_stops=False))
+    result = engine_composite(
+        market, blend, mode, NORMAL_COSTS, baseline=market.anchor, end=market.last_close
+    )
+    target, outcome = _decision(result, STOP_TS)
+    assert target == pytest.approx(0.32) and outcome == NO_ACTION
+    assert _sells_after(result, STOP_TS) == []
+
+
+def test_composite_stopped_out_unscheduled_and_switch_cases() -> None:
+    """A member whose key is None (not scheduled) reports False and no child is built; on a switch close
+    both the outgoing and the incoming point are asked; a switch to None still reports the outgoing stop."""
+    market = _flat_market()
+    built: list[str] = []
+
+    def make(key: str) -> Strategy:
+        built.append(key)
+        return _Scripted(STOP_TS if key == "out" else None, reports_stop=True)
+
+    closes = market.daily_closes
+    window = market.window_to(D1, closes[3])
+    assert window is not None
+    # not scheduled before the first start: False, nothing built
+    late = CompositeStrategy(strategy_id="late", market=market, schedule=[(STOP_TS, "out")], factory=make)
+    assert late.stopped_out(window) is False and built == []
+    assert late.on_bar(window).target_weight == 0.0 and built == []
+    # explicit None key: same
+    none_key = CompositeStrategy(
+        strategy_id="none", market=market, schedule=[(market.anchor, None)], factory=make
+    )
+    assert none_key.stopped_out(window) is False and built == []
+
+    stop_window = market.window_to(D1, STOP_TS)
+    assert stop_window is not None
+    # out -> None at STOP_TS: the incoming is not scheduled, the outgoing point's stop still counts
+    to_none = CompositeStrategy(
+        strategy_id="to-none", market=market, schedule=[(market.anchor, "out"), (STOP_TS, None)], factory=make
+    )
+    assert to_none.stopped_out(stop_window) is True
+    # out -> in at STOP_TS: both asked; the incoming reports no stop, the outgoing does
+    built.clear()
+    switch = CompositeStrategy(
+        strategy_id="switch", market=market, schedule=[(market.anchor, "out"), (STOP_TS, "in")], factory=make
+    )
+    assert switch.stopped_out(stop_window) is True
+    assert sorted(built) == ["in", "out"]
+    # one close after the switch only the incoming point is asked
+    after = market.window_to(D1, STOP_TS + D1.delta)
+    assert after is not None
+    built.clear()
+    fresh = CompositeStrategy(
+        strategy_id="fresh", market=market, schedule=[(market.anchor, "out"), (STOP_TS, "in")], factory=make
+    )
+    assert fresh.stopped_out(after) is False and built == ["in"]
 
 
 def test_the_exempt_manager_routes_on_the_tag_alone_whatever_the_direction() -> None:

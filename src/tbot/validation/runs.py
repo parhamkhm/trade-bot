@@ -34,7 +34,14 @@ S1 trades to its full new target (including the other members' moves at that clo
 ``BlendStrategy`` tags the intent on that close and ``StopOutExemptRiskManager`` sends a tagged intent
 through a band-0 manager. Every other change of S1's target, a member's ordinary signal exit included, keeps
 S0's rebalance rule on the netted position (25 % band; entries from 0 and exits to 0 always trade). Members
-must implement :class:`StopOutAware`.
+must implement :class:`StopOutAware`. At a schedule-switch close a stop hit by the outgoing point counts as
+well as the incoming point's (``CompositeStrategy.stopped_out``).
+
+Known limitation (engine, not changed here): the tag is per close and is consulted only when the engine routes
+the intent. If the engine skips the decision (``SKIPPED_PENDING``: an earlier order still unfilled, engine.py
+``on_bar``), the tag of that close is lost and the next close is judged on its own. This cannot occur in the
+OOS window: a pending order at a daily close needs a 1h data gap of 6 bars or more under the manual-delay fill
+(next-open fills are always done by the next close), and there is no such gap after 2019-08-15.
 """
 
 from __future__ import annotations
@@ -315,9 +322,15 @@ def make_stub_risk(
     """The engine's default ``StubRiskManager`` for ``cfg`` (built the way the engine builds it).
 
     ``rebalance_band`` overrides the config's band (0.0 always trades a non-zero gap) and ``id_prefix`` the
-    client-order-id prefix, which two managers sharing one engine run must make distinct.
+    client-order-id prefix, which two managers sharing one engine run must make distinct. If the engine's
+    ``StubRiskManager`` lacks the parameter for an override that was asked for, this raises ``TypeError``
+    (an override is never dropped silently).
     """
     params = inspect.signature(StubRiskManager.__init__).parameters
+    if rebalance_band is not None and "rebalance_band" not in params:
+        raise TypeError("the engine's StubRiskManager has no rebalance_band; cannot build the band-0 manager")
+    if id_prefix is not None and "id_prefix" not in params:
+        raise TypeError("the engine's StubRiskManager has no id_prefix; two managers would share order ids")
     kwargs: dict[str, Any] = {
         "taker_fee_bps": cfg.costs.taker_fee_bps,
         "slippage_bps": cfg.costs.slippage_bps,
@@ -329,7 +342,7 @@ def make_stub_risk(
         )
     elif "drift_tolerance" in params:
         kwargs["drift_tolerance"] = getattr(cfg, "drift_tolerance", 0.02)
-    if id_prefix is not None and "id_prefix" in params:
+    if id_prefix is not None:
         kwargs["id_prefix"] = id_prefix
     return StubRiskManager(**kwargs)
 
@@ -510,11 +523,21 @@ class CompositeStrategy:
         return TargetIntent(self.id, ts, weight, f"{key}")
 
     def stopped_out(self, window: BarWindow) -> bool:
-        """True iff the scheduled child was stopped out by its daily rule on the last bar of ``window``."""
+        """True iff a scheduled child was stopped out by its daily rule on the last bar of ``window``.
+
+        Normally that is the child scheduled at this close. At a schedule-switch close (the key differs from
+        the key at the previous daily close) a stop hit on that bar by the OUTGOING point counts too, so the
+        answer is ``outgoing.stopped_out_on(w) or incoming.stopped_out_on(w)``. A ``None`` key means "not
+        scheduled" (flat, no child is built) and never reports a stop.
+        """
         ts = window.as_of
-        key = self.key_at(ts)
-        if key is None:
-            return False
+        incoming = self.key_at(ts)
+        outgoing = self.key_at(ts - Timeframe.D1.delta)
+        keys = [k for k in dict.fromkeys((outgoing, incoming)) if k is not None]
+        flags = [self._child_stopped_out(k, ts) for k in keys]  # no short-circuit: every child is asked
+        return any(flags)
+
+    def _child_stopped_out(self, key: str, ts: datetime) -> bool:
         child = self._child(key)
         if not isinstance(child, StopOutAware):
             raise TypeError(f"{key}: the strategy has no stopped_out_on(window); S1 needs it (D-092)")

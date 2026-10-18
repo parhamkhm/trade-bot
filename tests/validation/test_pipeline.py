@@ -334,6 +334,25 @@ def test_sensitivity_never_changes_a_selection_a_gate_dsr_pbo_or_x(
         assert a.pooled[MD].equity == b.pooled[MD].equity  # the run costs still drive the headline series
 
 
+def test_report_prints_the_actual_cost_labels_of_the_run_and_the_sensitivity(
+    evaluation: Phase3Evaluation, sensitive: Phase3Evaluation
+) -> None:
+    run_text = render_report(evaluation, SPEC)
+    assert f"costs ({evaluation.costs_label})" in run_text and evaluation.costs_label
+    # the old hard-coded wording (the D-091 decision text in the policy summary is separate and stays)
+    assert "the G0 median depth curve of D-091" not in run_text and "fee 10 bps per side plus" not in run_text
+    sens_text = render_report(sensitive, SPEC)
+    assert sensitive.sensitivity_costs_label == STRESS_COSTS.label
+    assert f"sensitivity costs: {STRESS_COSTS.label}." in sens_text
+    assert f"the run costs: {sensitive.costs_label}." in sens_text
+    assert "adverse-p90-cost depth curve" not in sens_text and "above use the median curve" not in sens_text
+
+
+def test_report_states_the_s1_stop_out_tag_limitation(evaluation: Phase3Evaluation) -> None:
+    text = render_report(evaluation, SPEC)
+    assert "SKIPPED_PENDING" in text and "cannot occur in the OOS window" in text
+
+
 def test_report_shows_the_sensitivity_block_marked_not_gating(sensitive: Phase3Evaluation) -> None:
     text = render_report(sensitive, SPEC)
     assert "sensitivity, not gating (D-091)" in text

@@ -167,6 +167,15 @@ def test_a_grid_strategy_without_stopped_out_on_is_refused_for_s1() -> None:
     assert check_stop_out_aware(lambda _e: _AwareStrategy()) == []  # type: ignore[arg-type,return-value]
 
 
+def test_s0_is_asked_for_stopped_out_on_too_because_it_can_be_an_s1_member() -> None:
+    def loader(entry: Phase3Entry) -> Strategy:
+        return SmaFilter(100) if entry.key == "S0" else _AwareStrategy()  # type: ignore[return-value]
+
+    assert check_stop_out_aware(loader) == [
+        "S0: no stopped_out_on(window); S1 cannot follow its stop-outs (D-092)"
+    ]
+
+
 def test_a_strategy_that_fails_to_load_is_reported_by_the_importable_check_not_twice() -> None:
     def loader(entry: Phase3Entry) -> Strategy:
         raise ModuleNotFoundError("x", name="x")
