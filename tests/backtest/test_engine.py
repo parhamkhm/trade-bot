@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -679,18 +679,21 @@ def test_feed_is_reiterable() -> None:
     assert len(feed) == 5
 
 
+HOLDOUT_NOW = datetime(2031, 3, 4, 5, 6, 7, tzinfo=UTC)  # stamped on the holdout-log rows these tests write
+
+
 def test_sealed_holdout_bars_are_refused(monkeypatch: pytest.MonkeyPatch) -> None:
     start = CANONICAL_HOLDOUT_START - timedelta(days=2)
     bars = [make_bar(i, "100", "100", start=start) for i in range(4)]  # last bar closes inside the holdout
     monkeypatch.delenv("TBOT_UNSEAL_HOLDOUT", raising=False)
     with pytest.raises(HoldoutLockError):
-        BacktestFeed(bars)
+        BacktestFeed(bars, now=HOLDOUT_NOW)
     with pytest.raises(HoldoutLockError):
-        BacktestFeed(bars, allow_holdout=True)  # one lock is not enough
+        BacktestFeed(bars, allow_holdout=True, now=HOLDOUT_NOW)  # one lock is not enough
     monkeypatch.setenv("TBOT_UNSEAL_HOLDOUT", "G4")
     with pytest.raises(HoldoutLockError):
-        BacktestFeed(bars)  # the other lock alone is not enough either
-    assert len(BacktestFeed(bars, allow_holdout=True)) == 4
+        BacktestFeed(bars, now=HOLDOUT_NOW)  # the other lock alone is not enough either
+    assert len(BacktestFeed(bars, allow_holdout=True, now=HOLDOUT_NOW)) == 4
     # the shared predicate is by CLOSE time (``ts``), matching the loader (SPEC: "ts < holdout_start"):
     # a bar whose close is exactly the boundary is already sealed, so "before" must close strictly earlier.
     before = [make_bar(i, "100", "100", start=start - timedelta(days=1)) for i in range(2)]
@@ -700,7 +703,8 @@ def test_sealed_holdout_bars_are_refused(monkeypatch: pytest.MonkeyPatch) -> Non
     at_boundary = [make_bar(0, "100", "100", start=CANONICAL_HOLDOUT_START - timedelta(days=1))]
     assert at_boundary[0].ts == CANONICAL_HOLDOUT_START
     with pytest.raises(HoldoutLockError):
-        BacktestFeed(at_boundary)  # closing exactly at the boundary is already sealed, not "before" it
+        # closing exactly at the boundary is already sealed, not "before" it
+        BacktestFeed(at_boundary, now=HOLDOUT_NOW)
 
 
 def test_engine_level_holdout_guard_catches_a_custom_feed_that_skips_its_own_check(
@@ -712,11 +716,13 @@ def test_engine_level_holdout_guard_catches_a_custom_feed_that_skips_its_own_che
     sealed = [make_bar(0, "100", "100", start=CANONICAL_HOLDOUT_START)]
     monkeypatch.delenv("TBOT_UNSEAL_HOLDOUT", raising=False)
     with pytest.raises(HoldoutLockError):
-        run_backtest(_RawFeed(sealed), Scripted([0.0]), make_config())
+        run_backtest(_RawFeed(sealed), Scripted([0.0]), make_config(), now=HOLDOUT_NOW)
     with pytest.raises(HoldoutLockError):
-        run_backtest(_RawFeed(sealed), Scripted([0.0]), make_config(), allow_holdout=True)  # one lock
+        # one lock
+        run_backtest(_RawFeed(sealed), Scripted([0.0]), make_config(), allow_holdout=True, now=HOLDOUT_NOW)
     monkeypatch.setenv("TBOT_UNSEAL_HOLDOUT", "G4")
-    assert run_backtest(_RawFeed(sealed), Scripted([0.0]), make_config(), allow_holdout=True).n_bars == 1
+    both = run_backtest(_RawFeed(sealed), Scripted([0.0]), make_config(), allow_holdout=True, now=HOLDOUT_NOW)
+    assert both.n_bars == 1
 
 
 def _unseal_rows(log: Path) -> list[str]:
@@ -733,9 +739,11 @@ def test_unsealing_is_logged_once_per_run_not_once_per_bar(
 ) -> None:
     monkeypatch.setenv("TBOT_UNSEAL_HOLDOUT", "G4")
     bars = _sealed_bars()
-    res = run_backtest(_RawFeed(bars), Scripted([0.5]), make_config(), allow_holdout=True)
+    res = run_backtest(_RawFeed(bars), Scripted([0.5]), make_config(), allow_holdout=True, now=HOLDOUT_NOW)
     assert res.n_bars == 4
-    assert len(_unseal_rows(tmp_path / "HOLDOUT_LOG.md")) == 1  # 4 sealed bars, 1 log row
+    rows = _unseal_rows(tmp_path / "HOLDOUT_LOG.md")
+    assert len(rows) == 1  # 4 sealed bars, 1 log row
+    assert "2031-03-04T05:06:07Z" in rows[0]  # the injected instant, not today's date
 
 
 def test_benchmarks_take_allow_holdout_so_a_g4_run_unseals_exactly_once_per_run(
@@ -746,16 +754,16 @@ def test_benchmarks_take_allow_holdout_so_a_g4_run_unseals_exactly_once_per_run(
     second unsealing. With both locks set it must run, logging one unsealing per engine run."""
     feed, cfg, strat = _RawFeed(_sealed_bars()), make_config(), Scripted([0.5])
     monkeypatch.setenv("TBOT_UNSEAL_HOLDOUT", "G4")
-    res = run_backtest(feed, strat, cfg, allow_holdout=True)
+    res = run_backtest(feed, strat, cfg, allow_holdout=True, now=HOLDOUT_NOW)
     with pytest.raises(HoldoutLockError):  # the first lock is missing for the benchmarks
-        run_benchmarks(feed, strat, cfg, res)
-    bench = run_benchmarks(feed, strat, cfg, res, allow_holdout=True)
+        run_benchmarks(feed, strat, cfg, res, now=HOLDOUT_NOW)
+    bench = run_benchmarks(feed, strat, cfg, res, allow_holdout=True, now=HOLDOUT_NOW)
     assert bench.buy_and_hold.n_bars == 4 and bench.vol_matched.n_bars == 4
     # strategy + B&H + vol-matched = three engine runs; the refused attempt is logged as a refusal
     assert len(_unseal_rows(tmp_path / "HOLDOUT_LOG.md")) == 3
     monkeypatch.delenv("TBOT_UNSEAL_HOLDOUT")  # the env lock alone must not be enough either
     with pytest.raises(HoldoutLockError):
-        run_benchmarks(feed, strat, cfg, res, allow_holdout=True)
+        run_benchmarks(feed, strat, cfg, res, allow_holdout=True, now=HOLDOUT_NOW)
 
 
 @pytest.mark.parametrize("delay", [timedelta(0), timedelta(hours=6)], ids=["next_open", "delay_6h"])

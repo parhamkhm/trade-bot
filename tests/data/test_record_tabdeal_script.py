@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,16 @@ BASE_URL = "https://api1.tabdeal.org"
 READ_PREFIX = "/r/api/v1"
 TRADES_URL = f"{BASE_URL}{READ_PREFIX}/trades"
 DEPTH_URL = f"{BASE_URL}{READ_PREFIX}/depth"
+
+
+class _FixedClock:
+    """A ``tbot.core.types.Clock`` that always says the same instant (no wall-clock dependence)."""
+
+    def now(self) -> datetime:
+        return datetime(2026, 10, 10, 12, 0, 0, tzinfo=UTC)
+
+
+FIXED_CLOCK = _FixedClock()
 
 
 def _load_json(name: str) -> Any:
@@ -77,7 +88,7 @@ def test_main_never_passes_tabdeal_credentials_even_if_present(
         "--heartbeat-file",
         str(tmp_path / "heartbeat.json"),
     ]
-    exit_code = record_tabdeal.main(argv)
+    exit_code = record_tabdeal.main(argv, clock=FIXED_CLOCK)
 
     assert exit_code == 0
     assert captured["api_key"] is None
@@ -116,7 +127,7 @@ def test_main_defaults_config_to_tbot_config_env_var(tmp_path: Path, monkeypatch
         "--heartbeat-file",
         str(tmp_path / "heartbeat.json"),
     ]
-    exit_code = record_tabdeal.main(argv)
+    exit_code = record_tabdeal.main(argv, clock=FIXED_CLOCK)
 
     assert exit_code == 0
     assert captured["name_or_path"] == str(custom_config)
@@ -170,7 +181,7 @@ def test_main_exits_non_zero_on_recorder_fatal_error(tmp_path: Path, monkeypatch
         str(tmp_path / "heartbeat.json"),
         # deliberately NOT --once: this exercises the run_forever path
     ]
-    exit_code = record_tabdeal.main(argv)
+    exit_code = record_tabdeal.main(argv, clock=FIXED_CLOCK)
 
     assert exit_code == 1
 
@@ -221,7 +232,7 @@ def test_main_registers_secrets_for_logging(
             "--heartbeat-file",
             str(tmp_path / "heartbeat.json"),
         ]
-        exit_code = record_tabdeal.main(argv)
+        exit_code = record_tabdeal.main(argv, clock=FIXED_CLOCK)
         assert exit_code == 0
 
         assert structlog.is_configured()

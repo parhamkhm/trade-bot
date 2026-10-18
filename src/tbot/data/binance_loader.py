@@ -631,6 +631,7 @@ def _resolve_month_range(
         reason=reason,
         log_path=holdout_log_path,
         configured_holdout_start=data_config.holdout_start,
+        now=now,
     )
     if unsealed:
         return start_year, start_month, latest_year, latest_month
@@ -947,8 +948,12 @@ def _default_holdout_log_path() -> Path:
     return _resolve_repo_root() / "research" / "HOLDOUT_LOG.md"
 
 
-def _append_holdout_log(log_path: Path, *, caller: str, reason: str, outcome: str) -> None:
-    timestamp = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+def _append_holdout_log(
+    log_path: Path, *, caller: str, reason: str, outcome: str, now: datetime | None = None
+) -> None:
+    """Append one row. ``now`` is the instant stamped on the row; ``None`` (production) reads the
+    real UTC clock, tests pass a fixed instant."""
+    timestamp = (now or datetime.now(UTC)).isoformat().replace("+00:00", "Z")
     row = f"| {timestamp} | {caller} | {reason or '(no reason given)'} | — | {outcome} |\n"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     if not log_path.is_file():
@@ -961,13 +966,16 @@ def _append_holdout_log(log_path: Path, *, caller: str, reason: str, outcome: st
         fh.write(row)
 
 
-def log_holdout_event(*, caller: str, reason: str, outcome: str, log_path: Path | None = None) -> None:
+def log_holdout_event(
+    *, caller: str, reason: str, outcome: str, log_path: Path | None = None, now: datetime | None = None
+) -> None:
     """Append one row to the holdout log for a caller with no ``DataConfig`` of its own -- the backtest
     feed and engine, which have only ``allow_holdout``/the env var, not a full ``_resolve_holdout_access``
     call. Resolves the default log path the same lazy way ``_resolve_holdout_access`` does, so a plain
-    read never needs to; this is the only other function that writes to the holdout log."""
+    read never needs to; this is the only other function that writes to the holdout log. ``now`` is the
+    instant stamped on the row (``None``: the real UTC clock)."""
     resolved_path = log_path if log_path is not None else _default_holdout_log_path()
-    _append_holdout_log(resolved_path, caller=caller, reason=reason, outcome=outcome)
+    _append_holdout_log(resolved_path, caller=caller, reason=reason, outcome=outcome, now=now)
 
 
 def _resolve_holdout_access(
@@ -977,6 +985,7 @@ def _resolve_holdout_access(
     reason: str,
     log_path: Path | None,
     configured_holdout_start: datetime,
+    now: datetime | None = None,
 ) -> bool:
     """Returns True when the holdout may be included. Raises ``HoldoutLockError`` otherwise.
 
@@ -1008,7 +1017,7 @@ def _resolve_holdout_access(
 
     def _log(outcome: str) -> None:
         resolved_path = log_path if log_path is not None else _default_holdout_log_path()
-        _append_holdout_log(resolved_path, caller=caller, reason=reason, outcome=outcome)
+        _append_holdout_log(resolved_path, caller=caller, reason=reason, outcome=outcome, now=now)
 
     if configured_holdout_start != CANONICAL_HOLDOUT_START and not both_locks:
         _log("refused: holdout_start overridden")
@@ -1050,6 +1059,7 @@ def load_bars(
     caller: str | None = None,
     reason: str = "",
     holdout_log_path: Path | None = None,
+    now: datetime | None = None,
 ) -> list[Bar]:
     """Load closed bars as ``Bar`` objects, excluding the sealed holdout by default.
 
@@ -1063,6 +1073,7 @@ def load_bars(
         reason=reason,
         log_path=holdout_log_path,
         configured_holdout_start=cfg.holdout_start,
+        now=now,
     )
     table = store_mod._read_symbol_timeframe(
         cfg.parquet_root, source=SOURCE, symbol=symbol, timeframe=timeframe, start=start, end=end
@@ -1097,6 +1108,7 @@ def load_frame(
     caller: str | None = None,
     reason: str = "",
     holdout_log_path: Path | None = None,
+    now: datetime | None = None,
 ) -> pd.DataFrame:
     """Load bars as a ``pandas.DataFrame`` (``ts, open, high, low, close, volume, quote_volume,
     trades``), excluding the sealed holdout by default. ``as_float=True`` (default) casts OHLCV
@@ -1110,6 +1122,7 @@ def load_frame(
         reason=reason,
         log_path=holdout_log_path,
         configured_holdout_start=cfg.holdout_start,
+        now=now,
     )
     table = store_mod._read_symbol_timeframe(
         cfg.parquet_root, source=SOURCE, symbol=symbol, timeframe=timeframe, start=start, end=end

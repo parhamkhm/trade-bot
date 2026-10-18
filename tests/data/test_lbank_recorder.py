@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import json
 import sqlite3
 from decimal import Decimal
@@ -237,6 +238,7 @@ def test_a_failing_stream_never_stops_another(tmp_path: Path) -> None:
 def test_heartbeat_failure_never_touches_ingestion(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """CLAUDE.md §3.8: the heartbeat is downstream; its failure must not stop raw writes."""
     _mock_all()
+    ticks = itertools.count()  # a fake clock that advances 1 ms per read; next() is atomic across threads
     rec = LBankRecorder(
         RecorderConfig(
             data_dir=tmp_path,
@@ -246,7 +248,8 @@ def test_heartbeat_failure_never_touches_ingestion(tmp_path: Path, monkeypatch: 
             kline_interval_s={"minute1": 0.05},
             kline_lookback_bars={"minute1": 2},
             heartbeat_interval_s=0.01,
-        )
+        ),
+        now_ms=lambda: FIXED_NOW_MS + next(ticks),
     )
 
     def broken() -> None:

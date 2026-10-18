@@ -189,7 +189,7 @@ def test_m2_second_run_exits_3_without_touching_anything(tmp_path: Path) -> None
     _make_day(src / DAY, 5)
     dst.mkdir()
     (dst / "status.json").write_text('{"sentinel": 1}', encoding="utf-8")
-    holder = backup.RunLock(dst / ".lock")
+    holder = backup.RunLock(dst / ".lock", lambda: NOW)
     assert holder.acquire()
     try:
         assert backup.run(src, dst, codec=GzipCodec(), now=NOW) == 3
@@ -432,11 +432,11 @@ def test_major1_holder_older_than_the_timeout_exits_4_and_touches_nothing(
     _make_day(src / DAY, 5)
     dst.mkdir()
     (dst / "status.json").write_text('{"sentinel": 1}', encoding="utf-8")
-    holder = backup.RunLock(dst / ".lock", lambda: NOW)  # the holder started at NOW ...
+    started = NOW - timedelta(seconds=backup.STUCK_AFTER_S + 5)  # the holder is past the timeout ...
+    holder = backup.RunLock(dst / ".lock", lambda: started)
     assert holder.acquire()
-    later = NOW + timedelta(seconds=backup.STUCK_AFTER_S + 5)  # ... and the second run is past the timeout
     try:
-        assert backup.run(src, dst, codec=GzipCodec(), now=NOW, clock=lambda: later) == 4
+        assert backup.run(src, dst, codec=GzipCodec(), clock=lambda: NOW) == 4  # ... at the run's NOW
     finally:
         holder.release()
     assert "running" in capsys.readouterr().err  # said so in the log
@@ -447,19 +447,27 @@ def test_major1_holder_older_than_the_timeout_exits_4_and_touches_nothing(
 def test_major1_holder_younger_than_the_timeout_still_exits_3(tmp_path: Path) -> None:
     src, dst = _dirs(tmp_path)
     dst.mkdir()
-    holder = backup.RunLock(dst / ".lock", lambda: NOW)
+    started = NOW - timedelta(seconds=backup.STUCK_AFTER_S - 60)  # one minute short of the timeout
+    holder = backup.RunLock(dst / ".lock", lambda: started)
     assert holder.acquire()
-    later = NOW + timedelta(seconds=backup.STUCK_AFTER_S - 60)
     try:
-        assert backup.run(src, dst, codec=GzipCodec(), now=NOW, clock=lambda: later) == 3
+        assert backup.run(src, dst, codec=GzipCodec(), clock=lambda: NOW) == 3
     finally:
         holder.release()
+
+
+def test_major1_now_and_clock_together_are_rejected(tmp_path: Path) -> None:
+    src, dst = _dirs(tmp_path)
+    _make_day(src / DAY, 5)
+    with pytest.raises(TypeError, match="not both"):
+        backup.run(src, dst, codec=GzipCodec(), now=NOW, clock=lambda: NOW)
+    assert _count(src / DAY) == 5 and not dst.exists()  # rejected before anything was touched
 
 
 def test_major1_unreadable_holder_info_is_treated_as_a_normal_busy_lock(tmp_path: Path) -> None:
     src, dst = _dirs(tmp_path)
     dst.mkdir()
-    holder = backup.RunLock(dst / ".lock")
+    holder = backup.RunLock(dst / ".lock", lambda: NOW)
     assert holder.acquire()
     try:
         (dst / ".lock").write_text("not a pid\n", encoding="ascii")
@@ -479,7 +487,8 @@ def test_major1_lock_of_a_dead_pid_is_taken_over(tmp_path: Path) -> None:
     )
     dead_pid = int(dead.stdout)
     assert not backup._pid_alive(dead_pid)
-    orphan = backup.RunLock(dst / ".lock")  # stands for a descriptor inherited by an orphaned child
+    # stands for a descriptor inherited by an orphaned child
+    orphan = backup.RunLock(dst / ".lock", lambda: NOW)
     assert orphan.acquire()
     (dst / ".lock").write_text(f"{dead_pid} {NOW.timestamp():.3f}\n", encoding="ascii")
     try:

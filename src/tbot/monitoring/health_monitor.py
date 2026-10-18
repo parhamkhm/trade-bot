@@ -1295,7 +1295,13 @@ def _print_problems(problems: Mapping[str, Problem]) -> None:
         print(f"{problem.key}: {problem.summary}")
 
 
-def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    env: Mapping[str, str] | None = None,
+    *,
+    probes: Probes | None = None,
+) -> int:
+    """Entry point. ``probes`` (default: the real clock, commands and files) is injectable for tests."""
     parser = argparse.ArgumentParser(description="tbot Telegram health-alert monitor (send-only)")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true", help="run checks once, print problems, send nothing")
@@ -1308,7 +1314,7 @@ def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None
     except ConfigError as exc:
         log.error("configuration error: %s", exc)
         return 2
-    probes = Probes()
+    probes = probes or Probes()
     if args.check:
         _print_problems(collect_problems(settings, probes))
         return 0

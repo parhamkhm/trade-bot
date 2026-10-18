@@ -753,8 +753,12 @@ def run(
     clock: Callable[[], datetime] | None = None,
 ) -> int:
     """One backup run. Every time this run reads or writes (the lock holder's start time, the
-    status.json stamps and the closed-day cut-off) comes from one clock: ``clock``, else the fixed
-    instant ``now`` if given, else the real UTC clock."""
+    status.json stamps and the closed-day cut-off) comes from one source: the callable ``clock``, or
+    the fixed instant ``now``, or (neither given) the real UTC clock. The closed-day cut-off is read
+    once at the start of the run. Passing both ``now`` and ``clock`` raises ``TypeError``: two
+    "nows" in one run is a bug, not a feature."""
+    if now is not None and clock is not None:
+        raise TypeError("pass either now= or clock=, not both: one run has exactly one notion of now")
     codec = codec or ZstdCli()
     fixed = now
     clock_fn: Callable[[], datetime] = clock or (utc_now if fixed is None else (lambda: fixed))

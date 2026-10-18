@@ -96,8 +96,9 @@ class _SealGuard:
     logged ONCE per run (the first sealed bar), not once per bar, so ``research/HOLDOUT_LOG.md`` records
     one entry per unsealed run."""
 
-    def __init__(self, *, allow_holdout: bool) -> None:
+    def __init__(self, *, allow_holdout: bool, now: datetime | None = None) -> None:
         self._allow = allow_holdout
+        self._now = now  # stamped on the holdout-log rows; None: the real UTC clock
         self._unseal_logged = False
 
     def check(self, bar: Bar, *, caller: str) -> None:
@@ -110,7 +111,9 @@ class _SealGuard:
         outcome = "unsealed" if unsealed else "refused: locks mismatched or absent"
         # best-effort: an installed package with no repo root above it has nowhere to log
         with contextlib.suppress(RuntimeError):
-            log_holdout_event(caller=caller, reason="backtest engine bar guard", outcome=outcome)
+            log_holdout_event(
+                caller=caller, reason="backtest engine bar guard", outcome=outcome, now=self._now
+            )
         if not unsealed:
             raise HoldoutLockError(
                 f"a bar closing at {bar.ts.isoformat()} falls in the sealed holdout; this engine-level "
@@ -268,6 +271,7 @@ def run_backtest(
     allocator: Allocator | None = None,
     exec_feed: DataFeed | None = None,
     allow_holdout: bool = False,
+    now: datetime | None = None,
 ) -> BacktestResult:
     """Run one backtest and return positions per bar, fills, equity curve, trades and costs.
 
@@ -280,6 +284,8 @@ def run_backtest(
     engine, not only in ``BacktestFeed``: a custom ``DataFeed`` that skips that check (or a live-replay
     feed built later) cannot bypass the seal just by not calling it. ``allow_holdout`` is the same
     first lock ``BacktestFeed`` takes; the second lock is the ``TBOT_UNSEAL_HOLDOUT=G4`` env var.
+    ``now`` is the instant stamped on the holdout-log rows (``None``: the real UTC clock); it never
+    influences the simulation.
     """
     validate_strategy(strategy)
     if (exec_feed is None) != (config.exec_timeframe is None):
@@ -290,7 +296,7 @@ def run_backtest(
         if exec_feed is not None and config.exec_timeframe is not None
         else None
     )
-    guard = _SealGuard(allow_holdout=allow_holdout)
+    guard = _SealGuard(allow_holdout=allow_holdout, now=now)
     exec_timeframe = config.exec_timeframe or config.timeframe  # the bars orders actually fill on
     previous: Bar | None = None
     for bar in feed.bars(config.symbol, config.timeframe):

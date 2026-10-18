@@ -14,7 +14,6 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -53,15 +52,16 @@ OsClock = Callable[[datetime], None]
 
 @pytest.fixture
 def os_clock(monkeypatch: pytest.MonkeyPatch) -> OsClock:
-    """Pin the real clock: ``time.time`` and the mtime of every sidecar a read-only open creates.
+    """Pin the mtime of every sidecar a read-only open creates (the part of the real clock SQLite owns).
 
-    ``now=NOW`` is injected into ``run`` as before; this models everything else the real clock
-    touches. A sidecar that existed before the open is left alone (SQLite does not touch an existing
+    ``now=NOW`` is injected into ``run``; the backup itself never reads ``time.time`` (the lock, the
+    status stamps and the closed-day cut-off all come from the injected clock), so the only thing
+    left that the operating system stamps with the real instant is the mtime of the files SQLite
+    creates. A sidecar that existed before the open is left alone (SQLite does not touch an existing
     ``-wal`` on a read-only open)."""
 
     def install(instant: datetime) -> None:
         stamp = instant.timestamp()
-        monkeypatch.setattr(time, "time", lambda: stamp)
 
         def ro(db: Path) -> sqlite3.Connection:
             before = {p for p in backup._sidecars(db) if p.exists()}

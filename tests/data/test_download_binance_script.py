@@ -19,6 +19,7 @@ from tbot.core.types import Timeframe
 from tbot.data import store as store_mod
 
 FIXTURES = Path(__file__).parent / "fixtures"
+NOW = datetime(2024, 8, 1, 2, tzinfo=UTC)  # the injected clock: one bar after the last stored bar
 
 
 def _write_config(tmp_path: Path) -> Path:
@@ -104,7 +105,8 @@ def test_report_only_applies_gap_classification_from_sidecar(tmp_path: Path) -> 
     report_dir = tmp_path / "reports"
 
     exit_code = download_binance.main(
-        ["--config", str(config_path), "--report-only", "--report-dir", str(report_dir)]
+        ["--config", str(config_path), "--report-only", "--report-dir", str(report_dir)],
+        clock=lambda: NOW,
     )
     assert exit_code == 0
 

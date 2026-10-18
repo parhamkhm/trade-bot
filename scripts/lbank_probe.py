@@ -2450,9 +2450,9 @@ def main(
     _validate(args, parser)
     if args.selftest:
         return run_selftest(args.out_dir if "--out-dir" in raw_argv else None)
-    if args.summarize:
-        return summarize_file(args.summarize, args.out_dir)
     env = env or Env()
+    if args.summarize:
+        return summarize_file(args.summarize, args.out_dir, now=env.now)
     ratelimit = bool(args.ratelimit)
     prov = collect_provenance(
         env, "ratelimit" if ratelimit else "sampling", raw_argv, host_label=args.host_label
