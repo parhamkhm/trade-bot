@@ -555,13 +555,14 @@ that opened it (under S1 the netted position is treated as one position opened b
 takes over. The new choice is kept at least 3 months, and every switch needs Parham's written approval in
 `docs/reports/`.
 
-### 7.2 Phase 3 pre-registration — final text v3, APPROVED by Parham on 2026-10-12 at commit 73c7646; IN FORCE from the merge of this PR
+### 7.2 Phase 3 pre-registration — final text v3, APPROVED by Parham on 2026-10-12 at commit 73c7646 (in force, D-088); amended by D-090–D-093
 
 Status: **final text v3, submitted 2026-10-12 after Parham's review of v2 (d9c6c38; v1 2f719a6 and v2 were
 merged to main unapproved and never in force); APPROVED by Parham on 2026-10-12 at commit 73c7646; IN FORCE
-from the merge of this PR.** Labels: **[RECORDED]** = copied from decisions already in this document; **[DECIDED
-2026-10-11]** = Parham's decisions on the 2026-10-11 draft; **[OPERATIONAL]** = a detail needed to make a
-decided item exact, fixed now, before any result. Nothing below may change after any Phase 3 result is seen.
+from the merge of PR #24 (D-088).** **Amended by D-090–D-093** (decided 2026-10-12, before any Phase 3 result; in
+force from the merge of PR #31, after Parham's written approval of its exact head commit). Labels: **[RECORDED]** = copied from decisions already in this document; **[DECIDED
+2026-10-11]** = Parham's decisions on the 2026-10-11 draft; **[DECIDED 2026-10-12]** = Parham's decisions of 2026-10-12, before any Phase 3 result (D-090–D-093);
+**[OPERATIONAL]** = a detail needed to make a decided item exact, fixed now, before any result. Nothing below may change after any Phase 3 result is seen.
 Engine commits must be at or after `8d99335`; the sealed holdout (from `holdout_start` = 2025-10-01) stays sealed.
 
 **A. Data availability** — research data on hand (laptop store, checked 2026-10-11): Binance BTCUSDT and
@@ -572,12 +573,12 @@ ETHUSDT klines at 1h, 4h and 1d from the bar opening 2018-01-01 to the bar closi
 | S0 | `sma100_1d` [RECORDED §7.1] | BTCUSDT 1d OHLC (+1h for delayed fills and stops) | 2018-01-01 → 2025-09-30 | **Yes** |
 | C1 | Donchian ensemble | 1d OHLC (+1h) | same | **Yes** |
 | C2 | Time-series momentum | 1d close (+1h) | same | **Yes** |
-| C3 | EWMAC (1d and 4h) | 1d / 4h close (+1h) | same | **Yes** |
+| C3 | EWMAC (1d; the 4h points are out of Phase 3, D-090) | 1d close (+1h) | same | **Yes** |
 | C4 | Volatility-compression breakout | 1d OHLC (+1h) | same | **Yes** |
 | C5 | Pullback mean-reversion (weak evidence) | 1d close (+1h) | same | **Yes** |
 | C6 | Order-book imbalance (hourly) | LBank order-book snapshots | none before the holdout (LBank book history starts 2026-10-10 13:40 UTC) | **No** — see J |
 | — | Funding risk-off overlay (phase 4, G4) | Binance BTCUSDT perpetual funding | from the perpetual's launch (≈ 2019-09; *to verify on download*) | Not a G3 item |
-| ETH | Robustness [RECORDED G3] | ETHUSDT 1d/4h/1h | 2018-01-01 → 2025-09-30 | **Yes** (Sharpe > 0) |
+| ETH | Robustness [RECORDED G3] | ETHUSDT 1d/1h | 2018-01-01 → 2025-09-30 | **Yes** (Sharpe > 0) |
 | Idx | S&P 500 / Nasdaq-100 [RECORDED D-071] | Stooq daily price index | *to verify on download* | Informational only |
 
 MinTRL [RECORDED G3] is reported, not gating. The 365-day minimum belongs to S2 (phase 7b), not to G3. The pooled
@@ -615,15 +616,14 @@ OOS series covers 2020-01-01 → 2025-09-30 (≈ 2,100 days).
 | C2 | (60, 180, 360) | 2018-12-28 00:00 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | C3 | 1d f=(8,16,32) | 2019-01-20 00:00 | – | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | C3 | 1d f=(16,32,64) base | 2020-02-08 00:00 | – | – | – | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| C3 | 4h f=(8,16,32) | 2018-06-01 00:00 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| C3 | 4h f=(16,32,64) | 2018-06-01 00:00 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| C3 | 4h f=(32,64,128) | 2018-09-15 16:00 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | C4 | p=10 | 2019-01-21 00:00 | – | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | C4 | p=20 base | 2019-01-21 00:00 | – | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | C4 | p=30 | 2019-01-21 00:00 | – | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | C5 | x=5 | 2018-07-20 00:00 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | C5 | x=10 base | 2018-07-20 00:00 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | C5 | x=15 | 2018-07-20 00:00 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+
+The three C3 4h rows of the approved v3 table were removed by D-090 [DECIDED 2026-10-12].
 
 - Pooled OOS series = the 12 test periods concatenated [RECORDED §7.1].
 
@@ -633,7 +633,7 @@ OOS series covers 2020-01-01 → 2025-09-30 (≈ 2,100 days).
 with S0's σ̂ (D-056) on the latest completed **daily** close; S0's rebalance rule (transitions always traded; 25 %
 relative band while in position); protective stop fixed for the position at `P_ref − 3 × ATR20`, with `P_ref` = the
 open of the first bar after the entry signal bar and **ATR20 = S0's daily simple ATR20** at the latest completed
-daily close (also for the 4h strategy), floored at 0.01; stop fills as in §7.1 (daily rule for next-open, 1h bars
+daily close, floored at 0.01; stop fills as in §7.1 (daily rule for next-open, 1h bars
 for the delayed model); after a stop-out the strategy stays flat until its own entry condition goes false and then
 true again (a fresh entry). All indicators are finite-window and start-independent; `x_{a..b}` means bars a to b
 inclusive; t is the latest closed bar of the strategy's timeframe.
@@ -642,36 +642,39 @@ inclusive; t is the latest closed bar of the strategy's timeframe.
 |---|---|---|---|
 | C1 | For each lookback n: `U_n = max(high_{t−n..t−1})`, `L_n = min(low_{t−n..t−1})`, `M_n = (U_n + L_n)/2`. Channel n turns long when `close_t > U_n`, turns flat when `close_t < M_n`, else keeps its state. Strategy long iff **at least 2 of the 3** channels are long | lookbacks (n1, n2, n3) ∈ {(10, 28, 50), **(20, 55, 100)**, (40, 110, 200)} | 3 |
 | C2 | `s_h = sign(ln(close_t / close_{t−h}))` (sign 0 = 0). Long iff `mean(s_h1, s_h2, s_h3) > 0` | (h1, h2, h3) days ∈ {(15, 45, 90), **(30, 90, 180)**, (60, 180, 360)} | 3 |
-| C3 | For each pair (f, 4f): `E_k` = finite EWMA of close with α = 2/(k+1), truncated at K = 3k bars and renormalised; `raw = E_f − E_4f`; `σ_p = close_t × stdev(ln returns over the last 36 bars)` (ddof 1); `F = clip(raw / σ_p × c_f, −20, 20)`. Long iff `mean(F over the three pairs) > 0`. Spans are in bars of the timeframe | 1d: fast spans f ∈ {(8, 16, 32), **(16, 32, 64)**}; 4h: f ∈ {(8, 16, 32), (16, 32, 64), (32, 64, 128)} (1d (32, 64, 128) dropped, D-087) | 5 |
+| C3 | For each pair (f, 4f): `E_k` = finite EWMA of close with α = 2/(k+1), truncated at K = 3k bars and renormalised; `raw = E_f − E_4f`; `σ_p = close_t × stdev(ln returns over the last 36 bars)` (ddof 1); `F = clip(raw / σ_p × c_f, −20, 20)`. Long iff `mean(F over the three pairs) > 0`. Spans are in daily bars | 1d: fast spans f ∈ {(8, 16, 32), **(16, 32, 64)**} (1d (32, 64, 128) dropped, D-087; the three 4h points dropped, D-090) | 2 |
 | C4 | `rv_t` = stdev of the last 20 daily ln returns (ddof 1); `pct_t` = share of `rv_{t−364..t}` that is ≤ `rv_t`. Enter when flat if `pct_t ≤ p/100` **and** `close_t > max(high_{t−20..t−1})`; exit when `close_t < (max(high_{t−20..t−1}) + min(low_{t−20..t−1}))/2` | p ∈ {10, **20**, 30} | 3 |
 | C5 | `RSI2_t` = Cutler RSI over 2 bars (simple means of up and down closes over the last 2 changes; 100 if no down move); `SMA200_t` = mean of the last 200 closes. Enter when flat if `close_t > SMA200_t` **and** `RSI2_t < x`; exit when `RSI2_t > 70` | x ∈ {5, **10**, 15} | 3 |
 
-C3 forecast scalars `c_f` [OPERATIONAL]: Carver's published values 8→5.3, 16→3.75, 32→2.65, 64→1.87; for f = 128,
-which is not in his table, **1.32** (the table's ratio of about 1/√2 per doubling, applied once); after D-087 the
-f = 128 scalar is used only by the 4h point (32, 64, 128). C3 on 4h uses
-4h bars for its signal; sizing, stop and band follow the common rules.
+C3 forecast scalars `c_f` [OPERATIONAL]: Carver's published values 8→5.3, 16→3.75, 32→2.65, 64→1.87. The f = 128
+scalar (**1.32**, the table's ratio of about 1/√2 per doubling, applied once) was used only by the 4h point
+(32, 64, 128); after D-090 it is not used in Phase 3.
 
-**Total non-S0 trials: 17** (3 + 3 + 5 + 3 + 3; D-087). S0 = 1 trial (N = 1) [RECORDED §7.1]. S1 has no parameters. No
+**Total non-S0 trials: 14** (3 + 3 + 2 + 3 + 3; D-087, D-090). S0 = 1 trial (N = 1) [RECORDED §7.1]. S1 has no parameters. No
 other configuration is run in Phase 3.
 
 **D. Trial count** [RECORDED D-059, DECIDED wording]: every configuration ever run counts toward the DSR trial
 count, **including failed and abandoned ones**; a configuration counts once it has produced any backtest number.
 For every non-S0 contender N = all non-S0 trials logged in `research/EXPERIMENTS.md` up to the date X is chosen.
-All 17 grid points are logged in `research/EXPERIMENTS.md` **before the first run**.
+All 14 grid points are logged in `research/EXPERIMENTS.md` **before the first run**.
 
 **E. Thresholds** [RECORDED G3 / §7.1, unchanged]: maxDD ≤ 0.60 × maxDD(B&H); Sharpe ≥ 0.80 × Sharpe(B&H); PBO
 < 0.30; DSR ≥ 0.95 (§7.1 definition); ±1-grid-step neighbours keep ≥ 70 % of the Sharpe; ETH/USDT Sharpe > 0 with
 the same rules and parameters; for S0 the six §7.1 robustness variants each keep ≥ 70 %; for S0 and S1 the ×2 cost
 stress stays profitable.
 - PBO [DECIDED]: CSCV per candidate over its grid, on the daily manual-delay return matrix of the grid points over
-  2018-06-01 → 2025-09-30, **S = 16** equal contiguous blocks, Sharpe as the measure. For C3 the grid is all 5
-  points (D-087). A point is included from its first tradable close; days before it count as flat.
+  2018-06-01 → 2025-09-30, **S = 16** equal contiguous blocks, Sharpe as the measure. For C3 the grid is its 2
+  points (D-087, D-090). A point is included from its first tradable close; days before it count as flat.
+- PBO convention [DECIDED 2026-10-12, D-093]: in each CSCV split, the in-sample winner's out-of-sample rank r
+  among the N points (r = 1 the worst, r = N the best; ties take the average rank) gives ω = r / (N + 1) and
+  λ = ln(ω / (1 − ω)) [OPERATIONAL]; the split counts as **overfit when λ ≤ 0** (a winner that lands exactly on
+  the out-of-sample median rank counts as overfit). PBO = the share of overfit splits, and this value is the one
+  used for the gate. The share of splits with λ < 0 is reported next to it for information only.
 - **Neighbour test for per-period-selected candidates** [DECIDED 2026-10-11]: take the grid point P that the
   candidate's own selection procedure picks on the final training window ending at `holdout_start`; compute P's
   **fixed-parameter** pooled OOS manual-delay Sharpe over the 12 test periods; each ±1-step neighbour of P, also
   run with fixed parameters over the same days, must keep ≥ 70 % of it. The ±1 step is the adjacent scale (C1,
-  C2, C3 speed), the adjacent p (C4) or the adjacent x (C5); for C3 the timeframe is not a neighbour axis
-  [OPERATIONAL]. A point at the edge of its grid has one neighbour; after D-087 the 1d C3 base point (16, 32, 64)
+  C2, C3 speed), the adjacent p (C4) or the adjacent x (C5). A point at the edge of its grid has one neighbour; after D-087 the 1d C3 base point (16, 32, 64)
   has the single neighbour (8, 16, 32).
 - **Buy-and-hold benchmark for the G3 ratios** [DECIDED 2026-10-11]: BTCUSDT at weight 1, held continuously over
   the pooled OOS days, with the same fee and slippage model and the entry charged once (no rebalancing); computed
@@ -681,6 +684,19 @@ stress stays profitable.
 **F. Costs** [RECORDED D-060, DECIDED 2026-10-11]
 - Fees: LBank spot VIP 0, taker 10 bps per side (taker assumed).
 - Slippage: the **D-067 provisional curve** (from the G0 probe). **Every Phase 3 number is labelled PROVISIONAL.**
+  Construction [DECIDED 2026-10-12, D-091; the §7 G3 statistic, not a new rule]: the **per-notional median**. Per
+  side (a buy walks the asks, a sell the bids), the points are (0, 0), (the median over the probe samples of
+  the largest market order whose volume-weighted fill price stays within 0.1 % of the best price, 10 bps) and
+  (the same within 0.5 %, 50 bps). Each sample's cost (VWAP walking the book) rises monotonically with notional,
+  so a quantile of those order sizes is the notional at which the opposite quantile of cost equals 10 or 50 bps:
+  exactly for the nearest-rank p10, and for the median (the mean of the two middle of 32 samples) up to the gap
+  between those two samples. These are points of the §7 G3 per-notional median curve. Interpolation,
+  extrapolation, the 10,000 USDT equity normaliser and half the median spread (added once) are as in §7 G3. At
+  0.5 %, one sample per side reached the end of the visible 200-level book, so its size is a lower bound; it can
+  affect only the segment beyond the 0.1 % point, which orders at the 10,000 USDT normaliser never reach.
+- Slippage sensitivity [DECIDED 2026-10-12, D-091], **reported only, never gating**: the adverse tail, the
+  per-notional **p90 of cost** (thin book). By the same argument its points are the **p10 of the order sizes**,
+  plus half the p95 spread (the probe stores no p90 spread; p95 is the more adverse choice).
 - **The G3 verdict comes from ONE complete rerun** of this whole pre-registered procedure (A–I) with the frozen
   LBank depth-at-size curve (§7 G3 model; window from the G1b start to the day G1b passes, then frozen and logged,
   D-085; "the G1b start" is the start of the consecutive healthy run that passes G1b, so if G1b fails and
@@ -695,11 +711,20 @@ execution bars (the first 1h bar opening at or after signal close + 6 h). **The 
 version.** Engine at or after `8d99335` (D-081 fill-time sizing, D-082 resize classification).
 
 **H. T6 selection procedure** [RECORDED §7.1], step by step:
-1. Run S0 (no search) and the 17 grid points of C1–C5 through the walk-forward (B), both fill modes; log every run.
+1. Run S0 (no search) and the 14 grid points of C1–C5 through the walk-forward (B), both fill modes; log every run.
 2. Apply the walk-forward gates to each candidate: G3 (E) plus the non-holdout part of G4 (regime-overlay
    keep/drop, phase 4).
 3. Build S1 = equal-weight blend of every strategy that passed G3 (S0 included if it passed), with S0's band;
-   leave-one-out when compared with a candidate C.
+   leave-one-out when compared with a candidate C. *Stops* [DECIDED 2026-10-12, D-092]: S1 has **no protective
+   stop of its own**. It follows each member's own daily state through that member's target weight (a member in
+   STOPPED contributes 0). A reduction of S1's target caused by a member's stop-out **always trades** and is never
+   blocked by the 25 % band (§7.1 rule 3); [OPERATIONAL] at a close where any member enters STOPPED, S1 trades to
+   its full new target (other members' moves at that close included), ignoring the band. Other changes of S1's
+   target, including a member's ordinary signal exit, keep S0's rebalance rule on the netted position. The report
+   states that S1 has no intraday stop of its own. *Open item, outside Phase 3:* CLAUDE.md §5 and D-050 require a
+   valid protective stop for every long that the phase 4 RiskManager approves; how S1 meets that live (for
+   example a stop per member sub-position) must be decided by Parham before S1 can be deployed. Phase 3 is not
+   affected (it uses the stub risk manager).
 4. C qualifies only if it passes the walk-forward gates, its pooled OOS manual-delay Sharpe exceeds S0's and S1's
    (S1 without C), it beats S0 in at least half of the periods, and DSR(C) ≥ 0.95 with every variant counted.
 5. X = the qualifying C with the highest pooled OOS Sharpe; if none, the better of S0/S1 among those passing the
@@ -713,26 +738,21 @@ version.** Engine at or after `8d99335` (D-081 fill-time sizing, D-082 resize cl
 **I. Robustness** [RECORDED G3, D-071; DECIDED 2026-10-11]: ETH/USDT runs with the same rules and **BTC's
 per-period parameter choices unchanged** (no re-selection on ETH); gating: Sharpe > 0. S&P 500 and Nasdaq-100
 (Stooq, daily, 252-day annualisation, price index) run with the same daily rules and BTC's per-period choices
-unchanged (C3 on 1d only; a period whose BTC choice is a 4h point is flat for the indices), reported for context
+unchanged, reported for context
 only, never a gate.
 
 **J. Data rules** [DECIDED 2026-10-11]
 - **D-040 open:** Phase 3 may run while D-040 is open. No Phase 3 strategy reads bar volume, enforced by two tests
   kept side by side: the static `tests/strategies/test_no_volume_dependency.py`, and the behavioural
-  `tests/strategies/test_volume_invariance.py` — S0 and all 17 grid points run through the real engine path
+  `tests/strategies/test_volume_invariance.py` — S0 and all 14 grid points run through the real engine path
   twice, with the original volume and with volume replaced (random, and separately NaN); targets, orders and
   equity must be bit-identical; parametrised over the registry `tbot.strategies.phase3_registry`; with a
   negative control (a volume-dependent dummy strategy must make it fail). Any future strategy that uses volume
   is blocked until D-040 is closed.
-- **4h ATR rule test:** `tests/strategies/test_c3_4h_daily_atr.py` proves the 4h C3 points use only S0's daily
-  ATR20 of the last COMPLETED daily bar: changing the 4h bars of the incomplete day, or changing a 4h bar of a
-  completed day (its high, low and close) in a way that leaves that day's daily high, low and close unchanged,
-  leaves the stop level unchanged; changing the last completed day's daily range changes it. The same test
-  proves the 4h points' target weight uses only the σ̂ of the last COMPLETED daily close: changing the incomplete
-  day, or only the intrabar high/low of a 4h bar of a completed day with that day's daily high, low and close
-  unchanged, leaves the target weight unchanged; changing the last completed day changes it. A changed 4h close
-  is not covered for the target weight, because 4h closes feed the C3 signal by design (D-089).
-- Until the strategies exist, the strategy-specific cases of both tests skip with the reason "not implemented
+- **4h ATR rule test — retired by D-090** [DECIDED 2026-10-12]: `tests/strategies/test_c3_4h_daily_atr.py`
+  (D-089) is removed with the 4h points. The rule it protected (the stop's ATR20 and the sizing σ̂ are S0's daily
+  values at the latest completed daily close) stays in the common rules (C).
+- Until the strategies exist, the strategy-specific cases of the behavioural volume test skip with the reason "not implemented
   yet"; a strategy PR may not merge while any of its cases skips.
 - **C6 (order book):** option (ii), forward collection. Not evaluated in Phase 3 and **no proxy trials**, so the DSR
   trial count is not inflated. The LBank recorder keeps collecting. **Earliest evaluation date: 2027-10-10**
