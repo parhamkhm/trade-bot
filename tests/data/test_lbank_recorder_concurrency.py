@@ -243,10 +243,15 @@ def test_stop_joins_cleanly_while_a_call_is_still_in_flight(tmp_path: Path) -> N
     )
     thread.start()
     assert _wait_until(lambda: thread.is_alive())
-    release_event.set()  # let in-flight calls finish so stop() + join() do not hang for ~2 s each
+    time.sleep(0.05)  # let the workers enter the hung handler
+    # Stop while calls are still blocked. httpx.MockTransport does not enforce the client timeout, so the
+    # handler's own 2 s wait stands in for `http_timeout_s`: shutdown must be bounded by it, not indefinite.
+    started = time.monotonic()
     rec._stop.set()
-    thread.join(timeout=5)
-    assert not thread.is_alive()  # the thread's own executor.shutdown(wait=True) + client.close() returned
+    thread.join(timeout=10)
+    assert not thread.is_alive()  # executor.shutdown(wait=True) + client.close() returned
+    assert time.monotonic() - started < 4.5
+    release_event.set()
 
 
 @pytest.mark.parametrize("max_concurrent", [3])
@@ -275,7 +280,6 @@ def test_full_recorder_start_stop_is_clean_with_concurrent_depth(tmp_path: Path,
             depth_interval_s=0.02,
             depth_max_concurrent=max_concurrent,
             trades_interval_s=0.05,
-            trades_timeout_s=0.5,
             funding_interval_s=0.05,
             kline_interval_s={"minute1": 0.05},
             kline_lookback_bars={"minute1": 2},
@@ -293,3 +297,39 @@ def test_full_recorder_start_stop_is_clean_with_concurrent_depth(tmp_path: Path,
         rec.join(timeout=10)
     assert all(not t.is_alive() for t in rec._threads)
     assert rec.status["depth"].skipped_total == 0  # plenty of capacity (3) for a 20 ms period here
+
+
+def test_a_worker_store_failure_is_counted_and_alerted_never_silent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A DayStore that cannot be built inside a depth worker (e.g. mkdir/connect failure) must show up in
+    the stream status and as an error-level log, not vanish inside the Future (CLAUDE.md 3.8)."""
+    real = lr.DayStore
+
+    def flaky(data_dir: Path) -> lr.DayStore:
+        if threading.current_thread().name.startswith("depth-poll"):
+            raise OSError("disk unavailable")
+        return real(data_dir)
+
+    monkeypatch.setattr(lr, "DayStore", flaky)
+    ticks = itertools.count()
+    rec = LBankRecorder(
+        RecorderConfig(data_dir=tmp_path, depth_interval_s=0.02, http_timeout_s=0.5),
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, json=DEPTH)),
+        now_ms=lambda: FIXED_NOW_MS + next(ticks),
+    )
+    rec.status["depth"] = lr.StreamStatus()
+    with capture_logs() as logs:
+        thread = threading.Thread(
+            target=rec._run_concurrent_stream, args=("depth", 0.02, rec._poll_depth, 3, None), daemon=True
+        )
+        thread.start()
+        try:
+            assert _wait_until(lambda: rec.status["depth"].consecutive_errors >= 2)
+        finally:
+            rec._stop.set()
+            thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert "OSError: disk unavailable" in (rec.status["depth"].last_error or "")
+    assert rec.status["depth"].rows_total == 0
+    assert any(e["event"] == "lbank_recorder.worker_failed" and e["log_level"] == "error" for e in logs)

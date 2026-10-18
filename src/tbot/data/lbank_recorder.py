@@ -510,10 +510,6 @@ class RecorderConfig:
     )
     funding_interval_s: float = 60.0
     http_timeout_s: float = 20.0
-    # shorter than `http_timeout_s`: trades polling stays single-call-at-a-time (the gap/cursor logic
-    # depends on strict order), so a slow call must fail fast and free the next slot rather than
-    # eating most of `trades_interval_s` and pushing the following poll into the catch-up skip path.
-    trades_timeout_s: float = 8.0
     heartbeat_interval_s: float = 10.0
 
 
@@ -566,7 +562,7 @@ class LBankRecorder:
                 self._cfg.depth_max_concurrent,
                 self._cfg.http_timeout_s,
             ),
-            ("trades", self._cfg.trades_interval_s, self._poll_trades, 1, self._cfg.trades_timeout_s),
+            ("trades", self._cfg.trades_interval_s, self._poll_trades, 1, self._cfg.http_timeout_s),
             ("funding", self._cfg.funding_interval_s, self._poll_funding, 1, self._cfg.http_timeout_s),
         ]
         for interval, period in self._cfg.kline_interval_s.items():
@@ -661,7 +657,18 @@ class LBankRecorder:
             return store
 
         def task() -> None:
-            self.run_once(name, job, client, worker_store())
+            try:
+                store = worker_store()
+            except Exception as exc:  # e.g. mkdir/connect failure: counted and alerted, never silent (3.8)
+                self._note_worker_failure(name, exc)
+                return
+            self.run_once(name, job, client, store)
+
+        def observe(future: Future[None]) -> None:
+            # backstop: anything that still escapes `task` must not vanish inside the Future
+            exc = future.exception()
+            if exc is not None:
+                self._note_worker_failure(name, exc)
 
         in_flight: set[Future[None]] = set()
         try:
@@ -671,7 +678,9 @@ class LBankRecorder:
                 if len(in_flight) >= max_concurrent:
                     self._note_skip(name)
                 else:
-                    in_flight.add(executor.submit(task))
+                    future = executor.submit(task)
+                    future.add_done_callback(observe)
+                    in_flight.add(future)
                 next_due += period
                 now = time.monotonic()
                 if next_due < now:  # keep the rate at one dispatch per period, never catch up
@@ -683,6 +692,14 @@ class LBankRecorder:
             for store in stores:
                 store.close()
             client.close()
+
+    def _note_worker_failure(self, name: str, exc: BaseException) -> None:
+        status = self.status[name]
+        with self._lock:
+            status.last_attempt_ms = self._now_ms()
+            status.consecutive_errors += 1
+            status.last_error = f"{type(exc).__name__}: {exc}"[:300]
+        logger.error("lbank_recorder.worker_failed", stream=name, error=status.last_error)
 
     def _note_skip(self, name: str) -> None:
         status = self.status[name]
