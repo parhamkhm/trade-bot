@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import os
+import subprocess
 from decimal import Decimal
 from pathlib import Path
 from types import ModuleType
@@ -205,9 +207,51 @@ def test_missing_data_is_a_refusal_naming_the_series() -> None:
     ]
 
 
-def test_the_engine_commit_is_checked_with_git() -> None:
-    assert check_engine_commit() == []  # this checkout contains the Phase 2 engine merge
-    assert any("not an ancestor" in p or "git failed" in p for p in check_engine_commit(min_commit="0" * 40))
+def _git(repo: Path, *args: str) -> str:
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+           "GIT_COMMITTER_EMAIL": "t@t", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+    out = subprocess.run(["git", *args], cwd=repo, env=env, capture_output=True, text=True, check=True)
+    return out.stdout.strip()
+
+
+@pytest.fixture
+def history(tmp_path: Path) -> tuple[Path, str, str, str]:
+    """A throwaway repo: commits old -> engine -> new on main, plus a side commit not in main's history."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    shas = []
+    for name in ("old", "engine", "new"):
+        (repo / name).write_text(name)
+        _git(repo, "add", name)
+        _git(repo, "commit", "-q", "-m", name)
+        shas.append(_git(repo, "rev-parse", "HEAD"))
+    _git(repo, "checkout", "-q", "-b", "side", shas[0])
+    (repo / "side").write_text("side")
+    _git(repo, "add", "side")
+    _git(repo, "commit", "-q", "-m", "side")
+    side = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "-q", "main")
+    return repo, shas[1], shas[0], side
+
+
+def test_the_engine_commit_is_checked_with_git(history: tuple[Path, str, str, str]) -> None:
+    repo, engine, older, side = history
+    assert check_engine_commit(repo, min_commit=engine) == []  # HEAD is after the engine commit
+    assert check_engine_commit(repo, min_commit=older) == []
+    assert any("not an ancestor" in p for p in check_engine_commit(repo, min_commit=side))  # not in history
+    assert any("git failed" in p for p in check_engine_commit(repo, min_commit="0" * 40))  # unknown commit
+
+
+def test_a_shallow_clone_is_a_refusal_even_when_the_commit_is_present(
+    history: tuple[Path, str, str, str], tmp_path: Path
+) -> None:
+    repo, engine, _, _ = history
+    clone = tmp_path / "shallow"
+    _git(tmp_path, "clone", "-q", "--depth", "1", "--branch", "main", repo.resolve().as_uri(), str(clone))
+    problems = check_engine_commit(clone, min_commit=_git(clone, "rev-parse", "HEAD"))
+    assert problems and "shallow" in problems[0]  # fail-closed: truncated history never passes
+    assert check_engine_commit(clone, min_commit=engine)  # the engine commit is missing: refused too
 
 
 def test_an_unreadable_repository_is_a_refusal(tmp_path: Path) -> None:

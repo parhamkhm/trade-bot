@@ -86,17 +86,21 @@ def check_engine() -> list[str]:
     return ["engine lacks BacktestConfig.enforce_stops / rebalance_band (the stops/band PR is not merged)"]
 
 
+def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True, check=False, timeout=30)
+
+
 def check_engine_commit(repo: Path = _REPO, min_commit: str = ENGINE_MIN_COMMIT) -> list[str]:
-    """The checked-out engine is at or after ``min_commit`` (``git merge-base --is-ancestor``)."""
+    """The checked-out engine is at or after ``min_commit`` (``git merge-base --is-ancestor``).
+
+    Fail-closed: a missing repository, a shallow clone (its truncated history cannot prove ancestry) or any
+    git error is a refusal, never a skip.
+    """
     try:
-        proc = subprocess.run(
-            ["git", "merge-base", "--is-ancestor", min_commit, "HEAD"],
-            cwd=repo,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=30,
-        )
+        shallow = _git(repo, "rev-parse", "--is-shallow-repository")
+        if shallow.returncode == 0 and shallow.stdout.strip() == "true":
+            return [f"cannot verify engine commit {min_commit}: {repo} is a shallow clone"]
+        proc = _git(repo, "merge-base", "--is-ancestor", min_commit, "HEAD")
     except (OSError, subprocess.SubprocessError) as exc:
         return [f"cannot verify the engine commit ({type(exc).__name__}: {exc})"]
     if proc.returncode == 0:
