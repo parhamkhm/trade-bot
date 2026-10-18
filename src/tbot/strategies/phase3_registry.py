@@ -1,4 +1,4 @@
-"""Registry of the Phase 3 strategies pre-registered in docs/SPEC.md §7.2 C (S0 + the 17 grid points).
+"""Registry of the Phase 3 strategies pre-registered in docs/SPEC.md §7.2 C (S0 + the 14 grid points, D-090).
 
 The single source the Phase 3 tests and the walk-forward harness iterate over. Each entry names the module
 and factory the strategy-researcher implements; until a module exists, ``load`` raises
@@ -31,7 +31,7 @@ def _entry(key: str, module: str, tf: Timeframe, **params: object) -> Phase3Entr
     return Phase3Entry(key, module, "make", tf, MappingProxyType(dict(params)))
 
 
-_D1, _H4 = Timeframe.D1, Timeframe.H4
+_D1 = Timeframe.D1
 
 PHASE3_ENTRIES: tuple[Phase3Entry, ...] = (
     _entry("S0", "tbot.strategies.s0_sma100", _D1),
@@ -43,9 +43,6 @@ PHASE3_ENTRIES: tuple[Phase3Entry, ...] = (
     _entry("C2-(60,180,360)", "tbot.strategies.tsmom", _D1, horizons=(60, 180, 360)),
     _entry("C3-1d-(8,16,32)", "tbot.strategies.ewmac", _D1, fast_spans=(8, 16, 32)),
     _entry("C3-1d-(16,32,64)", "tbot.strategies.ewmac", _D1, fast_spans=(16, 32, 64)),
-    _entry("C3-4h-(8,16,32)", "tbot.strategies.ewmac", _H4, fast_spans=(8, 16, 32)),
-    _entry("C3-4h-(16,32,64)", "tbot.strategies.ewmac", _H4, fast_spans=(16, 32, 64)),
-    _entry("C3-4h-(32,64,128)", "tbot.strategies.ewmac", _H4, fast_spans=(32, 64, 128)),
     _entry("C4-p10", "tbot.strategies.vol_breakout", _D1, pct=10),
     _entry("C4-p20", "tbot.strategies.vol_breakout", _D1, pct=20),
     _entry("C4-p30", "tbot.strategies.vol_breakout", _D1, pct=30),
