@@ -287,7 +287,7 @@ REPORT BACK: files changed, test results, open questions, risks found
 ```
 
 **Definition of Done:** `uv run pytest` green · `uv run ruff check .` clean · `uv run mypy` clean on strict
-packages · new code has tests · no secrets · `docs/SPEC.md` decision log updated if behaviour changed.
+packages · new code has tests · no secrets · `docs/DECISIONS.md` updated if behaviour changed.
 **A PR is "ready to merge" only when its GitHub Actions CI run on the PR's current head commit is fully
 green** — every step (secrets check, ruff, mypy, order-code audit, pytest) ran and passed on the Linux runner.
 Local checks on the Windows laptop do not count. Every "ready to merge" message to Parham states the CI status
@@ -297,9 +297,19 @@ and run link per PR. Platform-specific code or tests are guarded with `sys.platf
 written approval of that exact head commit** (Parham, 2026-10-12; PR #18 was merged without it — no harm, because
 its text was marked as not in force).
 
+**Token rules** (Parham, 2026-10-18; approval rules unchanged):
+- Reports to Parham: ≤ 15 lines by default (status, what he must do, links); details only on request.
+- No waiting or polling loops in a session. Timed server jobs run as systemd timers and report via Telegram.
+  CI status is checked once, when Parham asks.
+- D-rows live in `docs/DECISIONS.md`. Agents read only the SPEC sections their task needs, never the whole file.
+- Opus `reviewer` only for SPEC, pre-registration or gate math, engine, execution, risk and metrics; every
+  other PR (strategies, tests, docs, infra) gets a Sonnet review.
+- PRs Parham must approve: a short summary file plus the diff of the files that matter (SPEC, gate math,
+  engine, money path) only, never the whole test suite.
+
 **Rules**
 1. One task → one agent. Independent tasks run in parallel; dependent tasks run in sequence.
-2. Subagents never modify `core/types.py` or `docs/SPEC.md`; they propose changes in their report.
+2. Subagents never modify `core/types.py`, `docs/SPEC.md` or `docs/DECISIONS.md`; they propose changes in their report.
 3. The agent that writes a strategy never evaluates it; `validation-analyst` does.
 4. Every change under `risk/` or `execution/` is reviewed by `reviewer`, then by Parham, before merge.
 5. Work on feature branches; small PRs; conventional commit messages.
