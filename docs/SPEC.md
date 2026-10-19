@@ -697,6 +697,7 @@ stress stays profitable.
 - Slippage sensitivity [DECIDED 2026-10-12, D-091], **reported only, never gating**: the adverse tail, the
   per-notional **p90 of cost** (thin book). By the same argument its points are the **p10 of the order sizes**,
   plus half the p95 spread (the probe stores no p90 spread; p95 is the more adverse choice).
+- [OPERATIONAL, added 2026-10-19, before any Phase 3 result] The curve construction is data-independent. The median is the middle sample (odd count) or the mean of the two middle samples (even count); p10 is the nearest-rank p10. A sample whose fill reaches the end of the visible book is a lower bound for its order size; the report counts such samples per side and per band. Before the G3 run on the frozen curve: the largest possible order — a weight change of 1 at the 10,000 USDT normaliser as defined in §7 G3 — must be ≤ the frozen curve's 0.1 % notional point on each side; otherwise stop and report before running. The sample counts and the book-end note above describe the G0 probe (provisional curve) only.
 - **The G3 verdict comes from ONE complete rerun** of this whole pre-registered procedure (A–I) with the frozen
   LBank depth-at-size curve (§7 G3 model; window from the G1b start to the day G1b passes, then frozen and logged,
   D-085; "the G1b start" is the start of the consecutive healthy run that passes G1b, so if G1b fails and
