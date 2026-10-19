@@ -21,7 +21,7 @@ from numpy.typing import NDArray
 
 from tbot.indicators.moving_average import as_float_array
 
-__all__ = ["atr_simple", "sigma_hat_kernel", "true_range"]
+__all__ = ["atr_simple", "log_return_stdev", "sigma_hat_kernel", "true_range"]
 
 Series = Sequence[float] | NDArray[np.float64]
 
@@ -72,4 +72,23 @@ def sigma_hat_kernel(
         recent_first = sq[t - k : t][::-1]  # r_t, r_{t-1}, ..., r_{t-k+1}
         numerator = math.fsum(w * s for w, s in zip(weights, recent_first, strict=True))
         out[t] = math.sqrt(numerator / denominator) * scale
+    return out
+
+
+def log_return_stdev(close: Series, n: int) -> NDArray[np.float64]:
+    """Sample standard deviation (ddof 1) of the last ``n`` log returns up to and including each index.
+
+    ``r_j = ln(close_j / close_{j-1})``; the value at ``t`` uses ``r_{t-n+1 .. t}`` (``n + 1`` closes), so the
+    first valid index is ``n``. Daily, not annualised (SPEC 7.2 C3 ``sigma_p``, C4 ``rv``). Exactly 0 when the
+    ``n`` returns are all 0.
+    """
+    if n < 2:
+        raise ValueError(f"n must be >= 2 for ddof 1, got {n}")
+    c = as_float_array(close).tolist()
+    returns = [math.log(c[i] / c[i - 1]) for i in range(1, len(c))]  # returns[j] belongs to index j + 1
+    out = np.full(len(c), np.nan)
+    for t in range(n, len(c)):
+        window = returns[t - n : t]
+        mean = math.fsum(window) / n
+        out[t] = math.sqrt(math.fsum((r - mean) ** 2 for r in window) / (n - 1))
     return out
