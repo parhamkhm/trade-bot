@@ -50,6 +50,13 @@ is handed each execution bar as it becomes available:
 * A SELL is never capped in either mode: it is rejected whole if the position does not cover it -- a
   long-only book has no symmetric "resize down" for an exit.
 * LIMIT orders are rejected: SPEC defines no limit-fill semantics yet (needs a maker/queue model).
+* Protective stops (SPEC section 7.1, D-050): :meth:`SimulatedBroker.stop_out` sells the WHOLE position when
+  the execution bar's low reached the stop level. The reference price is ``min(open, stop)`` -- the stop
+  level when the bar traded down through it, the open when the bar gapped below it -- and the usual adverse
+  slippage (floored to the tick) and taker fee are charged on top, so a stop exit is never free. The fill
+  is stamped with the bar's open time (the intra-bar time of the touch is unknown), is flagged
+  ``stop_fill=True`` and carries its own ``stop-NNNNNN`` order id. Which level applies, when it is armed and
+  what is cancelled around it is the ENGINE's business; the broker only prices the exit.
 
 Fees and slippage come from ``FeeSchedule`` / ``SlippageModel`` objects built from configuration.
 ``SlippageModel`` is the hook where the depth-curve model of SPEC section 7 (G3) plugs in later.
@@ -182,6 +189,7 @@ class FillRecord:
     reference_price: Decimal  # the open the fill was priced from, before slippage
     slippage_cost: Decimal  # quote asset, >= 0: |fill price - reference| * quantity (incl. tick rounding)
     gap_fill: bool = False  # bar.open_ts != created_ts + fill_delay: the feed had a gap at the deadline
+    stop_fill: bool = False  # a protective-stop exit (SimulatedBroker.stop_out), not a strategy order
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,6 +289,7 @@ class SimulatedBroker:
         self._pending: list[str] = []  # client_order_ids in submission order
         self._last_bar_ts: datetime | None = None
         self._seq = 0
+        self._stop_seq = 0
 
     # -- Broker protocol -------------------------------------------------------------------
 
@@ -409,6 +418,63 @@ class SimulatedBroker:
         self._pending = still_pending
         return ExecutionReport(tuple(fills), tuple(rejections), tuple(resizes))
 
+    def stop_out(self, bar: Bar, stop: Decimal) -> FillRecord | OrderRejection | None:
+        """Sell the whole position if ``bar`` traded down to ``stop`` (module docstring, protective stops).
+
+        Must be called after :meth:`advance` of the SAME bar, so a strategy order that fills at this bar's
+        open is booked before the stop is tested (an entry can be stopped on its own bar; an exit order at
+        the open leaves nothing to stop). Returns ``None`` when there is no position or ``bar.low > stop``.
+        Otherwise the position is sold at ``min(bar.open, stop)`` less adverse slippage (floored to the tick),
+        with the taker fee; a stop exit that would fall below ``min_notional`` is returned as an
+        :class:`OrderRejection` and the position is left untouched (the run is then flagged INVALID).
+        """
+        if bar.symbol != self._filters.symbol:
+            raise BrokerError(f"bar for {bar.symbol} fed to a {self._filters.symbol} broker")
+        if self._last_bar_ts != bar.ts:
+            raise BrokerError("stop_out must be called after advance() of the same bar")
+        if not stop.is_finite() or stop <= _ZERO:
+            raise ValueError(f"stop must be a finite Decimal > 0, got {stop!r}")
+        if self._qty <= _ZERO or bar.low > stop:
+            return None
+        quantity = self._qty
+        reference = min(bar.open, stop)
+        price = self._fill_price(Side.SELL, quantity, bar, reference)
+        notional = price * quantity
+        fee = self._fees.fee(notional)
+        self._seq += 1
+        self._stop_seq += 1
+        cid = f"stop-{self._stop_seq:06d}"
+        req = OrderRequest(
+            client_order_id=cid,
+            symbol=self._filters.symbol,
+            side=Side.SELL,
+            type=OrderType.MARKET,
+            quantity=quantity,
+            created_ts=bar.open_ts,
+        )
+        order = _Order(req=req, exchange_order_id=f"sim-{self._seq}", state=OrderState.NEW)
+        self._orders[cid] = order
+        order.last_ts = bar.open_ts
+        if not self._filters.passes_notional(price, quantity):
+            order.state = OrderState.REJECTED
+            reason = f"MIN_NOTIONAL: stop exit {notional} < {self._filters.min_notional}"
+            return OrderRejection(cid, bar.open_ts, reason)
+        self._cash += notional - fee
+        self._qty -= quantity
+        order.state, order.filled_qty, order.avg_price = OrderState.FILLED, quantity, price
+        fill = Fill(
+            client_order_id=cid,
+            symbol=req.symbol,
+            side=Side.SELL,
+            ts=bar.open_ts,
+            price=price,
+            quantity=quantity,
+            fee=fee,
+            fee_asset=self._quote,
+            exchange_order_id=order.exchange_order_id,
+        )
+        return FillRecord(fill, reference, abs(price - reference) * quantity, stop_fill=True)
+
     # -- internals -------------------------------------------------------------------------
 
     def _get(self, client_order_id: str) -> _Order:
@@ -434,16 +500,21 @@ class SimulatedBroker:
             return f"MAX_QUANTITY: {req.quantity} > {flt.max_qty}"
         return None
 
-    def _fill_price(self, side: Side, quantity: Decimal, bar: Bar) -> Decimal:
-        ctx = SlippageContext(side=side, quantity=quantity, reference_price=bar.open, ts=bar.open_ts)
+    def _fill_price(
+        self, side: Side, quantity: Decimal, bar: Bar, reference: Decimal | None = None
+    ) -> Decimal:
+        """Adverse-slipped, tick-rounded price; ``reference`` defaults to the bar's open (a stop exit
+        passes ``min(open, stop)``)."""
+        ref = bar.open if reference is None else reference
+        ctx = SlippageContext(side=side, quantity=quantity, reference_price=ref, ts=bar.open_ts)
         bps = self._slippage.slippage_bps(ctx)
         if bps < 0:
             raise BrokerError(f"slippage model returned negative bps ({bps}); slippage is always adverse")
         tick = self._filters.tick_size
         if side is Side.BUY:
-            raw = bar.open * (1 + bps / _BPS)
+            raw = ref * (1 + bps / _BPS)
             return (raw / tick).to_integral_value(rounding=ROUND_CEILING) * tick
-        raw = bar.open * (1 - bps / _BPS)
+        raw = ref * (1 - bps / _BPS)
         return (raw / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
 
     def _affordable_quantity(self, price: Decimal) -> Decimal:

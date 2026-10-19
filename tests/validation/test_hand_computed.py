@@ -67,7 +67,8 @@ def test_five_bar_example_to_the_cent() -> None:
       9980.029521,
       fee 0.1 % = 9.980029521, cash left = 10000 - 9980.029521 - 9.980029521 = 9.990449479.
     * close(1) = 105: equity = 9.990449479 + 99.75042 * 105 = 10483.784549479. Weight 0.99905: inside the
-      0.02 drift tolerance, no trade. close(2) = 110: equity 10982.536649479, target 0.0 -> SELL everything.
+      25 % relative rebalance band (0.00095 off a target of 1.0), no trade.
+      close(2) = 110: equity 10982.536649479, target 0.0 -> SELL everything.
     * open(3) = 108: SELL fills at floor(108 * 0.9995, tick) = 107.94. Notional 99.75042 * 107.94 =
       10767.0603348,
       fee 10.76706033480, final cash = 9.990449479 + 10767.0603348 - 10.7670603348 = 10766.2837239442.
