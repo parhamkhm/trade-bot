@@ -650,6 +650,10 @@ C3 forecast scalars `c_f` [OPERATIONAL]: Carver's published values 8→5.3, 16�
 scalar (**1.32**, the table's ratio of about 1/√2 per doubling, applied once) was used only by the 4h point
 (32, 64, 128); after D-090 it is not used in Phase 3.
 
+[OPERATIONAL, added 2026-10-19, before any Phase 3 result] For C4 and C5 the strategy keeps its own long/flat signal state, replayed from the trial's first tradable close, where it starts flat: flat → long at a close where the entry condition holds; long → flat at a close where the exit condition holds; otherwise unchanged. 'Its own entry condition goes false and then true again' refers to this signal state: after a stop-out the position stays STOPPED until the exit condition fires and a later close then satisfies the entry condition.
+
+[OPERATIONAL, added 2026-10-19, before any Phase 3 result] For C3, if σ_p_t = 0 the pair's forecast F is 0.
+
 **Total non-S0 trials: 14** (3 + 3 + 2 + 3 + 3; D-087, D-090). S0 = 1 trial (N = 1) [RECORDED §7.1]. S1 has no parameters. No
 other configuration is run in Phase 3.
 
